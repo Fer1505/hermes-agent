@@ -2017,9 +2017,11 @@ class BasePlatformAdapter(ABC):
     def prepare_tts_text(self, text: str) -> str:
         """Prepare text for TTS. Override to filter tool output, code, etc.
 
-        Default strips markdown formatting and truncates to 4000 chars.
+        Default strips markdown formatting. Provider-specific length caps are
+        enforced by ``tools.tts_tool.text_to_speech_tool`` so long voice replies
+        are not cut before chunk-capable providers can handle them.
         """
-        return re.sub(r'[*_`#\[\]()]', '', text)[:4000].strip()
+        return re.sub(r'[*_`#\[\]()]', '', text).strip()
 
     async def play_tts(
         self,

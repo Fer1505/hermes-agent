@@ -84,6 +84,26 @@ def _make_runner(tmp_path):
     return runner
 
 
+def _make_base_adapter_for_tts():
+    """Create a minimal concrete base adapter for helper-method tests."""
+    from gateway.platforms.base import BasePlatformAdapter
+
+    class ConcreteBaseAdapter(BasePlatformAdapter):
+        async def connect(self) -> bool:
+            return True
+
+        async def disconnect(self) -> None:
+            return None
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            return None
+
+        async def get_chat_info(self, chat_id):
+            return {}
+
+    return object.__new__(ConcreteBaseAdapter)
+
+
 # =====================================================================
 # /voice command handler
 # =====================================================================
@@ -432,6 +452,25 @@ class TestSendVoiceReply:
         mock_adapter.send_voice.assert_called_once()
         call_args = mock_adapter.send_voice.call_args
         assert call_args.kwargs.get("chat_id") == "123"
+
+    @pytest.mark.asyncio
+    async def test_voice_reply_does_not_pretruncate_long_text(self, runner):
+        mock_adapter = AsyncMock()
+        mock_adapter.send_voice = AsyncMock()
+        event = _make_event()
+        runner.adapters[event.source.platform] = mock_adapter
+        long_text = ("Atlas full voice reply sentence. " * 200) + "FINAL_SENTINEL"
+        tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
+
+        with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result) as mock_tts, \
+             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("os.path.isfile", return_value=True), \
+             patch("os.unlink"), \
+             patch("os.makedirs"):
+            await runner._send_voice_reply(event, long_text)
+
+        assert mock_tts.call_args.kwargs["text"] == long_text
+        assert "FINAL_SENTINEL" in mock_tts.call_args.kwargs["text"]
 
     @pytest.mark.asyncio
     async def test_auto_voice_reply_uses_thread_metadata_helper(self, runner):
@@ -1471,16 +1510,16 @@ class TestAutoTtsEmptyTextGuard:
 
     def test_empty_after_strip_skips_tts(self):
         """Markdown-only content should not trigger TTS call."""
-        import re
+        adapter = _make_base_adapter_for_tts()
         text_content = "****"
-        speech_text = re.sub(r'[*_`#\[\]()]', '', text_content)[:4000].strip()
+        speech_text = adapter.prepare_tts_text(text_content)
         assert not speech_text, "Expected empty after stripping markdown chars"
 
     def test_code_block_response_skips_tts(self):
         """Code-only response results in empty speech text."""
-        import re
+        adapter = _make_base_adapter_for_tts()
         text_content = "```python\nprint(1)\n```"
-        speech_text = re.sub(r'[*_`#\[\]()]', '', text_content)[:4000].strip()
+        speech_text = adapter.prepare_tts_text(text_content)
         # Note: base.py regex only strips individual chars, not full code blocks
         # So code blocks are partially stripped but may leave content
         # The real fix is in base.py — empty check after strip
@@ -2110,6 +2149,20 @@ class TestAutoTtsTempFileCleanup:
         assert finally_idx > 0, "play_tts must be in a try/finally block"
         assert remove_idx > 0, "finally block must call os.remove on _tts_path"
         assert remove_idx > finally_idx, "os.remove must be inside the finally block"
+
+
+class TestAutoTtsTextPreparation:
+    """Base adapter auto-TTS should not cut text before provider handling."""
+
+    def test_prepare_tts_text_strips_markdown_without_pretruncate(self):
+        adapter = _make_base_adapter_for_tts()
+        text = ("**Atlas** says keep the full voice note. " * 150) + "FINAL SENTINEL"
+
+        prepared = adapter.prepare_tts_text(text)
+
+        assert len(prepared) > 4000
+        assert "FINAL SENTINEL" in prepared
+        assert "*" not in prepared
 
 
 # =====================================================================
