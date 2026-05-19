@@ -126,7 +126,13 @@ def utf16_len(s: str) -> int:
     Ported from nearai/ironclaw#2304 which discovered the same discrepancy in
     Rust's ``chars().count()``.
     """
-    return len(s.encode("utf-16-le")) // 2
+    try:
+        return len(s.encode("utf-16-le")) // 2
+    except LookupError:
+        # Extremely early/shutdown interpreter states can occasionally fail
+        # codec lookup even for stdlib encodings.  Telegram still needs the
+        # same code-unit count, so fall back to direct Unicode scalar math.
+        return sum(2 if ord(ch) > 0xFFFF else 1 for ch in s)
 
 
 def _prefix_within_utf16_limit(s: str, limit: int) -> str:
@@ -1613,6 +1619,14 @@ class BasePlatformAdapter(ABC):
         """
         return None
 
+    async def _after_final_text_response_sent(
+        self,
+        event: MessageEvent,
+        content: str,
+        result: "SendResult",
+    ) -> None:
+        """Hook for adapters that need side effects after final text delivery."""
+        return None
 
     async def edit_message(
         self,
@@ -3240,6 +3254,20 @@ class BasePlatformAdapter(ABC):
                         metadata=_thread_metadata,
                     )
                     _record_delivery(result)
+                    if result.success:
+                        try:
+                            await self._after_final_text_response_sent(
+                                event,
+                                text_content,
+                                result,
+                            )
+                        except Exception as hook_err:
+                            logger.warning(
+                                "[%s] Post-send hook failed: %s",
+                                self.name,
+                                hook_err,
+                                exc_info=True,
+                            )
 
                     # Schedule auto-deletion of system-notice replies.
                     # Detached so the handler returns immediately; errors

@@ -588,6 +588,15 @@ class TestUtf16Len:
     def test_empty(self):
         assert utf16_len("") == 0
 
+    def test_codec_lookup_fallback(self):
+        class CodecLookupBrokenStr(str):
+            def encode(self, encoding="utf-8", errors="strict"):
+                if encoding == "utf-16-le":
+                    raise LookupError("unknown encoding: utf-16-le")
+                return super().encode(encoding, errors)
+
+        assert utf16_len(CodecLookupBrokenStr("a😀b")) == 4
+
 
 class TestPrefixWithinUtf16Limit:
     """Verify UTF-16-aware prefix truncation."""
@@ -728,4 +737,3 @@ class TestProxyKwargsForAiohttp:
             sess_kw, req_kw = proxy_kwargs_for_aiohttp("http://proxy:8080")
             assert sess_kw == {}
             assert req_kw == {"proxy": "http://proxy:8080"}
-
