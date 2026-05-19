@@ -3094,8 +3094,13 @@ class BasePlatformAdapter(ABC):
                 **_keep_typing_kwargs,
             )
         )
+        typing_stopped = False
 
         async def _stop_typing_task() -> None:
+            nonlocal typing_stopped
+            if typing_stopped:
+                return
+            typing_stopped = True
             typing_task.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(typing_task), timeout=0.5)
@@ -3433,6 +3438,18 @@ class BasePlatformAdapter(ABC):
             except Exception:
                 pass  # Last resort — don't let error reporting crash the handler
         finally:
+            # Stop the user-visible typing indicator before post-delivery
+            # callbacks. Those callbacks can run slow auxiliary work such as
+            # title generation, topic renames, or background-review release
+            # messages; they should not keep Telegram/Discord looking like the
+            # main answer is still being composed after the response was sent.
+            await _stop_typing_task()
+            try:
+                if hasattr(self, "stop_typing"):
+                    await self.stop_typing(event.source.chat_id)
+            except Exception:
+                pass
+
             # Fire any one-shot post-delivery callback registered for this
             # session (e.g. deferred background-review notifications).
             #
@@ -3463,15 +3480,6 @@ class BasePlatformAdapter(ABC):
                         await _post_result
                 except Exception:
                     pass
-            # Stop typing indicator
-            await _stop_typing_task()
-            # Also cancel any platform-level persistent typing tasks (e.g. Discord)
-            # that may have been recreated by _keep_typing after the last stop_typing()
-            try:
-                if hasattr(self, "stop_typing"):
-                    await self.stop_typing(event.source.chat_id)
-            except Exception:
-                pass
             # Late-arrival drain: a message may have arrived during the
             # cleanup awaits above (typing_task cancel, stop_typing).  Such
             # messages passed the Level-1 guard (entry still live, Event

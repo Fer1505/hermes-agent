@@ -58,6 +58,24 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
+class TypingOrderAdapter(ProgressCaptureAdapter):
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform)
+        self.events = []
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self.events.append(f"send:{content}")
+        return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
+
+    async def send_typing(self, chat_id, metadata=None) -> None:
+        self.events.append("send_typing")
+        await super().send_typing(chat_id, metadata=metadata)
+
+    async def stop_typing(self, chat_id) -> None:
+        self.events.append("stop_typing")
+        await super().stop_typing(chat_id)
+
+
 class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
     SUPPORTS_MESSAGE_EDITING = False
 
@@ -866,6 +884,41 @@ async def test_base_processing_releases_post_delivery_callback_after_main_send()
     sent_texts = [call["content"] for call in adapter.sent]
     assert sent_texts == ["done", "💾 Skill 'prospect-scanner' created."]
     assert released == [True]
+
+
+@pytest.mark.asyncio
+async def test_base_processing_stops_typing_before_post_delivery_callback():
+    """Post-delivery bookkeeping must not keep the user-visible typing state alive."""
+    adapter = TypingOrderAdapter()
+
+    async def _handler(event):
+        return "done"
+
+    adapter.set_message_handler(_handler)
+
+    def _post_delivery_cb():
+        adapter.events.append("post_delivery_callback")
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="msg-1",
+    )
+    session_key = "agent:main:telegram:group:-1001:17585"
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._post_delivery_callbacks[session_key] = _post_delivery_cb
+
+    await adapter._process_message_background(event, session_key)
+
+    assert adapter.events.index("send:done") < adapter.events.index("stop_typing")
+    assert adapter.events.index("stop_typing") < adapter.events.index("post_delivery_callback")
 
 
 @pytest.mark.asyncio
