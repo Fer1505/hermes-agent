@@ -13,6 +13,16 @@ metadata:
 
 > You're seeing this skill because the Hermes Kanban dispatcher spawned you as a worker with `--skills kanban-worker` — it's loaded automatically for every dispatched worker. The **lifecycle** (6 steps: orient → work → heartbeat → block/complete) also lives in the `KANBAN_GUIDANCE` block that's auto-injected into your system prompt. This skill is the deeper detail: good handoff shapes, retry diagnostics, edge cases.
 
+## Mission Control task status discipline
+
+When the user asks about **Mission Control tasks** or a live task tool returns Olympus `/tasks` entries, do not assume those items are Hermes Kanban cards. Mission Control tasks are owned by the orchestration API and may need `/tasks/{task_id}/status` mutation rather than `hermes kanban complete/archive`.
+
+Interpret ambiguous words carefully: for Franklin, **"close tasks" means review each task and mark it finished/completed only if it is actually taken care of**. It does not mean cancel by default. Before any terminal status change, inspect evidence/events/state, preserve real `waiting_human` / `approval_request` items unless the needed human input/approval has actually arrived, and do not mark work complete without proof.
+
+Exception: routine Olympus system-runtime update tasks for Node.js, PostgreSQL, Python, OpenClaw-managed runtime upkeep, and similar safe managed platform maintenance are standing Prometheus/Atlas responsibilities. Do not leave them `waiting_human` just because they are modeled as approval requests unless the action is destructive, credential/OAuth/QuickBooks/money/legal/safety-sensitive, externally committing, or explicitly human-gated. Move those to actionable owner status with a note that no completion claim is made, then execute/verify through the governed update path.
+
+If the user explicitly asks to cancel or remove work rather than finish it, use `cancelled` with an explicit note that no completion claim is made, then verify with a fresh live read.
+
 ## Workspace handling
 
 Your workspace kind determines how you should behave inside `$HERMES_KANBAN_WORKSPACE`:
