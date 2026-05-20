@@ -29,6 +29,7 @@ def mirror_to_session(
     source_label: str = "cli",
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    provider_message_id: Optional[str] = None,
 ) -> bool:
     """
     Append a delivery-mirror message to the target session's transcript.
@@ -63,6 +64,8 @@ def mirror_to_session(
             "mirror": True,
             "mirror_source": source_label,
         }
+        if provider_message_id:
+            mirror_msg["message_id"] = str(provider_message_id)
 
         _append_to_jsonl(session_id, mirror_msg)
         _append_to_sqlite(session_id, mirror_msg)

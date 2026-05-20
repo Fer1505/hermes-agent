@@ -938,9 +938,19 @@ def check_dangerous_command(command: str, env_type: str,
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
         return _hardline_block_result(hardline_desc)
 
-    # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
-    # CLI --yolo remains process-scoped via the env var for local use.
-    if is_truthy_value(os.getenv("HERMES_YOLO_MODE")) or is_current_session_yolo_enabled():
+    # Like the combined guard below, never allow sudo password brute-force
+    # through this legacy entry point.
+    is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
+    if is_sudo_guess:
+        logger.warning("Sudo stdin guard block: %s (command: %s)",
+                       sudo_guess_desc, command[:200])
+        return _sudo_stdin_block_result(sudo_guess_desc)
+
+    # --yolo or approvals.mode=off: bypass all approval prompts. Gateway
+    # /yolo is session-scoped; CLI --yolo remains process-scoped via the env
+    # var for local use.
+    approval_mode = _get_approval_mode()
+    if is_truthy_value(os.getenv("HERMES_YOLO_MODE")) or is_current_session_yolo_enabled() or approval_mode == "off":
         return {"approved": True, "message": None}
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)

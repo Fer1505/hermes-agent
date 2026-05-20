@@ -305,6 +305,7 @@ def _handle_send(args):
                     source_label=source_label,
                     thread_id=thread_id,
                     user_id=user_id,
+                    provider_message_id=result.get("message_id"),
                 ):
                     result["mirrored"] = True
             except Exception:

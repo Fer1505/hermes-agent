@@ -206,6 +206,30 @@ class TestMirrorToSession:
         assert msg["mirror"] is True
         assert msg["mirror_source"] == "cli"
 
+    def test_successful_mirror_persists_provider_message_id(self, tmp_path):
+        sessions_dir, index_file = _setup_sessions(tmp_path, {
+            "s1": {
+                "session_id": "sess_abc",
+                "origin": {"platform": "telegram", "chat_id": "12345"},
+                "updated_at": "2026-01-01T00:00:00",
+            }
+        })
+
+        with patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file), \
+             patch("gateway.mirror._append_to_sqlite"):
+            result = mirror_to_session(
+                "telegram",
+                "12345",
+                "Hello!",
+                source_label="cli",
+                provider_message_id="1067",
+            )
+
+        assert result is True
+        msg = json.loads((sessions_dir / "sess_abc.jsonl").read_text().strip())
+        assert msg["message_id"] == "1067"
+
     def test_successful_mirror_uses_thread_id(self, tmp_path):
         sessions_dir, index_file = _setup_sessions(tmp_path, {
             "topic_a": {
