@@ -2800,6 +2800,35 @@ class GatewayRunner:
             except Exception as e:
                 logger.debug("Failed interrupting agent during shutdown: %s", e)
 
+    def _mark_running_agents_resume_pending(self, reason: str) -> int:
+        """Durably mark currently-running turns before shutdown can kill them.
+
+        The drain-timeout branch is too late for long-running turns: process
+        managers can restart the gateway before the timeout fires, and crash
+        recovery's short recency window may not catch sessions whose user input
+        was hours old.  Marking before drain starts preserves the transcript;
+        the normal successful-turn path clears the marker if the agent finishes
+        cleanly during drain.
+        """
+        marked = 0
+        for session_key, agent in list(self._running_agents.items()):
+            if agent is _AGENT_PENDING_SENTINEL:
+                continue
+            try:
+                if self.session_store.mark_resume_pending(session_key, reason):
+                    marked += 1
+            except Exception as e:
+                logger.debug(
+                    "mark_resume_pending failed for %s: %s",
+                    session_key, e,
+                )
+        if marked:
+            logger.info(
+                "Marked %d active session(s) resume_pending before gateway drain",
+                marked,
+            )
+        return marked
+
     async def _notify_active_sessions_of_shutdown(self) -> None:
         """Send shutdown/restart notifications to active chats and home channels.
 
@@ -5237,6 +5266,15 @@ class GatewayRunner:
             self._running = False
             self._draining = True
 
+            # Durably mark in-flight turns before any await-heavy shutdown
+            # work.  A service manager can restart/kill the process before the
+            # drain timeout branch fires; this early marker lets startup
+            # auto-resume even for turns whose user input was hours old.
+            _resume_reason = (
+                "restart_timeout" if self._restart_requested else "shutdown_timeout"
+            )
+            self._mark_running_agents_resume_pending(_resume_reason)
+
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
             await self._notify_active_sessions_of_shutdown()
@@ -5263,40 +5301,12 @@ class GatewayRunner:
                     timeout,
                     self._running_agent_count(),
                 )
-                # Mark forcibly-interrupted sessions as resume_pending BEFORE
-                # interrupting the agents.  This preserves each session's
-                # session_id + transcript so the next message on the same
-                # session_key auto-resumes from the existing conversation
-                # instead of getting routed through suspend_recently_active()
-                # and converted into a fresh session.  Terminal escalation
-                # for genuinely stuck sessions still flows through the
-                # existing ``.restart_failure_counts`` stuck-loop counter
-                # (incremented below, threshold 3), which sets
-                # ``suspended=True`` and overrides resume_pending.
-                #
-                # Iterate self._running_agents (current) rather than the
-                # drain-start ``active_agents`` snapshot — the snapshot
-                # may include sessions that finished gracefully during
-                # the drain window, and marking those falsely would give
-                # them a stray restart-interruption system note on their
-                # next turn even though their previous turn completed
-                # cleanly.  Skip pending sentinels for the same reason
-                # _interrupt_running_agents() does: their agent hasn't
-                # started yet, there's nothing to interrupt, and the
-                # session shouldn't carry a misleading resume flag.
-                _resume_reason = (
-                    "restart_timeout" if self._restart_requested else "shutdown_timeout"
-                )
-                for _sk, _agent in list(self._running_agents.items()):
-                    if _agent is _AGENT_PENDING_SENTINEL:
-                        continue
-                    try:
-                        self.session_store.mark_resume_pending(_sk, _resume_reason)
-                    except Exception as _e:
-                        logger.debug(
-                            "mark_resume_pending failed for %s: %s",
-                            _sk, _e,
-                        )
+                # Refresh the marker for any agents still running after the
+                # drain window, then interrupt them.  Agents that completed
+                # cleanly during drain should already have left
+                # self._running_agents and cleared their early marker via the
+                # successful-turn path.
+                self._mark_running_agents_resume_pending(_resume_reason)
                 self._interrupt_running_agents(
                     _INTERRUPT_REASON_GATEWAY_RESTART if self._restart_requested else _INTERRUPT_REASON_GATEWAY_SHUTDOWN
                 )
