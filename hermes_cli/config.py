@@ -2987,7 +2987,7 @@ def _normalize_custom_provider_entry(
         "baseUrl": "base_url",
         "apiMode": "api_mode",
         "keyEnv": "key_env",
-        "apiKeyEnv": "key_env",  # alias — OpenClaw-compatible + docs variant
+        "apiKeyEnv": "key_env",
         "defaultModel": "default_model",
         "contextLength": "context_length",
         "rateLimitDelay": "rate_limit_delay",

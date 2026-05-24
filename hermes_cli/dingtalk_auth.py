@@ -1,15 +1,4 @@
-"""
-DingTalk Device Flow authorization.
-
-Implements the same 3-step registration flow as dingtalk-openclaw-connector:
-  1. POST /app/registration/init   → get nonce
-  2. POST /app/registration/begin  → get device_code + verification_uri_complete
-  3. POST /app/registration/poll   → poll until SUCCESS → get client_id + client_secret
-
-The verification_uri_complete is rendered as a QR code in the terminal so the
-user can scan it with DingTalk to authorize, yielding AppKey + AppSecret
-automatically.
-"""
+"""DingTalk Device Flow authorization."""
 
 from __future__ import annotations
 
@@ -29,7 +18,7 @@ REGISTRATION_BASE_URL = os.environ.get(
     "DINGTALK_REGISTRATION_BASE_URL", "https://oapi.dingtalk.com"
 ).rstrip("/")
 
-REGISTRATION_SOURCE = os.environ.get("DINGTALK_REGISTRATION_SOURCE", "openClaw")
+REGISTRATION_SOURCE = os.environ.get("DINGTALK_REGISTRATION_SOURCE", "hermes")
 
 
 # ── API helpers ────────────────────────────────────────────────────────────
@@ -237,8 +226,6 @@ def dingtalk_qr_auth() -> Optional[Tuple[str, str]]:
 
     print()
     print_info("  Initializing DingTalk device authorization...")
-    print_info("  Note: the scan page is branded 'OpenClaw' — DingTalk's")
-    print_info("        ecosystem onboarding bridge. Safe to use.")
 
     try:
         reg = begin_registration()
