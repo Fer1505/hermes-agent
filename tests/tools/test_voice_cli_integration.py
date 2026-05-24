@@ -56,6 +56,10 @@ class TestMarkdownStripping:
     def test_strips_inline_code(self):
         assert _strip_markdown_for_tts("Run `pip install foo`") == "Run pip install foo"
 
+    def test_strips_tts_control_directives(self):
+        text = "[[tts:kokoro_voice=af_heart]] Athena reply. [[audio_as_voice]]"
+        assert _strip_markdown_for_tts(text) == "Athena reply."
+
     def test_strips_fenced_code_blocks(self):
         text = "Here is code:\n```python\nprint('hello')\n```\nDone."
         result = _strip_markdown_for_tts(text)

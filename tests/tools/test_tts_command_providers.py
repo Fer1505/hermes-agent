@@ -451,6 +451,56 @@ class TestTextToSpeechToolWithCommandProvider:
         assert data["provider"] == "py-copy"
         assert data["voice_compatible"] is False
         assert Path(data["file_path"]).exists()
+        assert Path(data["file_path"]).read_text(encoding="utf-8") == "hi"
+        if os.name != "nt":
+            assert Path(data["file_path"]).stat().st_mode & 0o077 == 0
+
+    def test_command_provider_strips_tts_control_directives(self, tmp_path):
+        cfg = {
+            "tts": {
+                "provider": "py-copy",
+                "providers": {
+                    "py-copy": {
+                        "type": "command",
+                        "command": _python_copy_command(),
+                        "output_format": "mp3",
+                    },
+                },
+            },
+        }
+        out = tmp_path / "clip.mp3"
+
+        with patch("tools.tts_tool._load_tts_config", lambda: cfg["tts"]):
+            result = text_to_speech_tool(
+                text="[[tts:kokoro_voice=af_heart]] Athena reply.",
+                output_path=str(out),
+            )
+
+        data = json.loads(result)
+        assert data["success"] is True, data
+        assert Path(data["file_path"]).read_text(encoding="utf-8") == "Athena reply."
+
+    def test_command_provider_rejects_directive_only_text(self, tmp_path):
+        cfg = {
+            "provider": "py-copy",
+            "providers": {
+                "py-copy": {
+                    "type": "command",
+                    "command": _python_copy_command(),
+                    "output_format": "mp3",
+                },
+            },
+        }
+
+        with patch("tools.tts_tool._load_tts_config", return_value=cfg):
+            result = text_to_speech_tool(
+                text="[[tts:kokoro_voice=af_heart]]",
+                output_path=str(tmp_path / "clip.mp3"),
+            )
+
+        data = json.loads(result)
+        assert data["success"] is False
+        assert data["error"] == "Text is required"
 
     def test_voice_compatible_opt_in_toggles_flag(self, tmp_path):
         """voice_compatible=true is reflected in the response when the
@@ -474,6 +524,8 @@ class TestTextToSpeechToolWithCommandProvider:
         assert data["success"] is True
         assert data["voice_compatible"] is True
         assert data["media_tag"].startswith("[[audio_as_voice]]")
+        if os.name != "nt":
+            assert Path(data["file_path"]).stat().st_mode & 0o077 == 0
 
     def test_missing_command_falls_through_to_builtin(self, tmp_path):
         """A provider entry with an empty command is not a command
