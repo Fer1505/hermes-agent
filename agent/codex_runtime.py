@@ -241,10 +241,15 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                             agent._client_log_context(),
                         )
                 final_response = stream.get_final_response()
-                # PATCH: ChatGPT Codex backend streams valid output items
-                # but get_final_response() can return an empty output list.
+                # ChatGPT Codex backend streams valid output items but
+                # get_final_response() can return missing/empty output.
                 # Backfill from collected items or synthesize from deltas.
+                if final_response is None:
+                    final_response = SimpleNamespace(output=[])
                 _out = getattr(final_response, "output", None)
+                if _out is None:
+                    final_response.output = []
+                    _out = final_response.output
                 if isinstance(_out, list) and not _out:
                     if collected_output_items:
                         final_response.output = list(collected_output_items)
@@ -279,6 +284,40 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 "Codex Responses stream transport failed; falling back to create(stream=True). %s error=%s",
                 agent._client_log_context(),
                 exc,
+            )
+            return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+        except TypeError as exc:
+            if "'NoneType' object is not iterable" not in str(exc):
+                raise
+            if collected_output_items:
+                logger.debug(
+                    "Codex stream: recovered %d output items after SDK output=None terminal event",
+                    len(collected_output_items),
+                )
+                return SimpleNamespace(
+                    output=list(collected_output_items),
+                    status="completed",
+                )
+            if agent._codex_streamed_text_parts and not has_tool_calls:
+                assembled = "".join(agent._codex_streamed_text_parts)
+                logger.debug(
+                    "Codex stream: recovered from SDK output=None terminal event using %d deltas (%d chars)",
+                    len(agent._codex_streamed_text_parts),
+                    len(assembled),
+                )
+                return SimpleNamespace(
+                    output=[SimpleNamespace(
+                        type="message",
+                        role="assistant",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text=assembled)],
+                    )],
+                    status="completed",
+                )
+            logger.debug(
+                "Codex Responses stream hit SDK output=None terminal event without recoverable deltas; "
+                "falling back to create(stream=True). %s",
+                agent._client_log_context(),
             )
             return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
         except RuntimeError as exc:
@@ -406,8 +445,11 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
             if terminal_response is None and isinstance(event, dict):
                 terminal_response = event.get("response")
             if terminal_response is not None:
-                # Backfill empty output from collected stream events
+                # Backfill missing/empty output from collected stream events.
                 _out = getattr(terminal_response, "output", None)
+                if _out is None:
+                    terminal_response.output = []
+                    _out = terminal_response.output
                 if isinstance(_out, list) and not _out:
                     if collected_output_items:
                         terminal_response.output = list(collected_output_items)

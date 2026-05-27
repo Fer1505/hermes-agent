@@ -813,8 +813,15 @@ class _CodexCompletionsAdapter:
                 _check_cancelled()
                 final = stream.get_final_response()
 
-            # Backfill empty output from collected stream events
+            # Backfill missing/empty output from collected stream events.
+            # Some chatgpt.com Codex responses currently finish with
+            # output=None instead of output=[] even after streaming text.
+            if final is None:
+                final = SimpleNamespace(output=[], usage=None)
             _output = getattr(final, "output", None)
+            if _output is None:
+                final.output = []
+                _output = final.output
             if isinstance(_output, list) and not _output:
                 if collected_output_items:
                     final.output = list(collected_output_items)
@@ -869,6 +876,51 @@ class _CodexCompletionsAdapter:
                     completion_tokens=getattr(resp_usage, "output_tokens", 0),
                     total_tokens=getattr(resp_usage, "total_tokens", 0),
                 )
+        except TypeError as exc:
+            if timed_out.is_set():
+                raise TimeoutError(_timeout_message()) from exc
+            if "'NoneType' object is not iterable" not in str(exc):
+                logger.debug("Codex auxiliary Responses API call failed: %s", exc)
+                raise
+            if collected_output_items:
+                def _item_get(obj: Any, key: str, default: Any = None) -> Any:
+                    val = getattr(obj, key, None)
+                    if val is None and isinstance(obj, dict):
+                        val = obj.get(key, default)
+                    return val if val is not None else default
+
+                for item in collected_output_items:
+                    item_type = _item_get(item, "type")
+                    if item_type == "message":
+                        for part in (_item_get(item, "content") or []):
+                            ptype = _item_get(part, "type")
+                            if ptype in {"output_text", "text"}:
+                                text_parts.append(_item_get(part, "text", ""))
+                    elif item_type == "function_call":
+                        tool_calls_raw.append(SimpleNamespace(
+                            id=_item_get(item, "call_id", ""),
+                            type="function",
+                            function=SimpleNamespace(
+                                name=_item_get(item, "name", ""),
+                                arguments=_item_get(item, "arguments", "{}"),
+                            ),
+                        ))
+                logger.debug(
+                    "Codex auxiliary: recovered %d output items after SDK output=None terminal event",
+                    len(collected_output_items),
+                )
+            elif collected_text_deltas and not has_function_calls:
+                text_parts.append("".join(collected_text_deltas))
+                logger.debug(
+                    "Codex auxiliary: recovered from SDK output=None terminal event using %d deltas",
+                    len(collected_text_deltas),
+                )
+            else:
+                logger.debug(
+                    "Codex auxiliary Responses API call failed before recoverable output: %s",
+                    exc,
+                )
+                raise
         except Exception as exc:
             if timed_out.is_set():
                 raise TimeoutError(_timeout_message()) from exc

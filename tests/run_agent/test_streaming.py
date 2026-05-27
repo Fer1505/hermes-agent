@@ -811,6 +811,83 @@ class TestCodexStreamCallbacks:
         response = agent._run_codex_stream({}, client=mock_client)
         assert "Hello from Codex!" in deltas
 
+    def test_codex_stream_synthesizes_output_when_final_output_is_none(self):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = False
+
+        mock_event_text_1 = SimpleNamespace(
+            type="response.output_text.delta",
+            delta="primary ",
+        )
+        mock_event_text_2 = SimpleNamespace(
+            type="response.output_text.delta",
+            delta="ok",
+        )
+
+        mock_stream = MagicMock()
+        mock_stream.__enter__ = MagicMock(return_value=mock_stream)
+        mock_stream.__exit__ = MagicMock(return_value=False)
+        mock_stream.__iter__ = MagicMock(
+            return_value=iter([mock_event_text_1, mock_event_text_2])
+        )
+        mock_stream.get_final_response.return_value = SimpleNamespace(
+            output=None,
+            status="completed",
+        )
+
+        mock_client = MagicMock()
+        mock_client.responses.stream.return_value = mock_stream
+
+        response = agent._run_codex_stream({}, client=mock_client)
+
+        assert response.output[0].content[0].text == "primary ok"
+
+    def test_codex_stream_synthesizes_output_when_sdk_raises_on_none_output(self):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = False
+
+        class BrokenStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(type="response.output_text.delta", delta="primary ")
+                yield SimpleNamespace(type="response.output_text.delta", delta="ok")
+                raise TypeError("'NoneType' object is not iterable")
+
+            def get_final_response(self):  # pragma: no cover - iterator raises first
+                raise AssertionError("get_final_response should not be reached")
+
+        mock_client = MagicMock()
+        mock_client.responses.stream.return_value = BrokenStream()
+
+        response = agent._run_codex_stream({}, client=mock_client)
+
+        assert response.output[0].content[0].text == "primary ok"
+
     def test_codex_stream_refreshes_activity_on_every_event(self):
         from run_agent import AIAgent
 
