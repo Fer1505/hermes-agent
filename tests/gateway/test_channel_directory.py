@@ -70,6 +70,33 @@ class TestBuildChannelDirectoryWrites:
 
         assert result == previous
 
+    def test_preserves_seeded_bluebubbles_targets(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "bluebubbles": [
+                {
+                    "id": "franklin@example.com",
+                    "name": "Franklin De La Rosa",
+                    "type": "dm",
+                    "thread_id": None,
+                }
+            ]
+        })
+
+        with (
+            patch("gateway.channel_directory.DIRECTORY_PATH", cache_file),
+            patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}),
+        ):
+            result = asyncio.run(build_channel_directory({}))
+
+        assert result["platforms"]["bluebubbles"] == [
+            {
+                "id": "franklin@example.com",
+                "name": "Franklin De La Rosa",
+                "type": "dm",
+                "thread_id": None,
+            }
+        ]
+
 
 class TestResolveChannelName:
     def _setup(self, tmp_path, platforms):

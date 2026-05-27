@@ -223,8 +223,13 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     def _webhook_url(self) -> str:
         """Compute the external webhook URL for BlueBubbles registration."""
         host = self.webhook_host
-        if host in {"0.0.0.0", "127.0.0.1", "localhost", "::"}:
-            host = "localhost"
+        if host in {"0.0.0.0", "localhost", "::"}:
+            # BlueBubbles runs in Electron/Node on macOS and may resolve
+            # "localhost" to ::1 first.  The gateway listener defaults to
+            # IPv4 loopback, so register the reachable address explicitly.
+            host = "127.0.0.1"
+        elif ":" in host and not host.startswith("["):
+            host = f"[{host}]"
         return f"http://{host}:{self.webhook_port}{self.webhook_path}"
 
     @property
@@ -934,4 +939,3 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             asyncio.create_task(self.mark_read(session_chat_id))
 
         return web.Response(text="ok")
-

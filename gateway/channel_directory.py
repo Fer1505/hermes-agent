@@ -17,6 +17,7 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 
 DIRECTORY_PATH = get_hermes_home() / "channel_directory.json"
+STATIC_MERGE_PLATFORMS = frozenset({"bluebubbles"})
 
 
 def _normalize_channel_query(value: str) -> str:
@@ -53,6 +54,28 @@ def _session_entry_name(origin: Dict[str, Any]) -> str:
     return f"{base_name} / {topic_label}"
 
 
+def _merge_static_entries(
+    platform_name: str,
+    session_entries: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Preserve installer-seeded targets for platforms with no enumeration API."""
+    if platform_name not in STATIC_MERGE_PLATFORMS:
+        return session_entries
+
+    existing = load_directory().get("platforms", {}).get(platform_name, [])
+    merged: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for entry in [*(existing if isinstance(existing, list) else []), *session_entries]:
+        if not isinstance(entry, dict):
+            continue
+        entry_id = str(entry.get("id") or "").strip()
+        if not entry_id or entry_id in seen_ids:
+            continue
+        merged.append(entry)
+        seen_ids.add(entry_id)
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Build / refresh
 # ---------------------------------------------------------------------------
@@ -84,7 +107,10 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
         plat_name = plat.value
         if plat_name in _SKIP_SESSION_DISCOVERY or plat_name in platforms:
             continue
-        platforms[plat_name] = _build_from_sessions(plat_name)
+        platforms[plat_name] = _merge_static_entries(
+            plat_name,
+            _build_from_sessions(plat_name),
+        )
 
     # Include plugin-registered platforms (dynamic enum members aren't in
     # Platform.__members__, so the loop above misses them).
@@ -92,7 +118,10 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
         from gateway.platform_registry import platform_registry
         for entry in platform_registry.plugin_entries():
             if entry.name not in _SKIP_SESSION_DISCOVERY and entry.name not in platforms:
-                platforms[entry.name] = _build_from_sessions(entry.name)
+                platforms[entry.name] = _merge_static_entries(
+                    entry.name,
+                    _build_from_sessions(entry.name),
+                )
     except Exception:
         pass
 
