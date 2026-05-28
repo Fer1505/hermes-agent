@@ -706,6 +706,13 @@ class TestInterimAssistantMessageConfig:
         assert raw["display"]["interim_assistant_messages"] is True
 
 
+class TestAutonomousProfileSafetyDefaults:
+    def test_default_config_fails_closed_for_profile_context_and_tool_loops(self):
+        assert DEFAULT_CONFIG["tool_loop_guardrails"]["hard_stop_enabled"] is True
+        assert DEFAULT_CONFIG["compression"]["abort_on_summary_failure"] is True
+        assert DEFAULT_CONFIG["auxiliary"]["compression"]["timeout"] == 360
+
+
 class TestDiscordChannelPromptsConfig:
     def test_default_config_includes_discord_channel_prompts(self):
         assert DEFAULT_CONFIG["discord"]["channel_prompts"] == {}

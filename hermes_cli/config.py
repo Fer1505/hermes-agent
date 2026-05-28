@@ -785,11 +785,12 @@ DEFAULT_CONFIG = {
     },
 
     # Tool loop guardrails nudge models when they repeat failed or
-    # non-progressing tool calls. Soft warnings are always-on by default;
-    # hard stops are opt-in so interactive CLI/TUI sessions keep flowing.
+    # non-progressing tool calls. Soft warnings are always on by default;
+    # hard stops are enabled by default so autonomous/profile sessions fail
+    # closed before spending the full iteration budget on a repeated loop.
     "tool_loop_guardrails": {
         "warnings_enabled": True,
-        "hard_stop_enabled": False,
+        "hard_stop_enabled": True,
         "warn_after": {
             "exact_failure": 2,
             "same_tool_failure": 3,
@@ -814,7 +815,7 @@ DEFAULT_CONFIG = {
                                       # 0 for long-running rolling-compaction sessions
                                       # where you want nothing pinned except the
                                       # system prompt + rolling summary + recent tail.
-        "abort_on_summary_failure": False,  # When True, auto-compression that fails
+        "abort_on_summary_failure": True,  # When True, auto-compression that fails
                                       # to generate a summary (aux LLM errored / returned
                                       # non-JSON / timed out) aborts entirely instead of
                                       # dropping the middle window with a static
@@ -822,8 +823,7 @@ DEFAULT_CONFIG = {
                                       # preserved unchanged and the session "freezes" at
                                       # its current size until the user runs /compress
                                       # (which bypasses the failure cooldown) or /new.
-                                      # Default False matches historical behavior; set to
-                                      # True if you'd rather pause than silently lose
+                                      # Default True pauses rather than silently losing
                                       # context turns when your aux model is flaky.
     },
 
@@ -923,7 +923,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
-            "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
+            "timeout": 360,        # seconds — compression summarises large contexts; increase for local models
             "extra_body": {},
         },
         # Note: session_search no longer uses an auxiliary LLM (PR #27590 —

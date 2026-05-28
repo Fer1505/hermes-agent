@@ -236,12 +236,12 @@ async def test_backward_compat_no_admin_list_means_no_gate():
 
 
 # ---------------------------------------------------------------------------
-# Scope isolation — DM vs group
+# Scope parity — DM vs group
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_dm_admin_is_not_group_admin():
+async def test_dm_admin_is_group_admin_under_lane_parity():
     runner = _make_runner(
         platform_extra={
             "allow_admin_from": ["111"],
@@ -249,24 +249,22 @@ async def test_dm_admin_is_not_group_admin():
             "group_user_allowed_commands": [],
         }
     )
-    # User 111 is DM admin. In group context they're a non-admin with no
-    # listed commands → /stop denied.
     result = await runner._handle_message(
         _make_event("/stop", _make_source(user_id="111", chat_type="group"))
     )
-    assert "⛔" in result
+    assert "⛔" not in result
+    assert "Stopping" in result or "stop" in result.lower()
 
 
 @pytest.mark.asyncio
-async def test_group_only_gating_leaves_dm_unrestricted():
+async def test_group_only_admin_gates_dm_with_same_policy():
     runner = _make_runner(
         platform_extra={
-            # Only group has an admin list → DM scope stays in backward-compat mode
             "group_allow_admin_from": ["222"],
         }
     )
     result = await runner._handle_message(_make_event("/whoami", _make_source(user_id="anyone", chat_type="dm")))
-    assert "Tier: unrestricted" in result
+    assert "Tier: user" in result
 
 
 # ---------------------------------------------------------------------------
@@ -455,14 +453,13 @@ async def test_gate_does_not_intercept_unknown_command():
 
 
 # ---------------------------------------------------------------------------
-# Scope independence — admin in DM scope is NOT auto-admin in group when
-# group has its own admin list (regression guard for the "admin lists are
-# scope-specific" rule).
+# Scope parity — admin identity is shared across DM and group lanes even when
+# group-specific compatibility keys are also configured.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_dm_admin_blocked_in_group_with_separate_admin_list():
+async def test_dm_admin_is_group_admin_with_separate_admin_list():
     runner = _make_runner(
         platform_extra={
             "allow_admin_from": ["111"],          # DM admin
@@ -470,12 +467,10 @@ async def test_dm_admin_blocked_in_group_with_separate_admin_list():
             "group_user_allowed_commands": ["status"],
         }
     )
-    # User 111 is DM admin. In a group, they're a non-admin and can only
-    # run group_user_allowed_commands. /restart is not in that list → denied.
     grp_src = _make_source(user_id="111", chat_type="group", chat_id="g1")
-    result = await runner._handle_message(_make_event("/restart", grp_src))
-    assert "⛔" in result
-    assert "/restart is admin-only here" in result
+    result = await runner._handle_message(_make_event("/whoami", grp_src))
+    assert "⛔" not in result
+    assert "admin" in result
 
 
 # ---------------------------------------------------------------------------

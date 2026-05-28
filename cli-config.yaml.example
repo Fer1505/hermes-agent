@@ -321,11 +321,11 @@ browser:
 # =============================================================================
 # Soft warnings are enabled by default. They append guidance to repeated failed
 # or non-progressing tool results but still let the tool execute. Hard stops are
-# opt-in circuit breakers for autonomous/cron sessions where stopping a loop is
-# preferable to spending the full iteration budget.
+# enabled by default so autonomous/profile sessions fail closed before spending
+# the full iteration budget on a repeated loop.
 tool_loop_guardrails:
   warnings_enabled: true
-  hard_stop_enabled: false
+  hard_stop_enabled: true
   warn_after:
     exact_failure: 2
     same_tool_failure: 3
@@ -387,6 +387,11 @@ compression:
 
   # To pin a specific model/provider for compression summaries, use the
   # auxiliary section below (auxiliary.compression.provider / model).
+
+  # Abort auto-compression if the summary model fails. This preserves the
+  # transcript unchanged instead of dropping the middle window with a static
+  # placeholder, which is safer for long-running profile sessions.
+  abort_on_summary_failure: true
 
 # =============================================================================
 # Anthropic prompt caching TTL
@@ -458,6 +463,12 @@ prompt_caching:
 #                           # reasoning controls:
 #                           # extra_body:
 #                           #   enable_thinking: false
+#
+#   # Context compression summaries
+#   compression:
+#     provider: "auto"
+#     model: ""
+#     timeout: 360
 
 # =============================================================================
 # Persistent Memory

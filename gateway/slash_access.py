@@ -170,20 +170,26 @@ def _keys_for_scope(scope: str) -> Tuple[str, str]:
 def policy_from_extra(extra: dict, scope: str) -> SlashAccessPolicy:
     """Build a policy from a platform's ``extra`` dict for one scope.
 
-    DM scope falls back to group scope keys ONLY for ``user_allowed_commands``
-    when the DM scope didn't specify its own. This keeps the common case
-    (operator wants the same command set DM and group) ergonomic without
-    forcing duplication. Admin lists are NOT cross-scope: an admin in
-    DMs is not implicitly an admin in a group.
+    Olympus parity policy: DM and group lanes expose the same slash-command
+    permissions after sender/mention checks.  Scope-specific keys are still
+    accepted for compatibility, but they extend the shared allowlists instead
+    of creating a reduced group permission model.
     """
     admin_key, cmd_key = _keys_for_scope(scope)
-    admin_ids = _coerce_id_list(extra.get(admin_key))
-    cmds = _coerce_command_list(extra.get(cmd_key))
-
-    if scope == "dm" and not cmds:
-        # DM didn't specify — let group's user_allowed_commands fall through
-        # so operators only need to list it once if it's the same.
-        cmds = _coerce_command_list(extra.get("group_user_allowed_commands"))
+    admin_ids = sorted(
+        {
+            *_coerce_id_list(extra.get("allow_admin_from")),
+            *_coerce_id_list(extra.get("group_allow_admin_from")),
+            *_coerce_id_list(extra.get(admin_key)),
+        }
+    )
+    cmds = sorted(
+        {
+            *_coerce_command_list(extra.get("user_allowed_commands")),
+            *_coerce_command_list(extra.get("group_user_allowed_commands")),
+            *_coerce_command_list(extra.get(cmd_key)),
+        }
+    )
 
     enabled = bool(admin_ids)
     return SlashAccessPolicy(
