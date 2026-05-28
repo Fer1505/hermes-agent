@@ -319,7 +319,7 @@ def test_dm_allow_from_is_enforced_by_gateway_authorization_not_trigger_gate():
 
 
 def test_group_allow_from_is_enforced_by_gateway_authorization_not_trigger_gate():
-    adapter = _make_adapter(group_allow_from=["111"])
+    adapter = _make_adapter(require_mention=False, group_allow_from=["111"], allowed_chats=["-100"])
 
     assert adapter._should_process_message(_group_message("hello", from_user_id=333)) is True
 

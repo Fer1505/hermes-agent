@@ -535,6 +535,16 @@ TOOLSETS = {
 }
 
 
+TOOLSET_ALIASES = {
+    # Some skill manifests and external runtime descriptors use the plural
+    # "files"; the actual built-in toolset is singular "file".
+    "files": "file",
+}
+
+
+def _canonical_toolset_name(name: str) -> str:
+    return TOOLSET_ALIASES.get(name, name)
+
 
 def get_toolset(name: str) -> Optional[Dict[str, Any]]:
     """
@@ -547,7 +557,8 @@ def get_toolset(name: str) -> Optional[Dict[str, Any]]:
         Dict: Toolset definition with description, tools, and includes
         None: If toolset not found
     """
-    toolset = TOOLSETS.get(name)
+    canonical_name = _canonical_toolset_name(name)
+    toolset = TOOLSETS.get(canonical_name)
 
     try:
         from tools.registry import registry
@@ -603,6 +614,8 @@ def resolve_toolset(name: str, visited: Set[str] = None) -> List[str]:
     """
     if visited is None:
         visited = set()
+
+    name = _canonical_toolset_name(name)
     
     # Special aliases that represent all tools across every toolset
     # This ensures future toolsets are automatically included without changes.
@@ -767,6 +780,7 @@ def validate_toolset(name: str) -> bool:
     # Accept special alias names for convenience
     if name in {"all", "*"}:
         return True
+    name = _canonical_toolset_name(name)
     if name in TOOLSETS:
         return True
     if name in _get_plugin_toolset_names():

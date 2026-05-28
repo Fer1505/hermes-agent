@@ -607,6 +607,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             raise
                         if send_result and not getattr(send_result, "success", True):
                             err = getattr(send_result, "error", "unknown")
+                            try:
+                                from gateway.channel_directory import mark_channel_delivery_failed
+                                mark_channel_delivery_failed(
+                                    platform_name,
+                                    chat_id,
+                                    err,
+                                    thread_id=thread_id,
+                                )
+                            except Exception:
+                                pass
                             logger.warning(
                                 "Job '%s': live adapter send to %s:%s failed (%s), falling back to standalone",
                                 job["id"], platform_name, chat_id, err,
@@ -651,15 +661,44 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                 logger.error("Job '%s': %s", job["id"], msg)
+                try:
+                    from gateway.channel_directory import mark_channel_delivery_failed
+                    mark_channel_delivery_failed(
+                        platform_name,
+                        chat_id,
+                        e,
+                        thread_id=thread_id,
+                    )
+                except Exception:
+                    pass
                 delivery_errors.append(msg)
                 continue
 
             if result and result.get("error"):
                 msg = f"delivery error: {result['error']}"
                 logger.error("Job '%s': %s", job["id"], msg)
+                try:
+                    from gateway.channel_directory import mark_channel_delivery_failed
+                    mark_channel_delivery_failed(
+                        platform_name,
+                        chat_id,
+                        result["error"],
+                        thread_id=thread_id,
+                    )
+                except Exception:
+                    pass
                 delivery_errors.append(msg)
                 continue
 
+            try:
+                from gateway.channel_directory import mark_channel_delivery_success
+                mark_channel_delivery_success(
+                    platform_name,
+                    chat_id,
+                    thread_id=thread_id,
+                )
+            except Exception:
+                pass
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
 
     if delivery_errors:

@@ -288,6 +288,28 @@ def _handle_send(args):
                 force_document=force_document_attachments,
             )
         )
+        if isinstance(result, dict) and result.get("error"):
+            try:
+                from gateway.channel_directory import mark_channel_delivery_failed
+                mark_channel_delivery_failed(
+                    platform_name,
+                    chat_id,
+                    result["error"],
+                    thread_id=thread_id,
+                )
+            except Exception:
+                pass
+        elif isinstance(result, dict) and result.get("success"):
+            try:
+                from gateway.channel_directory import mark_channel_delivery_success
+                mark_channel_delivery_success(
+                    platform_name,
+                    chat_id,
+                    thread_id=thread_id,
+                )
+            except Exception:
+                pass
+
         if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
 

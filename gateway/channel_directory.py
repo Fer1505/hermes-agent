@@ -18,6 +18,40 @@ logger = logging.getLogger(__name__)
 
 DIRECTORY_PATH = get_hermes_home() / "channel_directory.json"
 STATIC_MERGE_PLATFORMS = frozenset({"bluebubbles"})
+DELIVERY_METADATA_KEYS = frozenset({
+    "delivery_status",
+    "stale_reason",
+    "last_delivery_error",
+    "last_delivery_failed_at",
+})
+STALE_DELIVERY_ERROR_MARKERS = (
+    "chat not found",
+    "channel not found",
+    "room not found",
+    "thread not found",
+    "forbidden",
+    "bot was blocked",
+    "bot blocked",
+    "not enough rights",
+    "not a member",
+    "have no access",
+    "missing access",
+    "missing permissions",
+)
+TRANSIENT_DELIVERY_ERROR_MARKERS = (
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "try again",
+    "too many requests",
+    "rate limit",
+    "flood",
+    "bad gateway",
+    "gateway timeout",
+    "service unavailable",
+    "connection reset",
+    "network",
+)
 
 
 def _normalize_channel_query(value: str) -> str:
@@ -54,6 +88,59 @@ def _session_entry_name(origin: Dict[str, Any]) -> str:
     return f"{base_name} / {topic_label}"
 
 
+def _channel_is_stale(channel: Dict[str, Any]) -> bool:
+    return channel.get("delivery_status") == "stale"
+
+
+def _channel_delivery_id(chat_id: str, thread_id: Optional[str] = None) -> str:
+    if thread_id:
+        return f"{chat_id}:{thread_id}"
+    return str(chat_id)
+
+
+def _safe_error_text(error: Any) -> str:
+    text = str(error or "unknown delivery failure")
+    try:
+        from agent.redact import redact_sensitive_text
+        text = redact_sensitive_text(text)
+    except Exception:
+        pass
+    return text[:500]
+
+
+def is_stale_delivery_error(error: Any) -> bool:
+    """Return True when a delivery error indicates a stale target, not a transient outage."""
+    text = str(error or "").lower()
+    if not text:
+        return False
+    if any(marker in text for marker in TRANSIENT_DELIVERY_ERROR_MARKERS):
+        return False
+    return any(marker in text for marker in STALE_DELIVERY_ERROR_MARKERS)
+
+
+def _preserve_delivery_metadata(
+    entries: List[Dict[str, Any]],
+    previous_entries: Any,
+) -> List[Dict[str, Any]]:
+    """Carry stale delivery proof across session-derived directory rebuilds."""
+    if not isinstance(previous_entries, list):
+        return entries
+
+    previous_by_id = {
+        str(entry.get("id")): entry
+        for entry in previous_entries
+        if isinstance(entry, dict) and entry.get("id") is not None
+    }
+    for entry in entries:
+        previous = previous_by_id.get(str(entry.get("id")))
+        if not previous:
+            continue
+        for key in DELIVERY_METADATA_KEYS:
+            if key in previous:
+                entry[key] = previous[key]
+    return entries
+
+
 def _merge_static_entries(
     platform_name: str,
     session_entries: List[Dict[str, Any]],
@@ -88,7 +175,8 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     """
     from gateway.config import Platform
 
-    platforms: Dict[str, List[Dict[str, str]]] = {}
+    previous_platforms = load_directory().get("platforms", {})
+    platforms: Dict[str, List[Dict[str, Any]]] = {}
 
     for platform, adapter in adapters.items():
         try:
@@ -125,6 +213,12 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
+    for platform_name, entries in list(platforms.items()):
+        platforms[platform_name] = _preserve_delivery_metadata(
+            entries,
+            previous_platforms.get(platform_name, []),
+        )
+
     directory = {
         "updated_at": datetime.now().isoformat(),
         "platforms": platforms,
@@ -136,6 +230,79 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
         logger.warning("Channel directory: failed to write: %s", e)
 
     return directory
+
+
+def mark_channel_delivery_failed(
+    platform_name: str,
+    chat_id: str,
+    error: Any,
+    *,
+    thread_id: Optional[str] = None,
+) -> bool:
+    """Mark a cached directory entry stale after a permanent delivery failure."""
+    if not is_stale_delivery_error(error):
+        return False
+
+    directory = load_directory()
+    platforms = directory.get("platforms", {})
+    channels = platforms.get(platform_name, [])
+    if not isinstance(channels, list):
+        return False
+
+    target_id = _channel_delivery_id(str(chat_id), str(thread_id) if thread_id else None)
+    changed = False
+    for channel in channels:
+        if not isinstance(channel, dict) or str(channel.get("id")) != target_id:
+            continue
+        channel["delivery_status"] = "stale"
+        channel["stale_reason"] = "delivery_failed"
+        channel["last_delivery_error"] = _safe_error_text(error)
+        channel["last_delivery_failed_at"] = datetime.now().isoformat()
+        changed = True
+
+    if not changed:
+        return False
+
+    try:
+        atomic_json_write(DIRECTORY_PATH, directory)
+    except Exception as exc:
+        logger.warning("Channel directory: failed to mark %s:%s stale: %s", platform_name, target_id, exc)
+        return False
+    return True
+
+
+def mark_channel_delivery_success(
+    platform_name: str,
+    chat_id: str,
+    *,
+    thread_id: Optional[str] = None,
+) -> bool:
+    """Clear stale delivery metadata after a later successful send."""
+    directory = load_directory()
+    platforms = directory.get("platforms", {})
+    channels = platforms.get(platform_name, [])
+    if not isinstance(channels, list):
+        return False
+
+    target_id = _channel_delivery_id(str(chat_id), str(thread_id) if thread_id else None)
+    changed = False
+    for channel in channels:
+        if not isinstance(channel, dict) or str(channel.get("id")) != target_id:
+            continue
+        for key in DELIVERY_METADATA_KEYS:
+            if key in channel:
+                channel.pop(key, None)
+                changed = True
+
+    if not changed:
+        return False
+
+    try:
+        atomic_json_write(DIRECTORY_PATH, directory)
+    except Exception as exc:
+        logger.warning("Channel directory: failed to clear stale mark for %s:%s: %s", platform_name, target_id, exc)
+        return False
+    return True
 
 
 def _build_discord(adapter) -> List[Dict[str, str]]:
@@ -319,6 +486,8 @@ def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
 
     # 1. Exact name match, including the display labels shown by send_message(action="list")
     for ch in channels:
+        if _channel_is_stale(ch):
+            continue
         if _normalize_channel_query(ch["name"]) == query:
             return ch["id"]
         if _normalize_channel_query(_channel_target_name(platform_name, ch)) == query:
@@ -328,12 +497,17 @@ def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
     if "/" in query:
         guild_part, ch_part = query.rsplit("/", 1)
         for ch in channels:
+            if _channel_is_stale(ch):
+                continue
             guild = ch.get("guild", "").strip().lower()
             if guild == guild_part and _normalize_channel_query(ch["name"]) == ch_part:
                 return ch["id"]
 
     # 3. Partial prefix match (only if unambiguous)
-    matches = [ch for ch in channels if _normalize_channel_query(ch["name"]).startswith(query)]
+    matches = [
+        ch for ch in channels
+        if not _channel_is_stale(ch) and _normalize_channel_query(ch["name"]).startswith(query)
+    ]
     if len(matches) == 1:
         return matches[0]["id"]
 
@@ -377,7 +551,10 @@ def format_directory_for_display() -> str:
         else:
             lines.append(f"{plat_name.title()}:")
             for ch in channels:
-                lines.append(f"  {plat_name}:{_channel_target_name(plat_name, ch)}")
+                label = _channel_target_name(plat_name, ch)
+                if _channel_is_stale(ch):
+                    label = f"{label} [stale: delivery failed]"
+                lines.append(f"  {plat_name}:{label}")
             lines.append("")
 
     lines.append('Use these as the "target" parameter when sending.')

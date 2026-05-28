@@ -1,7 +1,11 @@
 """Tests for the delivery routing module."""
 
+import asyncio
+from types import SimpleNamespace
+
 from gateway.config import Platform
-from gateway.delivery import DeliveryTarget
+from gateway.delivery import DeliveryRouter, DeliveryTarget
+from gateway.platforms.base import SendResult
 from gateway.session import SessionSource
 
 
@@ -122,5 +126,24 @@ class TestPlatformNameCaseInsensitivity:
         assert target.platform == Platform.TELEGRAM
         assert target.chat_id == "12345"
 
+
+class TestDeliveryResultProof:
+    def test_adapter_send_failure_is_reported_as_delivery_failure(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        class FailingAdapter:
+            async def send(self, chat_id, content, metadata=None):
+                return SendResult(success=False, error="Chat not found")
+
+        router = DeliveryRouter(
+            config=SimpleNamespace(),
+            adapters={Platform.TELEGRAM: FailingAdapter()},
+        )
+        target = DeliveryTarget(platform=Platform.TELEGRAM, chat_id="-100999")
+
+        result = asyncio.run(router.deliver("hello", [target]))
+
+        assert result["telegram:-100999"]["success"] is False
+        assert "Chat not found" in result["telegram:-100999"]["error"]
 
 

@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from gateway.channel_directory import (
     build_channel_directory,
     lookup_channel_type,
+    mark_channel_delivery_failed,
+    mark_channel_delivery_success,
     resolve_channel_name,
     format_directory_for_display,
     load_directory,
@@ -199,6 +201,107 @@ class TestResolveChannelName:
             assert resolve_channel_name("telegram", "Alice (dm)") == "123"
             assert resolve_channel_name("telegram", "Dev Group (group)") == "456"
             assert resolve_channel_name("telegram", "Coaching Chat / topic 17585 (group)") == "-1001:17585"
+
+    def test_stale_delivery_labels_do_not_resolve_by_name(self, tmp_path):
+        platforms = {
+            "telegram": [
+                {
+                    "id": "-100999",
+                    "name": "Old Group",
+                    "type": "group",
+                    "delivery_status": "stale",
+                    "last_delivery_error": "Chat not found",
+                },
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            assert resolve_channel_name("telegram", "Old Group") is None
+            assert resolve_channel_name("telegram", "Old Group (group)") is None
+            assert resolve_channel_name("telegram", "-100999") == "-100999"
+
+
+class TestDeliveryStaleMetadata:
+    def _setup(self, tmp_path, platforms):
+        cache_file = _write_directory(tmp_path, platforms)
+        return patch("gateway.channel_directory.DIRECTORY_PATH", cache_file)
+
+    def test_permanent_send_failure_marks_entry_stale(self, tmp_path):
+        with self._setup(tmp_path, {
+            "telegram": [{"id": "-100999", "name": "Old Group", "type": "group"}],
+        }):
+            assert mark_channel_delivery_failed("telegram", "-100999", "Chat not found") is True
+            result = load_directory()
+
+        entry = result["platforms"]["telegram"][0]
+        assert entry["delivery_status"] == "stale"
+        assert entry["stale_reason"] == "delivery_failed"
+        assert "Chat not found" in entry["last_delivery_error"]
+        assert entry["last_delivery_failed_at"]
+
+    def test_transient_send_failure_does_not_mark_stale(self, tmp_path):
+        with self._setup(tmp_path, {
+            "telegram": [{"id": "-100999", "name": "Old Group", "type": "group"}],
+        }):
+            assert mark_channel_delivery_failed("telegram", "-100999", "Timed out") is False
+            result = load_directory()
+
+        assert "delivery_status" not in result["platforms"]["telegram"][0]
+
+    def test_success_clears_stale_delivery_metadata(self, tmp_path):
+        with self._setup(tmp_path, {
+            "telegram": [
+                {
+                    "id": "-100999",
+                    "name": "Old Group",
+                    "type": "group",
+                    "delivery_status": "stale",
+                    "stale_reason": "delivery_failed",
+                    "last_delivery_error": "Chat not found",
+                    "last_delivery_failed_at": "2026-01-01T00:00:00",
+                },
+            ],
+        }):
+            assert mark_channel_delivery_success("telegram", "-100999") is True
+            result = load_directory()
+
+        entry = result["platforms"]["telegram"][0]
+        assert "delivery_status" not in entry
+        assert "last_delivery_error" not in entry
+
+    def test_build_preserves_stale_metadata_from_previous_directory(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "telegram": [
+                {
+                    "id": "-100999",
+                    "name": "Old Group",
+                    "type": "group",
+                    "delivery_status": "stale",
+                    "stale_reason": "delivery_failed",
+                    "last_delivery_error": "Chat not found",
+                    "last_delivery_failed_at": "2026-01-01T00:00:00",
+                },
+            ],
+        })
+        TestBuildFromSessions()._write_sessions(tmp_path, {
+            "session_1": {
+                "origin": {
+                    "platform": "telegram",
+                    "chat_id": "-100999",
+                    "chat_name": "Old Group",
+                },
+                "chat_type": "group",
+            },
+        })
+
+        with (
+            patch("gateway.channel_directory.DIRECTORY_PATH", cache_file),
+            patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}),
+        ):
+            result = asyncio.run(build_channel_directory({}))
+
+        entry = result["platforms"]["telegram"][0]
+        assert entry["delivery_status"] == "stale"
+        assert entry["last_delivery_error"] == "Chat not found"
 
 
 class TestBuildFromSessions:

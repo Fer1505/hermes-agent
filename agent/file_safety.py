@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 
 def _hermes_home_path() -> Path:
@@ -72,6 +73,163 @@ def get_safe_write_root() -> Optional[str]:
         return None
 
 
+def _load_runtime_boundary_config() -> dict:
+    """Best-effort config load for runtime path boundary settings."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def _iter_path_values(value: object) -> Iterable[str]:
+    """Yield string path values from a scalar/list config or env setting."""
+    if value is None:
+        return
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                for item in parsed:
+                    yield from _iter_path_values(item)
+                return
+        for piece in text.replace(",", os.pathsep).split(os.pathsep):
+            piece = piece.strip()
+            if piece:
+                yield piece
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from _iter_path_values(item)
+
+
+def _resolve_boundary_path(path: str) -> Optional[str]:
+    try:
+        expanded = os.path.expandvars(os.path.expanduser(path))
+        return os.path.realpath(expanded)
+    except Exception:
+        return None
+
+
+def _dedupe_resolved_paths(paths: Iterable[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in paths:
+        resolved = _resolve_boundary_path(raw)
+        if resolved and resolved not in seen:
+            out.append(resolved)
+            seen.add(resolved)
+    return out
+
+
+def _nested_config_value(cfg: dict, keys: tuple[str, ...]) -> object:
+    cur: object = cfg
+    for key in keys:
+        if not isinstance(cur, dict) or key not in cur:
+            return None
+        cur = cur[key]
+    return cur
+
+
+def get_workspace_roots(config: Optional[dict] = None) -> list[str]:
+    """Return configured workspace read/cwd roots.
+
+    Supports both env vars and config spellings used by runtime manifests:
+    ``workspaceRoot`` / ``workspace_root`` at top level, under ``runtime``,
+    or under ``permissions``. Empty means no workspace boundary is active.
+    """
+    cfg = config if isinstance(config, dict) else _load_runtime_boundary_config()
+    raw_values: list[object] = [
+        os.getenv("HERMES_WORKSPACE_ROOTS"),
+        os.getenv("HERMES_WORKSPACE_ROOT"),
+        cfg.get("workspaceRoot"),
+        cfg.get("workspace_root"),
+        _nested_config_value(cfg, ("runtime", "workspaceRoot")),
+        _nested_config_value(cfg, ("runtime", "workspace_root")),
+        _nested_config_value(cfg, ("permissions", "workspaceRoot")),
+        _nested_config_value(cfg, ("permissions", "workspace_root")),
+    ]
+    return _dedupe_resolved_paths(
+        path for value in raw_values for path in _iter_path_values(value)
+    )
+
+
+def get_writable_surfaces(config: Optional[dict] = None) -> list[str]:
+    """Return configured write/cwd roots.
+
+    ``HERMES_WRITE_SAFE_ROOT`` remains the backward-compatible single-root
+    setting. The plural env/config forms support multiple writable surfaces.
+    If only ``workspaceRoot`` is configured, it is also used as the writable
+    surface so a workspace-only manifest still gets write protection.
+    """
+    cfg = config if isinstance(config, dict) else _load_runtime_boundary_config()
+    raw_values: list[object] = [
+        os.getenv("HERMES_WRITE_SAFE_ROOTS"),
+        os.getenv("HERMES_WRITE_SAFE_ROOT"),
+        cfg.get("writableSurfaces"),
+        cfg.get("writable_surfaces"),
+        _nested_config_value(cfg, ("runtime", "writableSurfaces")),
+        _nested_config_value(cfg, ("runtime", "writable_surfaces")),
+        _nested_config_value(cfg, ("permissions", "writableSurfaces")),
+        _nested_config_value(cfg, ("permissions", "writable_surfaces")),
+        _nested_config_value(cfg, ("terminal", "writableSurfaces")),
+        _nested_config_value(cfg, ("terminal", "writable_surfaces")),
+        _nested_config_value(cfg, ("terminal", "write_safe_root")),
+    ]
+    surfaces = _dedupe_resolved_paths(
+        path for value in raw_values for path in _iter_path_values(value)
+    )
+    return surfaces or get_workspace_roots(cfg)
+
+
+def is_path_within_roots(path: str, roots: Iterable[str], cwd: str | None = None) -> bool:
+    """Return True when *path* resolves inside one of *roots*."""
+    if not path:
+        return False
+    candidate = os.path.expandvars(os.path.expanduser(str(path)))
+    if cwd and not os.path.isabs(candidate):
+        candidate = os.path.join(cwd, candidate)
+    resolved = os.path.realpath(candidate)
+    for root in roots:
+        root_resolved = os.path.realpath(os.path.expanduser(str(root)))
+        if resolved == root_resolved or resolved.startswith(root_resolved + os.sep):
+            return True
+    return False
+
+
+def get_path_boundary_error(
+    path: str,
+    *,
+    purpose: str,
+    cwd: str | None = None,
+    config: Optional[dict] = None,
+) -> Optional[str]:
+    """Return a boundary error for a configured read/write/workdir path.
+
+    No configured roots means fail-open for backward compatibility. This is
+    intentionally a path guard, not a shell sandbox: terminal commands can
+    still reference absolute paths after launch unless the backend itself is
+    sandboxed.
+    """
+    roots = get_workspace_roots(config) if purpose == "read" else get_writable_surfaces(config)
+    if not roots:
+        return None
+    if is_path_within_roots(path, roots, cwd=cwd):
+        return None
+    roots_text = ", ".join(roots)
+    return (
+        f"Path boundary denied for {purpose}: {path!r} resolves outside "
+        f"configured root(s): {roots_text}"
+    )
+
+
 def is_write_denied(path: str) -> bool:
     """Return True if path is blocked by the write denylist or safe root."""
     home = os.path.realpath(os.path.expanduser("~"))
@@ -83,8 +241,11 @@ def is_write_denied(path: str) -> bool:
         if resolved.startswith(prefix):
             return True
 
-    safe_root = get_safe_write_root()
-    if safe_root and not (resolved == safe_root or resolved.startswith(safe_root + os.sep)):
+    safe_roots = get_writable_surfaces()
+    if safe_roots and not any(
+        resolved == root or resolved.startswith(root + os.sep)
+        for root in safe_roots
+    ):
         return True
 
     return False

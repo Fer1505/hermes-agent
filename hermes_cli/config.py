@@ -669,6 +669,17 @@ DEFAULT_CONFIG = {
         "persistent_shell": True,
     },
 
+    "runtime": {
+        # Optional path boundaries for file/terminal tools. Empty means
+        # backward-compatible no boundary. When set, workspaceRoot gates
+        # reads/searches and terminal cwd/workdir; writableSurfaces gates
+        # file writes/patches and terminal cwd/workdir. If writableSurfaces
+        # is empty but workspaceRoot is set, workspaceRoot is also used as
+        # the writable surface.
+        "workspaceRoot": "",
+        "writableSurfaces": [],
+    },
+
     "web": {
         "backend": "",           # shared fallback — applies to both search and extract
         "search_backend": "",    # per-capability override for web_search (e.g. "searxng")

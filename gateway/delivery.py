@@ -251,8 +251,31 @@ class DeliveryRouter:
         send_metadata = dict(metadata or {})
         if target.thread_id and "thread_id" not in send_metadata:
             send_metadata["thread_id"] = target.thread_id
-        return await adapter.send(target.chat_id, content, metadata=send_metadata or None)
+        result = await adapter.send(target.chat_id, content, metadata=send_metadata or None)
+        if result and getattr(result, "success", True) is False:
+            error = getattr(result, "error", "unknown delivery failure")
+            try:
+                from gateway.channel_directory import mark_channel_delivery_failed
+                mark_channel_delivery_failed(
+                    target.platform.value,
+                    target.chat_id,
+                    error,
+                    thread_id=target.thread_id,
+                )
+            except Exception:
+                pass
+            raise ValueError(f"{target.platform.value} delivery failed: {error}")
 
+        try:
+            from gateway.channel_directory import mark_channel_delivery_success
+            mark_channel_delivery_success(
+                target.platform.value,
+                target.chat_id,
+                thread_id=target.thread_id,
+            )
+        except Exception:
+            pass
+        return result
 
 
 

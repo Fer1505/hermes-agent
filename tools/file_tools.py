@@ -8,7 +8,7 @@ import os
 import threading
 from pathlib import Path
 
-from agent.file_safety import get_read_block_error
+from agent.file_safety import get_path_boundary_error, get_read_block_error
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
     ShellFileOperations,
@@ -462,6 +462,13 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
         _resolved = _resolve_path_for_task(path, task_id)
 
+        boundary_err = get_path_boundary_error(
+            str(_resolved),
+            purpose="read",
+        )
+        if boundary_err:
+            return tool_error(boundary_err)
+
         # ── Binary file guard ─────────────────────────────────────────
         # Block binary files by extension (no I/O).
         if has_binary_extension(str(_resolved)):
@@ -792,6 +799,15 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
 
 def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
     """Write content to a file."""
+    try:
+        boundary_err = get_path_boundary_error(
+            str(_resolve_path_for_task(path, task_id)),
+            purpose="write",
+        )
+    except Exception:
+        boundary_err = get_path_boundary_error(path, purpose="write")
+    if boundary_err:
+        return tool_error(boundary_err)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -860,6 +876,15 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         for _m in _re.finditer(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
             _paths_to_check.append(_m.group(1).strip())
     for _p in _paths_to_check:
+        try:
+            boundary_err = get_path_boundary_error(
+                str(_resolve_path_for_task(_p, task_id)),
+                purpose="write",
+            )
+        except Exception:
+            boundary_err = get_path_boundary_error(_p, purpose="write")
+        if boundary_err:
+            return tool_error(boundary_err)
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)
@@ -984,6 +1009,16 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 "pattern": pattern,
                 "already_searched": count,
             }, ensure_ascii=False)
+
+        try:
+            boundary_err = get_path_boundary_error(
+                str(_resolve_path_for_task(path, task_id)),
+                purpose="read",
+            )
+        except Exception:
+            boundary_err = get_path_boundary_error(path, purpose="read")
+        if boundary_err:
+            return tool_error(boundary_err)
 
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(

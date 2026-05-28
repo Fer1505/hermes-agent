@@ -319,6 +319,7 @@ def _reset_cached_sudo_passwords() -> None:
 from tools.approval import (
     check_all_command_guards as _check_all_guards_impl,
 )
+from agent.file_safety import get_path_boundary_error
 
 
 def _check_all_guards(command: str, env_type: str) -> dict:
@@ -1740,6 +1741,20 @@ def terminal_tool(
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
+        effective_workdir = workdir or cwd
+        boundary_err = get_path_boundary_error(
+            effective_workdir,
+            purpose="workdir",
+            cwd=cwd,
+        )
+        if boundary_err:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": boundary_err,
+                "status": "blocked",
+            }, ensure_ascii=False)
+
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
         if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:
@@ -1926,7 +1941,7 @@ def terminal_tool(
             from tools.process_registry import process_registry
 
             session_key = get_current_session_key(default="")
-            effective_cwd = workdir or cwd
+            effective_cwd = effective_workdir
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
@@ -2035,7 +2050,7 @@ def terminal_tool(
                 try:
                     execute_kwargs = {
                         "timeout": effective_timeout,
-                        "cwd": workdir or cwd,
+                        "cwd": effective_workdir,
                     }
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
