@@ -726,6 +726,75 @@ class TestDeliverResultWrapping:
         assert "MEDIA:" not in text_sent
         assert "Report" in text_sent
 
+    def test_live_adapter_success_clears_stale_delivery_metadata(self, tmp_path):
+        from gateway.channel_directory import load_directory
+        from gateway.config import Platform
+        from concurrent.futures import Future
+
+        directory_path = tmp_path / "channel_directory.json"
+        directory_path.write_text(json.dumps({
+            "updated_at": "2026-01-01T00:00:00",
+            "platforms": {
+                "telegram": [
+                    {
+                        "id": "-100123:42",
+                        "name": "Ops / alerts",
+                        "type": "group",
+                        "delivery_status": "stale",
+                        "stale_reason": "delivery_failed",
+                        "last_delivery_error": "Forbidden: bot was blocked",
+                        "last_delivery_failed_at": "2026-01-01T00:00:00",
+                    },
+                ],
+            },
+        }))
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(success=True)
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            future.set_result(MagicMock(success=True))
+            coro.close()
+            return future
+
+        job = {
+            "id": "stale-clear",
+            "deliver": "origin",
+            "origin": {
+                "platform": "telegram",
+                "chat_id": "-100123",
+                "thread_id": "42",
+            },
+        }
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("gateway.channel_directory.DIRECTORY_PATH", directory_path), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+            result = _deliver_result(
+                job,
+                "Recovered delivery",
+                adapters={Platform.TELEGRAM: adapter},
+                loop=loop,
+            )
+            directory = load_directory()
+
+        assert result is None
+        entry = directory["platforms"]["telegram"][0]
+        assert "delivery_status" not in entry
+        assert "stale_reason" not in entry
+        assert "last_delivery_error" not in entry
+        assert "last_delivery_failed_at" not in entry
+
     def test_no_mirror_to_session_call(self):
         """Cron deliveries should NOT mirror into the gateway session."""
         from gateway.config import Platform

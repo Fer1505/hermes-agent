@@ -636,6 +636,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
 
                 if adapter_ok:
+                    try:
+                        from gateway.channel_directory import mark_channel_delivery_success
+                        mark_channel_delivery_success(
+                            platform_name,
+                            chat_id,
+                            thread_id=thread_id,
+                        )
+                    except Exception:
+                        pass
                     logger.info("Job '%s': delivered to %s:%s via live adapter", job["id"], platform_name, chat_id)
                     delivered = True
             except Exception as e:

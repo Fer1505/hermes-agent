@@ -143,6 +143,40 @@ class TestSendMessageTool:
             force_document=False,
         )
 
+    def test_bluebubbles_explicit_target_does_not_require_home_channel(self):
+        bluebubbles_cfg = SimpleNamespace(enabled=True, token=None, extra={})
+        config = SimpleNamespace(
+            platforms={Platform.BLUEBUBBLES: bluebubbles_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "bluebubbles:franklindelarosa@gmail.com",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert "No home channel" not in json.dumps(result)
+        send_mock.assert_awaited_once_with(
+            Platform.BLUEBUBBLES,
+            bluebubbles_cfg,
+            "franklindelarosa@gmail.com",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+        )
+
     def test_display_label_target_resolves_via_channel_directory(self, tmp_path):
         config, telegram_cfg = _make_config()
         cache_file = tmp_path / "channel_directory.json"
@@ -288,6 +322,7 @@ class TestSendMessageTool:
             source_label="telegram",
             thread_id=None,
             user_id="user-123",
+            provider_message_id=None,
         )
 
     def test_top_level_send_failure_redacts_query_token(self):
@@ -998,6 +1033,19 @@ class TestParseTargetRefE164:
         assert _parse_target_ref("telegram", "+15551234567")[2] is False
         assert _parse_target_ref("discord", "+15551234567")[2] is False
         assert _parse_target_ref("matrix", "+15551234567")[2] is False
+
+    def test_bluebubbles_direct_identifiers_are_explicit(self):
+        assert _parse_target_ref("bluebubbles", "franklindelarosa@gmail.com") == (
+            "franklindelarosa@gmail.com",
+            None,
+            True,
+        )
+        assert _parse_target_ref("bluebubbles", "+15025551212") == (
+            "+15025551212",
+            None,
+            True,
+        )
+        assert _parse_target_ref("bluebubbles", "   ")[2] is False
 
 
 class TestParseTargetRefSlack:
