@@ -7,7 +7,16 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
+from cron.scheduler import (
+    _bad_human_facing_cron_output_reason,
+    _resolve_origin,
+    _resolve_delivery_target,
+    _deliver_result,
+    _send_media_via_adapter,
+    run_job,
+    SILENT_MARKER,
+    _build_job_prompt,
+)
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -1536,6 +1545,119 @@ class TestRunJobConfigEnvVarExpansion:
             "config.yaml ${VAR} in fallback_providers was not expanded."
         )
 
+    def test_auth_fallback_uses_fallback_provider_model(self, tmp_path, monkeypatch):
+        """Auth fallback must swap both provider and model before AIAgent init."""
+        from hermes_cli.auth import AuthError
+
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  provider: openai-codex\n"
+            "  default: gpt-5.5\n"
+            "fallback_providers:\n"
+            "  - provider: custom\n"
+            "    model: gemma4:e4b\n"
+            "    base_url: http://127.0.0.1:11434/v1\n"
+            "fallback_policy:\n"
+            "  cron:\n"
+            "    allow_on_auth_error: true\n"
+        )
+        monkeypatch.delenv("HERMES_MODEL", raising=False)
+
+        job = {"id": "fb-auth-job", "name": "fallback auth test", "prompt": "hi"}
+        fake_db = MagicMock()
+
+        def _resolve_runtime_provider(**kwargs):
+            if len(resolve_calls) == 0:
+                resolve_calls.append(kwargs)
+                raise AuthError("codex auth failed", provider="openai-codex")
+            resolve_calls.append(kwargs)
+            return {
+                "api_key": "no-key-required",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "provider": "custom",
+                "api_mode": "chat_completions",
+            }
+
+        resolve_calls = []
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   side_effect=_resolve_runtime_provider), \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+             patch("agent.credential_pool.load_pool") as load_pool_mock, \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            pool = MagicMock()
+            pool.has_credentials.return_value = False
+            load_pool_mock.return_value = pool
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, _output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        assert resolve_calls == [
+            {"requested": None},
+            {
+                "requested": "custom",
+                "explicit_base_url": "http://127.0.0.1:11434/v1",
+                "target_model": "gemma4:e4b",
+            },
+        ]
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["provider"] == "custom"
+        assert kwargs["model"] == "gemma4:e4b"
+        assert kwargs["base_url"] == "http://127.0.0.1:11434/v1"
+
+    def test_auth_fallback_can_fail_closed_for_non_local_delivery(self, tmp_path, monkeypatch):
+        """Human-facing cron jobs can refuse fallback when primary auth fails."""
+        from hermes_cli.auth import AuthError
+
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  provider: openai-codex\n"
+            "  default: gpt-5.5\n"
+            "fallback_providers:\n"
+            "  - provider: custom\n"
+            "    model: gemma4:e4b\n"
+            "    base_url: http://127.0.0.1:11434/v1\n"
+        )
+        monkeypatch.delenv("HERMES_MODEL", raising=False)
+
+        job = {
+            "id": "fb-auth-job",
+            "name": "fallback auth test",
+            "prompt": "hi",
+            "deliver": "telegram:123",
+        }
+        fake_db = MagicMock()
+        resolve_calls = []
+
+        def _resolve_runtime_provider(**kwargs):
+            resolve_calls.append(kwargs)
+            raise AuthError("codex auth failed", provider="openai-codex")
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   side_effect=_resolve_runtime_provider), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert "(FAILED)" in output
+        assert final_response == ""
+        assert "codex auth failed" in error
+        assert resolve_calls == [{"requested": None}]
+        mock_agent_cls.assert_not_called()
+
     def test_unexpanded_ref_passthrough_when_var_unset(self, tmp_path, monkeypatch):
         """When the env var is not set, the literal ${VAR} is kept verbatim (not crashed)."""
         (tmp_path / "config.yaml").write_text("model: ${_HERMES_TEST_CRON_UNSET_VAR}\n")
@@ -1762,6 +1884,71 @@ class TestRunJobSkillBacked:
         assert "Instructions for blogwatcher." in prompt_arg
         assert "Instructions for maps." in prompt_arg
         assert "Combine the results." in prompt_arg
+
+
+class TestCronOutputValidation:
+    def _telegram_job(self):
+        return {
+            "id": "cron-validate-job",
+            "name": "validator",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+    @pytest.mark.parametrize(
+        ("response", "reason_fragment"),
+        [
+            ("How can I help you today?", "generic assistant"),
+            ("I need more context to complete this.", "asked for context"),
+            ("Tool 'web_search' does not exist. Available tools: terminal", "nonexistent tool"),
+            ("```tool_code\nprint('x')\n```", "tool-call syntax"),
+            ('{"recipient_name":"functions.exec_command","tool_uses":[]}', "tool-call syntax"),
+            ("[NO ACTION REQUIRED]", "suppression marker"),
+        ],
+    )
+    def test_bad_human_facing_cron_output_is_rejected(self, response, reason_fragment):
+        reason = _bad_human_facing_cron_output_reason(self._telegram_job(), response)
+        assert reason is not None
+        assert reason_fragment in reason
+
+    def test_silent_marker_is_not_rejected(self):
+        assert _bad_human_facing_cron_output_reason(self._telegram_job(), "[SILENT]") is None
+
+    def test_no_action_required_is_allowed_for_local_audit_jobs(self):
+        job = {"id": "local-job", "deliver": "local"}
+        assert _bad_human_facing_cron_output_reason(job, "[NO ACTION REQUIRED]") is None
+
+    def test_tick_rejects_bad_output_before_save_deliver_and_mark(self):
+        from cron.scheduler import tick
+
+        job = self._telegram_job()
+        saved_output = {}
+
+        def _save_job_output(job_id, output):
+            saved_output["job_id"] = job_id
+            saved_output["output"] = output
+            return "/tmp/out.md"
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.run_job",
+                   return_value=(True, "# output", "How can I help you today?", None)), \
+             patch("cron.scheduler.save_job_output", side_effect=_save_job_output), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            tick(verbose=False)
+
+        assert saved_output["job_id"] == "cron-validate-job"
+        assert "Cron Output Rejected" in saved_output["output"]
+        assert "How can I help you today?" in saved_output["output"]
+        deliver_mock.assert_called_once()
+        delivered_text = deliver_mock.call_args.args[1]
+        assert "failed" in delivered_text.lower()
+        assert "Rejected cron final output" in delivered_text
+        mark_mock.assert_called_once()
+        assert mark_mock.call_args.args[0] == "cron-validate-job"
+        assert mark_mock.call_args.args[1] is False
+        assert "Rejected cron final output" in mark_mock.call_args.args[2]
 
 
 class TestSilentDelivery:

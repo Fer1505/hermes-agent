@@ -671,6 +671,25 @@ logger = logging.getLogger(__name__)
 _AGENT_PENDING_SENTINEL = object()
 
 
+def _truthy_config_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _gateway_auth_fallback_disabled(cfg: dict) -> bool:
+    policy = cfg.get("fallback_policy") or {}
+    if isinstance(policy, dict):
+        gateway_policy = policy.get("gateway") or {}
+        if isinstance(gateway_policy, dict) and gateway_policy.get("allow_on_auth_error") is True:
+            return False
+    return True
+
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
@@ -691,8 +710,15 @@ def _resolve_runtime_agent_kwargs() -> dict:
     except AuthError as auth_exc:
         # Primary provider auth failed (expired token, revoked key, etc.).
         # Try the fallback provider chain before raising.
+        cfg = _load_gateway_config()
+        if _gateway_auth_fallback_disabled(cfg):
+            logger.error(
+                "Primary provider auth failed and gateway auth fallback is disabled: %s",
+                auth_exc,
+            )
+            raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
         logger.warning("Primary provider auth failed: %s — trying fallback", auth_exc)
-        fb_config = _try_resolve_fallback_provider()
+        fb_config = _try_resolve_fallback_provider(cfg)
         if fb_config is not None:
             return fb_config
         raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
@@ -710,16 +736,11 @@ def _resolve_runtime_agent_kwargs() -> dict:
     }
 
 
-def _try_resolve_fallback_provider() -> dict | None:
+def _try_resolve_fallback_provider(config: dict | None = None) -> dict | None:
     """Attempt to resolve credentials from the fallback_model/fallback_providers config."""
     from hermes_cli.runtime_provider import resolve_runtime_provider
     try:
-        import yaml as _y
-        cfg_path = _hermes_home / "config.yaml"
-        if not cfg_path.exists():
-            return None
-        with open(cfg_path, encoding="utf-8") as _f:
-            cfg = _y.safe_load(_f) or {}
+        cfg = config if config is not None else _load_gateway_config()
         fb = cfg.get("fallback_providers") or cfg.get("fallback_model")
         if not fb:
             return None
@@ -729,15 +750,21 @@ def _try_resolve_fallback_provider() -> dict | None:
             if not isinstance(entry, dict):
                 continue
             try:
+                fb_model = str(entry.get("model") or entry.get("default_model") or "").strip()
+                resolve_kwargs = {
+                    "requested": entry.get("provider"),
+                    "explicit_base_url": entry.get("base_url"),
+                    "explicit_api_key": entry.get("api_key"),
+                }
+                if fb_model:
+                    resolve_kwargs["target_model"] = fb_model
                 runtime = resolve_runtime_provider(
-                    requested=entry.get("provider"),
-                    explicit_base_url=entry.get("base_url"),
-                    explicit_api_key=entry.get("api_key"),
+                    **resolve_kwargs,
                 )
                 logger.info(
                     "Fallback provider resolved: %s model=%s",
                     runtime.get("provider"),
-                    entry.get("model"),
+                    fb_model,
                 )
                 return {
                     "api_key": runtime.get("api_key"),
@@ -747,7 +774,7 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "command": runtime.get("command"),
                     "args": list(runtime.get("args") or []),
                     "credential_pool": runtime.get("credential_pool"),
-                    "model": entry.get("model"),
+                    "model": fb_model or runtime.get("model"),
                 }
             except Exception as fb_exc:
                 logger.debug("Fallback entry %s failed: %s", entry.get("provider"), fb_exc)
@@ -2543,6 +2570,8 @@ class GatewayRunner:
             if cfg_path.exists():
                 with open(cfg_path, encoding="utf-8") as _f:
                     cfg = _y.safe_load(_f) or {}
+                if _gateway_auth_fallback_disabled(cfg):
+                    return None
                 fb = cfg.get("fallback_providers") or cfg.get("fallback_model") or None
                 if fb:
                     return fb

@@ -181,16 +181,26 @@ model:
 fallback_providers:
   - provider: openrouter
     model: minimax/minimax-m2.7
+fallback_policy:
+  gateway:
+    allow_on_auth_error: true
 """.lstrip(),
         encoding="utf-8",
     )
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
-    def fake_resolve_runtime_provider(*, requested=None, explicit_base_url=None, explicit_api_key=None):
+    def fake_resolve_runtime_provider(
+        *,
+        requested=None,
+        explicit_base_url=None,
+        explicit_api_key=None,
+        target_model=None,
+    ):
         if requested in {None, "", "openai-codex"}:
             from hermes_cli.auth import AuthError
             raise AuthError("No Codex credentials stored. Run `hermes auth` to authenticate.")
         assert requested == "openrouter"
+        assert target_model == "minimax/minimax-m2.7"
         return {
             "api_key": "sk-openrouter",
             "base_url": "https://openrouter.ai/api/v1",
@@ -218,3 +228,38 @@ fallback_providers:
     assert runtime_kwargs["provider"] == "openrouter"
     assert runtime_kwargs["api_key"] == "sk-openrouter"
 
+
+def test_gateway_auth_fallback_can_fail_closed(tmp_path, monkeypatch):
+    """Gateway can fail closed instead of falling back after primary auth failure."""
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """
+model:
+  default: gpt-5.5
+  provider: openai-codex
+gateway:
+  fail_closed_on_primary_auth_error: true
+fallback_providers:
+  - provider: custom
+    model: gemma4:e4b
+    base_url: http://127.0.0.1:11434/v1
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    calls = []
+
+    def fake_resolve_runtime_provider(**kwargs):
+        calls.append(kwargs)
+        from hermes_cli.auth import AuthError
+        raise AuthError("No Codex credentials stored. Run `hermes auth` to authenticate.")
+
+    import hermes_cli.runtime_provider as runtime_provider
+
+    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", fake_resolve_runtime_provider)
+
+    with pytest.raises(RuntimeError, match="Codex|credentials|authenticate"):
+        gateway_run._resolve_runtime_agent_kwargs()
+
+    assert calls == [{"requested": None}]

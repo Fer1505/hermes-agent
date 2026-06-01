@@ -14,6 +14,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -128,6 +129,129 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
+
+
+def _cron_job_delivers_outside_local(job: dict) -> bool:
+    """Return True when a cron job intends to send output beyond local audit."""
+    deliver = _normalize_deliver_value(job.get("deliver", "local")).strip().lower()
+    if deliver and deliver != "local":
+        return True
+    origin = _resolve_origin(job)
+    return bool(origin and str(origin.get("platform") or "").lower() != "local")
+
+
+def _truthy_config_value(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _cron_auth_fallback_disabled_for_job(cfg: dict, job: dict) -> bool:
+    """Whether this job should fail closed instead of using auth fallback."""
+    if job.get("allow_auth_fallback") is True:
+        return False
+    if not _cron_job_delivers_outside_local(job):
+        return False
+
+    policy = (cfg or {}).get("fallback_policy") or {}
+    if isinstance(policy, dict):
+        cron_policy = policy.get("cron") or {}
+        if isinstance(cron_policy, dict) and cron_policy.get("allow_on_auth_error") is True:
+            return False
+    return True
+
+
+def _bad_human_facing_cron_output_reason(job: dict, final_response: str) -> str | None:
+    """Detect fallback/tool-corruption replies that should not be delivered.
+
+    The checks are intentionally narrow: cron may produce many kinds of valid
+    summaries, but short generic assistant prompts, fake tool syntax, and
+    nonexistent-tool diagnostics are never acceptable user-facing cron output.
+    """
+    text = (final_response or "").strip()
+    if not text:
+        return None
+    if text.upper().startswith(SILENT_MARKER):
+        return None
+
+    squashed = re.sub(r"\s+", " ", text).strip()
+    lower = squashed.lower()
+
+    generic_exact = {
+        "how can i help you today?",
+        "how may i help you today?",
+        "what can i help you with?",
+        "what can i help you with today?",
+    }
+    if lower in generic_exact:
+        return "generic assistant prompt"
+
+    generic_prefixes = (
+        "how can i help",
+        "how may i help",
+        "what can i help",
+        "what would you like me to do",
+    )
+    if len(squashed) <= 180 and lower.startswith(generic_prefixes):
+        return "generic assistant prompt"
+
+    context_deflections = (
+        "i need more context",
+        "i need additional context",
+        "i need more information",
+        "i need additional information",
+        "please provide more context",
+        "could you please provide",
+        "could you please tell me what you would like me to do",
+    )
+    if len(squashed) <= 320 and any(phrase in lower for phrase in context_deflections):
+        return "cron asked for context instead of completing the scheduled task"
+
+    if re.search(r"tool ['\"][^'\"]+['\"] does not exist", text, re.IGNORECASE):
+        return "nonexistent tool error leaked into final response"
+    if "available tools:" in lower and "does not exist" in lower:
+        return "nonexistent tool error leaked into final response"
+
+    raw_tool_markers = (
+        "<|tool_code|>",
+        "```tool_code",
+        "<tool_call",
+        "recipient_name",
+        "tool_uses",
+        "commentary to=functions.",
+        "assistant to=functions.",
+    )
+    if any(marker in lower for marker in raw_tool_markers):
+        return "raw or fake tool-call syntax leaked into final response"
+
+    if lower.startswith("[no action required]") and _cron_job_delivers_outside_local(job):
+        return "[NO ACTION REQUIRED] is not a valid delivery suppression marker"
+
+    return None
+
+
+def _format_rejected_cron_output(
+    output: str,
+    final_response: str,
+    reason: str,
+) -> str:
+    """Append an audit section explaining why a cron response was rejected."""
+    rejected = (final_response or "").strip()
+    if len(rejected) > 4000:
+        rejected = rejected[:4000].rstrip() + "\n... [truncated]"
+    quoted = "\n".join(f"> {line}" if line else ">" for line in rejected.splitlines())
+    return (
+        f"{(output or '').rstrip()}\n\n"
+        "## Cron Output Rejected\n\n"
+        f"Reason: {reason}\n\n"
+        "Rejected final response:\n\n"
+        f"{quoted}\n"
+    )
+
 
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _hermes_home: Path | None = None
@@ -1419,6 +1543,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             runtime = resolve_runtime_provider(**runtime_kwargs)
         except AuthError as auth_exc:
             # Primary provider auth failed — try fallback chain before giving up.
+            if _cron_auth_fallback_disabled_for_job(_cfg, job):
+                logger.error(
+                    "Job '%s': primary auth failed and auth fallback is disabled for non-local delivery: %s",
+                    job_id,
+                    auth_exc,
+                )
+                raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
             logger.warning("Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc)
             fb = _cfg.get("fallback_providers") or _cfg.get("fallback_model")
             fb_list = (fb if isinstance(fb, list) else [fb]) if fb else []
@@ -1427,12 +1558,19 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 if not isinstance(entry, dict):
                     continue
                 try:
+                    fb_model = str(entry.get("model") or entry.get("default_model") or "").strip()
                     fb_kwargs = {"requested": entry.get("provider")}
                     if entry.get("base_url"):
                         fb_kwargs["explicit_base_url"] = entry["base_url"]
                     if entry.get("api_key"):
                         fb_kwargs["explicit_api_key"] = entry["api_key"]
+                    if fb_model:
+                        fb_kwargs["target_model"] = fb_model
                     runtime = resolve_runtime_provider(**fb_kwargs)
+                    if fb_model:
+                        model = fb_model
+                    elif runtime.get("model"):
+                        model = runtime["model"]
                     logger.info("Job '%s': fallback resolved to %s", job_id, runtime.get("provider"))
                     break
                 except Exception as fb_exc:
@@ -1443,7 +1581,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
 
-        fallback_model = _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
+        fallback_model = None
+        if not _cron_auth_fallback_disabled_for_job(_cfg, job):
+            fallback_model = _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:
@@ -1792,6 +1932,17 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             """Run one due job end-to-end: execute, save, deliver, mark."""
             try:
                 success, output, final_response, error = run_job(job)
+                if success and not job.get("no_agent"):
+                    rejection_reason = _bad_human_facing_cron_output_reason(job, final_response)
+                    if rejection_reason:
+                        success = False
+                        error = f"Rejected cron final output: {rejection_reason}"
+                        output = _format_rejected_cron_output(
+                            output,
+                            final_response,
+                            rejection_reason,
+                        )
+                        final_response = ""
 
                 output_file = save_job_output(job["id"], output)
                 if verbose:
