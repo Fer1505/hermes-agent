@@ -154,8 +154,6 @@ def _cron_auth_fallback_disabled_for_job(cfg: dict, job: dict) -> bool:
     """Whether this job should fail closed instead of using auth fallback."""
     if job.get("allow_auth_fallback") is True:
         return False
-    if not _cron_job_delivers_outside_local(job):
-        return False
 
     policy = (cfg or {}).get("fallback_policy") or {}
     if isinstance(policy, dict):
@@ -166,11 +164,11 @@ def _cron_auth_fallback_disabled_for_job(cfg: dict, job: dict) -> bool:
 
 
 def _bad_human_facing_cron_output_reason(job: dict, final_response: str) -> str | None:
-    """Detect fallback/tool-corruption replies that should not be delivered.
+    """Detect fallback/tool-corruption replies that should not be accepted.
 
     The checks are intentionally narrow: cron may produce many kinds of valid
     summaries, but short generic assistant prompts, fake tool syntax, and
-    nonexistent-tool diagnostics are never acceptable user-facing cron output.
+    nonexistent-tool diagnostics are never acceptable cron output.
     """
     text = (final_response or "").strip()
     if not text:
@@ -228,7 +226,7 @@ def _bad_human_facing_cron_output_reason(job: dict, final_response: str) -> str 
     if any(marker in lower for marker in raw_tool_markers):
         return "raw or fake tool-call syntax leaked into final response"
 
-    if lower.startswith("[no action required]") and _cron_job_delivers_outside_local(job):
+    if lower.startswith("[no action required]"):
         return "[NO ACTION REQUIRED] is not a valid delivery suppression marker"
 
     return None
@@ -1545,7 +1543,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             # Primary provider auth failed — try fallback chain before giving up.
             if _cron_auth_fallback_disabled_for_job(_cfg, job):
                 logger.error(
-                    "Job '%s': primary auth failed and auth fallback is disabled for non-local delivery: %s",
+                    "Job '%s': primary auth failed and cron auth fallback is disabled: %s",
                     job_id,
                     auth_exc,
                 )

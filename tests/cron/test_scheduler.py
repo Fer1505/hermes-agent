@@ -1518,6 +1518,9 @@ class TestRunJobConfigEnvVarExpansion:
             "fallback_providers:\n"
             "  - provider: openrouter\n"
             "    model: ${_HERMES_TEST_CRON_FALLBACK}\n"
+            "fallback_policy:\n"
+            "  cron:\n"
+            "    allow_on_auth_error: true\n"
         )
         monkeypatch.setenv("_HERMES_TEST_CRON_FALLBACK", "gpt-4o-fallback-test")
 
@@ -1614,8 +1617,8 @@ class TestRunJobConfigEnvVarExpansion:
         assert kwargs["model"] == "gemma4:e4b"
         assert kwargs["base_url"] == "http://127.0.0.1:11434/v1"
 
-    def test_auth_fallback_can_fail_closed_for_non_local_delivery(self, tmp_path, monkeypatch):
-        """Human-facing cron jobs can refuse fallback when primary auth fails."""
+    def test_auth_fallback_fails_closed_by_default_for_cron_jobs(self, tmp_path, monkeypatch):
+        """Cron jobs refuse fallback by default when primary auth fails."""
         from hermes_cli.auth import AuthError
 
         (tmp_path / "config.yaml").write_text(
@@ -1633,7 +1636,7 @@ class TestRunJobConfigEnvVarExpansion:
             "id": "fb-auth-job",
             "name": "fallback auth test",
             "prompt": "hi",
-            "deliver": "telegram:123",
+            "deliver": "local",
         }
         fake_db = MagicMock()
         resolve_calls = []
@@ -1914,9 +1917,11 @@ class TestCronOutputValidation:
     def test_silent_marker_is_not_rejected(self):
         assert _bad_human_facing_cron_output_reason(self._telegram_job(), "[SILENT]") is None
 
-    def test_no_action_required_is_allowed_for_local_audit_jobs(self):
+    def test_no_action_required_is_rejected_for_local_audit_jobs(self):
         job = {"id": "local-job", "deliver": "local"}
-        assert _bad_human_facing_cron_output_reason(job, "[NO ACTION REQUIRED]") is None
+        reason = _bad_human_facing_cron_output_reason(job, "[NO ACTION REQUIRED]")
+        assert reason is not None
+        assert "suppression marker" in reason
 
     def test_tick_rejects_bad_output_before_save_deliver_and_mark(self):
         from cron.scheduler import tick
