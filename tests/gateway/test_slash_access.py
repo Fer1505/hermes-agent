@@ -123,8 +123,8 @@ class TestPolicyFromExtra:
         }
         dm = policy_from_extra(extra, "dm")
         gp = policy_from_extra(extra, "group")
-        assert dm.admin_user_ids == frozenset({"111"})
-        assert gp.admin_user_ids == frozenset({"222"})
+        assert dm.admin_user_ids == frozenset({"111", "222"})
+        assert gp.admin_user_ids == frozenset({"111", "222"})
         assert dm.user_allowed_commands == frozenset({"status"})
         # group's user_allowed_commands does not leak into DM's allowed list
         # except via the explicit fallback rule (only when DM list is unset).
@@ -140,22 +140,22 @@ class TestPolicyFromExtra:
         dm = policy_from_extra(extra, "dm")
         assert dm.user_allowed_commands == frozenset({"status", "model"})
 
-    def test_dm_admin_does_not_imply_group_admin(self):
-        # Admin lists are scope-specific. DM admin must not auto-promote in groups.
+    def test_admin_identity_shared_across_dm_and_group_lanes(self):
+        # Admin identity is shared so an operator does not lose admin status
+        # just because the same platform message arrives from a group lane.
         extra = {"allow_admin_from": ["111"]}
         dm = policy_from_extra(extra, "dm")
         gp = policy_from_extra(extra, "group")
         assert dm.is_admin("111") is True
-        # Group has no admin list set → gating disabled in groups → "111"
-        # gets unrestricted access, but that's the backward-compat fallback,
-        # not implicit admin promotion. The distinction matters when the
-        # group DOES have an admin list set:
+        assert gp.is_admin("111") is True
+
+        # Group-specific compatibility admins join the same admin set.
         extra2 = {
             "allow_admin_from": ["111"],
             "group_allow_admin_from": ["222"],
         }
         gp2 = policy_from_extra(extra2, "group")
-        assert gp2.is_admin("111") is False
+        assert gp2.is_admin("111") is True
         assert gp2.is_admin("222") is True
 
 
@@ -220,7 +220,7 @@ class TestPolicyForSource:
         )
         p = policy_for_source(cfg, grp_src)
         assert p.is_admin("222") is True
-        assert p.is_admin("111") is False  # DM admin, not group admin
+        assert p.is_admin("111") is True  # admin identity is shared
         # In group scope, the only listed user command is "help"; "status"
         # is not in the group list and should be denied for non-admins.
         assert p.can_run("999", "help") is True
@@ -245,10 +245,11 @@ class TestPolicyForSource:
             )
             p = policy_for_source(cfg, src)
             assert p.is_admin("222") is True, f"chat_type={ct} should map to group scope"
-            assert p.is_admin("111") is False, f"chat_type={ct} should not see DM admins"
+            assert p.is_admin("111") is True, f"chat_type={ct} should see shared admins"
 
-    def test_no_admin_list_for_dm_means_unrestricted_in_dm(self):
-        # Group has admin list, DM does not → DM gating disabled, group active.
+    def test_group_admin_list_also_gates_dm(self):
+        # A group compatibility admin list enables the shared admin policy for
+        # DM too, so DM users do not become unrestricted by omission.
         cfg = GatewayConfig(
             platforms={
                 Platform.DISCORD: PlatformConfig(
@@ -265,8 +266,8 @@ class TestPolicyForSource:
         )
         dm_p = policy_for_source(cfg, dm_src)
         grp_p = policy_for_source(cfg, grp_src)
-        assert dm_p.enabled is False
-        assert dm_p.can_run("999", "stop") is True  # backward compat
+        assert dm_p.enabled is True
+        assert dm_p.can_run("999", "stop") is False
         assert grp_p.enabled is True
         assert grp_p.can_run("999", "stop") is False  # gated
 

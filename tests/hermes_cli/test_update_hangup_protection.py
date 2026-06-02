@@ -213,8 +213,14 @@ class TestInstallHangupProtection:
         try:
             # On Windows (no SIGHUP) we still wrap stdio and create the log.
             assert state["installed"] is True
-            assert isinstance(sys.stdout, _UpdateOutputStream)
-            assert isinstance(sys.stderr, _UpdateOutputStream)
+            # Full-suite runs may reload hermes_cli.main in another test, so
+            # avoid brittle identity checks against the class object imported
+            # at collection time. The installed streams should still be the
+            # updater mirror wrapper by shape/name.
+            assert type(sys.stdout).__name__ == "_UpdateOutputStream"
+            assert type(sys.stderr).__name__ == "_UpdateOutputStream"
+            assert hasattr(sys.stdout, "_original")
+            assert hasattr(sys.stderr, "_original")
             assert state["log_file"] is not None
 
             sys.stdout.write("checking mirror\n")
