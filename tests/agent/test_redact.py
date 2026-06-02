@@ -114,6 +114,17 @@ class TestEnvAssignments:
         assert "SECRET_TOKEN=" in result
         assert "mypassword" not in result
 
+    def test_bluebubbles_sensitive_locator_envs_redacted(self):
+        text = (
+            "BLUEBUBBLES_SERVER_URL=https://bb.example.invalid:1234\n"
+            "BLUEBUBBLES_WEBHOOK_PATH=/private-bluebubbles-hook"
+        )
+        result = redact_sensitive_text(text)
+        assert "https://bb.example.invalid:1234" not in result
+        assert "/private-bluebubbles-hook" not in result
+        assert "BLUEBUBBLES_SERVER_URL=***" in result
+        assert "BLUEBUBBLES_WEBHOOK_PATH=***" in result
+
 
 class TestJsonFields:
     def test_json_api_key(self):
@@ -292,6 +303,25 @@ class TestProfileFieldRedaction:
         result = redact_sensitive_text(text)
         assert "502-555-1234" not in result
         assert "[REDACTED PHONE]" in result
+
+    def test_driver_document_profile_fields_redacted(self):
+        text = (
+            '{"driverProfilePhotoUrl": "https://files.example/photo?sig=abc", '
+            '"driverLicenseNumber": "KY-DL-12345", '
+            '"medicalCard": "expires 2026-08-01", '
+            '"mvrUrl": "https://files.example/mvr?sig=def", '
+            '"cdlisStatus": "clear"}'
+        )
+        result = redact_sensitive_text(text)
+        assert "files.example" not in result
+        assert "KY-DL-12345" not in result
+        assert "expires 2026-08-01" not in result
+        assert "clear" not in result
+        assert '"driverProfilePhotoUrl": "***"' in result
+        assert '"driverLicenseNumber": "***"' in result
+        assert '"medicalCard": "***"' in result
+        assert '"mvrUrl": "***"' in result
+        assert '"cdlisStatus": "***"' in result
 
 
 class TestElevenLabsTavilyExaKeys:

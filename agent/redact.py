@@ -127,6 +127,17 @@ _ENV_ASSIGN_RE = re.compile(
     rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2",
 )
 
+# Exact config values that are not classic tokens, but still disclose
+# sensitive delivery/auth surfaces when retained in logs.
+_SENSITIVE_CONFIG_ENV_KEY_NAMES = (
+    "BLUEBUBBLES_SERVER_URL",
+    "BLUEBUBBLES_WEBHOOK_PATH",
+)
+_SENSITIVE_CONFIG_ENV_KEY_RE = "|".join(re.escape(key) for key in _SENSITIVE_CONFIG_ENV_KEY_NAMES)
+_SENSITIVE_CONFIG_ENV_ASSIGN_RE = re.compile(
+    rf"\b({_SENSITIVE_CONFIG_ENV_KEY_RE})(\s*=\s*)(['\"]?)(\S+)\3"
+)
+
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
 _JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
 _JSON_FIELD_RE = re.compile(
@@ -141,15 +152,40 @@ _PROFILE_FIELD_KEY_NAMES = (
     "phone_number",
     "phoneNumber",
     "foreman_phone_number",
+    "driver_license_number",
+    "driverLicenseNumber",
     "license_number",
     "licenseNumber",
     "license_state",
     "licenseState",
     "driver_profile_image_url",
     "driverProfileImageUrl",
+    "driver_profile_photo_url",
+    "driverProfilePhotoUrl",
+    "driverProfilePhotoURL",
     "profile_image_url",
     "profileImageUrl",
     "profileImageURL",
+    "profile_photo",
+    "profilePhoto",
+    "profile_photo_url",
+    "profilePhotoUrl",
+    "medical_card",
+    "medicalCard",
+    "medical_card_expiration",
+    "medicalCardExpiration",
+    "mvr",
+    "mvr_date",
+    "mvrDate",
+    "mvr_url",
+    "mvrUrl",
+    "cdlis",
+    "cdlis_status",
+    "cdlisStatus",
+    "cdl_number",
+    "cdlNumber",
+    "cdl_status",
+    "cdlStatus",
     "home_address",
     "homeAddress",
     "street_address",
@@ -437,6 +473,11 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
             name, quote, value = m.group(1), m.group(2), m.group(3)
             return f"{name}={quote}{_mask_token(value)}{quote}"
         text = _ENV_ASSIGN_RE.sub(_redact_env, text)
+
+        text = _SENSITIVE_CONFIG_ENV_ASSIGN_RE.sub(
+            lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}***{m.group(3)}",
+            text,
+        )
 
         # JSON fields: "apiKey": "***"  (skip for code files — false positives)
         def _redact_json(m):

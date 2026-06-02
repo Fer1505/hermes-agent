@@ -138,6 +138,21 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         sep = "&" if "?" in path else "?"
         return f"{self.server_url}{path}{sep}password={quote(self.password, safe='')}"
 
+    @property
+    def _server_url_for_log(self) -> str:
+        """Safe display form for the configured BlueBubbles server URL."""
+        return "[REDACTED BLUEBUBBLES SERVER URL]" if self.server_url else ""
+
+    @property
+    def _webhook_url_for_log(self) -> str:
+        """Safe display form for the local webhook listener URL."""
+        host = self.webhook_host
+        if host in {"0.0.0.0", "localhost", "::"}:
+            host = "127.0.0.1"
+        elif ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return f"http://{host}:{self.webhook_port}/[REDACTED BLUEBUBBLES WEBHOOK PATH]"
+
     async def _api_get(self, path: str) -> Dict[str, Any]:
         assert self.client is not None
         res = await self.client.get(self._api_url(path))
@@ -173,13 +188,13 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             self._helper_connected = bool(server_data.get("helper_connected"))
             logger.info(
                 "[bluebubbles] connected to %s (private_api=%s, helper=%s)",
-                self.server_url,
+                self._server_url_for_log,
                 self._private_api_enabled,
                 self._helper_connected,
             )
         except Exception as exc:
             logger.error(
-                "[bluebubbles] cannot reach server at %s: %s", self.server_url, exc
+                "[bluebubbles] cannot reach server at %s: %s", self._server_url_for_log, exc
             )
             if self.client:
                 await self.client.aclose()
@@ -198,7 +213,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             "[bluebubbles] webhook listening on http://%s:%s%s",
             self.webhook_host,
             self.webhook_port,
-            self.webhook_path,
+            "/[REDACTED BLUEBUBBLES WEBHOOK PATH]",
         )
 
         # Register webhook with BlueBubbles server
@@ -250,7 +265,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     @property
     def _webhook_register_url_for_log(self) -> str:
         """Safe display form for the registered webhook URL."""
-        base = self._webhook_url
+        base = self._webhook_url_for_log
         if self.password:
             return f"{base}?password=***"
         return base
