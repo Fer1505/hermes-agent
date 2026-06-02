@@ -57,6 +57,7 @@ import { useSystemActions } from "@/contexts/useSystemActions";
 import type { SystemAction } from "@/contexts/system-actions-context";
 import ConfigPage from "@/pages/ConfigPage";
 import DocsPage from "@/pages/DocsPage";
+import WorkspacePage from "@/pages/WorkspacePage";
 import EnvPage from "@/pages/EnvPage";
 import SessionsPage from "@/pages/SessionsPage";
 import LogsPage from "@/pages/LogsPage";
@@ -118,6 +119,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/config": ConfigPage,
   "/env": EnvPage,
   "/docs": DocsPage,
+  "/workspace": WorkspacePage,
 };
 
 // Route placeholder for /chat.  The persistent ChatPage host (rendered
@@ -159,6 +161,12 @@ const BUILTIN_NAV_REST: NavItem[] = [
     labelKey: "documentation",
     label: "Documentation",
     icon: BookOpen,
+  },
+  {
+    path: "/workspace",
+    labelKey: "workspace",
+    label: "Workspace",
+    icon: Globe,
   },
 ];
 
@@ -312,7 +320,11 @@ export default function App() {
   const { theme } = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
   const closeMobile = useCallback(() => setMobileOpen(false), []);
-  const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
+  const isFrameRoute =
+    pathname === "/docs" ||
+    pathname === "/docs/" ||
+    pathname === "/workspace" ||
+    pathname === "/workspace/";
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isChatRoute = normalizedPath === "/chat";
   const embeddedChat = isDashboardEmbeddedChatEnabled();
@@ -590,14 +602,14 @@ export default function App() {
                 isChatRoute
                   ? "pb-3 pt-1 sm:pb-4 sm:pt-2 lg:pt-4"
                   : "pt-2 sm:pt-4 lg:pt-6 pb-4 sm:pb-8",
-                isDocsRoute && "min-h-0 flex-1",
+                isFrameRoute && "min-h-0 flex-1",
               )}
             >
               <PluginSlot name="pre-main" />
               <div
                 className={cn(
                   "w-full min-w-0",
-                  (isDocsRoute || isChatRoute) &&
+                  (isFrameRoute || isChatRoute) &&
                     "min-h-0 flex flex-1 flex-col",
                 )}
               >

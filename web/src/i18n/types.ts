@@ -95,11 +95,13 @@ export interface Translations {
       plugins: string;
       sessions: string;
       skills: string;
+      workspace: string;
     };
     modelToolsSheetSubtitle: string;
     modelToolsSheetTitle: string;
     navigation: string;
     openDocumentation: string;
+    openWorkspace: string;
     openNavigation: string;
     pluginNavSection: string;
     sessionsActiveCount: string;
