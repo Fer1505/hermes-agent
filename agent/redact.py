@@ -33,6 +33,9 @@ _SENSITIVE_QUERY_PARAMS = frozenset({
     "code",           # OAuth authorization codes
     "signature",      # pre-signed URL signatures
     "x-amz-signature",
+    "x-amz-credential",
+    "x-amz-security-token",
+    "awsaccesskeyid",
 })
 
 # Sensitive form-urlencoded / JSON body key names (case-insensitive exact match).
@@ -119,6 +122,39 @@ _JSON_FIELD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Controlled profile/contact fields that should not be retained in logs or
+# session transcripts as raw JSON/tool output. Keep this exact-key based so
+# ordinary operational fields like public job-site `address` are not erased.
+_PROFILE_FIELD_KEY_NAMES = (
+    "phone_number",
+    "phoneNumber",
+    "foreman_phone_number",
+    "license_number",
+    "licenseNumber",
+    "license_state",
+    "licenseState",
+    "driver_profile_image_url",
+    "driverProfileImageUrl",
+    "profile_image_url",
+    "profileImageUrl",
+    "profileImageURL",
+    "home_address",
+    "homeAddress",
+    "street_address",
+    "streetAddress",
+    "postal_address",
+    "postalAddress",
+)
+_PROFILE_FIELD_KEY_RE = "|".join(re.escape(key) for key in _PROFILE_FIELD_KEY_NAMES)
+_PROFILE_JSON_FIELD_RE = re.compile(
+    rf'("({_PROFILE_FIELD_KEY_RE})")\s*:\s*("([^"\\]|\\.)*"|null|true|false|-?\d+(?:\.\d+)?)',
+    re.IGNORECASE,
+)
+_PROFILE_KV_FIELD_RE = re.compile(
+    rf"\b({_PROFILE_FIELD_KEY_RE})(\s*[:=]\s*)([^\s,;]+)",
+    re.IGNORECASE,
+)
+
 # Authorization headers
 _AUTH_HEADER_RE = re.compile(
     r"(Authorization:\s*Bearer\s+)(\S+)",
@@ -167,6 +203,22 @@ _URL_WITH_QUERY_RE = re.compile(
     r"([^\s?#]*)"                     # path
     r"\?([^\s#]+)"                    # query (required)
     r"(#\S*)?",                       # optional fragment
+)
+
+# HTTP request targets and other absolute paths containing query strings.
+# Aiohttp access logs record only `POST /path?password=... HTTP/1.1`, not a
+# full URL, so the scheme-aware URL regex above cannot see those secrets.
+_ABSOLUTE_PATH_WITH_QUERY_RE = re.compile(
+    r"(?P<path>/[^\s?#\"']*)"
+    r"\?(?P<query>[^\s#\"']+)"
+    r"(?P<fragment>#[^\s\"']*)?",
+)
+
+_SENSITIVE_QUERY_PARAM_FRAGMENT_RE = re.compile(
+    r"([?&]("
+    + "|".join(re.escape(key) for key in sorted(_SENSITIVE_QUERY_PARAMS, key=len, reverse=True))
+    + r")=)([^&#\s\"']+)",
+    re.IGNORECASE,
 )
 
 # URLs containing userinfo — `scheme://user:password@host` for ANY scheme
@@ -281,6 +333,26 @@ def _redact_url_query_params(text: str) -> str:
     return _URL_WITH_QUERY_RE.sub(_sub, text)
 
 
+def _redact_absolute_path_query_params(text: str) -> str:
+    """Redact sensitive params in path-only request targets.
+
+    Access logs often contain `/route?token=...` instead of a full URL. Keep
+    this intentionally narrower than URL redaction by only matching absolute
+    paths that start with `/`.
+    """
+    def _sub(m: re.Match) -> str:
+        path = m.group("path")
+        query = _redact_query_string(m.group("query"))
+        fragment = m.group("fragment") or ""
+        return f"{path}?{query}{fragment}"
+    return _ABSOLUTE_PATH_WITH_QUERY_RE.sub(_sub, text)
+
+
+def _redact_sensitive_query_param_fragments(text: str) -> str:
+    """Redact `?token=...` / `&token=...` fragments without a full URL."""
+    return _SENSITIVE_QUERY_PARAM_FRAGMENT_RE.sub(lambda m: f"{m.group(1)}***", text)
+
+
 def _redact_url_userinfo(text: str) -> str:
     """Strip `user:password@` from HTTP/WS/FTP URLs.
 
@@ -347,6 +419,9 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
             return f'{key}: "{_mask_token(value)}"'
         text = _JSON_FIELD_RE.sub(_redact_json, text)
 
+        text = _PROFILE_JSON_FIELD_RE.sub(lambda m: f"{m.group(1)}: \"***\"", text)
+        text = _PROFILE_KV_FIELD_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}***", text)
+
     # Authorization headers
     text = _AUTH_HEADER_RE.sub(
         lambda m: m.group(1) + _mask_token(m.group(2)),
@@ -376,6 +451,12 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     # URL query params containing opaque tokens (?access_token=…&code=…)
     text = _redact_url_query_params(text)
 
+    # Bare request paths with query params (/webhook?password=…).
+    text = _redact_absolute_path_query_params(text)
+
+    # Isolated query fragments (`&X-Amz-Signature=...`) in truncated logs.
+    text = _redact_sensitive_query_param_fragments(text)
+
     # Form-urlencoded bodies (only triggers on clean k=v&k=v inputs).
     text = _redact_form_body(text)
 
@@ -401,4 +482,4 @@ class RedactingFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         original = super().format(record)
-        return redact_sensitive_text(original)
+        return redact_sensitive_text(original, force=True)

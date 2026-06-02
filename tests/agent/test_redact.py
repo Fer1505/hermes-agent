@@ -201,6 +201,22 @@ class TestRedactingFormatter:
         assert "abc123def456" not in result
         assert "sk-pro" in result
 
+    def test_formats_and_redacts_even_when_runtime_redaction_disabled(self, monkeypatch):
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        formatter = RedactingFormatter("%(message)s")
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg='POST /bluebubbles-webhook?password=plainsecret HTTP/1.1',
+            args=(),
+            exc_info=None,
+        )
+        result = formatter.format(record)
+        assert "plainsecret" not in result
+        assert "password=***" in result
+
 
 class TestPrintenvSimulation:
     """Simulate what happens when the agent runs `env` or `printenv`."""
@@ -235,6 +251,41 @@ class TestSecretCapturePayloadRedaction:
         text = '{"raw_secret": "ghp_abc123def456ghi789jkl"}'
         result = redact_sensitive_text(text)
         assert "abc123def456" not in result
+
+
+class TestProfileFieldRedaction:
+    def test_driver_contact_and_license_json_fields_redacted(self):
+        text = (
+            '{"phone_number": "+15551234567", "license_number": "D1234567", '
+            '"first_name": "Jane"}'
+        )
+        result = redact_sensitive_text(text)
+        assert "+15551234567" not in result
+        assert "D1234567" not in result
+        assert '"phone_number": "***"' in result
+        assert '"license_number": "***"' in result
+        assert '"first_name": "Jane"' in result
+
+    def test_profile_image_url_field_redacted(self):
+        text = '{"profileImageUrl": "https://cdn.example.com/pic.jpg?signature=abc"}'
+        result = redact_sensitive_text(text)
+        assert "cdn.example.com" not in result
+        assert '"profileImageUrl": "***"' in result
+
+    def test_operational_address_field_not_blanket_redacted(self):
+        text = '{"address": "100 Job Site Rd", "street_address": "12 Home St"}'
+        result = redact_sensitive_text(text)
+        assert "100 Job Site Rd" in result
+        assert "12 Home St" not in result
+        assert '"street_address": "***"' in result
+
+    def test_key_value_profile_field_redacted(self):
+        text = "phone_number: +15551234567 license_state=KY"
+        result = redact_sensitive_text(text)
+        assert "+15551234567" not in result
+        assert "KY" not in result
+        assert "phone_number: ***" in result
+        assert "license_state=***" in result
 
 
 class TestElevenLabsTavilyExaKeys:
@@ -417,6 +468,17 @@ class TestUrlQueryParamRedaction:
         assert "LONG_PRESIGNED_SIG" not in result
         assert "id=public" in result
 
+    def test_truncated_presigned_signature_fragment(self):
+        text = "tail-of-url&X-Amz-SignedHeaders=host&X-Amz-Signature=LONG_PRESIGNED_SIG"
+        result = redact_sensitive_text(text)
+        assert "LONG_PRESIGNED_SIG" not in result
+        assert "X-Amz-Signature=***" in result
+        assert "X-Amz-SignedHeaders=host" in result
+
+    def test_signature_literal_without_query_marker_unchanged(self):
+        text = r"pat = re.compile(r'(AWSAccessKeyId|X-Amz-|Signature=', re.I)"
+        assert redact_sensitive_text(text) == text
+
     def test_case_insensitive_param_names(self):
         """Lowercase/mixed-case sensitive param names are redacted."""
         # NOTE: All-caps names like TOKEN= are swallowed by _ENV_ASSIGN_RE
@@ -450,6 +512,12 @@ class TestUrlQueryParamRedaction:
         text = "wss://api.example.com/ws?token=opaqueWsToken123"
         result = redact_sensitive_text(text)
         assert "opaqueWsToken123" not in result
+
+    def test_absolute_path_query_in_access_log(self):
+        text = 'POST /bluebubbles-webhook?password=plainsecret HTTP/1.1'
+        result = redact_sensitive_text(text)
+        assert "plainsecret" not in result
+        assert "/bluebubbles-webhook?password=***" in result
 
 
 class TestUrlUserinfoRedaction:

@@ -455,6 +455,13 @@ class TestBlueBubblesWebhookUrl:
         adapter = _make_adapter(monkeypatch, password="W9fTC&L5JL*@")
         assert "password=W9fTC%26L5JL%2A%40" in adapter._webhook_register_url
 
+    def test_register_url_for_log_redacts_password(self, monkeypatch):
+        """Log display must not include the registered webhook password."""
+        adapter = _make_adapter(monkeypatch, password="secret123")
+        assert adapter._webhook_register_url_for_log.endswith("?password=***")
+        assert "secret123" not in adapter._webhook_register_url_for_log
+        assert adapter._webhook_register_url_for_log.startswith(adapter._webhook_url)
+
     def test_register_url_omits_query_when_no_password(self, monkeypatch):
         """If no password is configured, the register URL should be the bare URL."""
         monkeypatch.delenv("BLUEBUBBLES_PASSWORD", raising=False)
@@ -465,6 +472,7 @@ class TestBlueBubblesWebhookUrl:
         )
         adapter = BlueBubblesAdapter(cfg)
         assert adapter._webhook_register_url == adapter._webhook_url
+        assert adapter._webhook_register_url_for_log == adapter._webhook_url
 
 
 class TestBlueBubblesWebhookRegistration:

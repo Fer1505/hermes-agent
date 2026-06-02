@@ -197,17 +197,46 @@ def _bad_human_facing_cron_output_reason(job: dict, final_response: str) -> str 
     if len(squashed) <= 180 and lower.startswith(generic_prefixes):
         return "generic assistant prompt"
 
+    no_op_prefixes = (
+        "[no-op]",
+        "[no op]",
+        "[no action taken",
+        "[execution complete. no output generated",
+        "no action taken.",
+        "no action was taken.",
+    )
+    if len(squashed) <= 400 and lower.startswith(no_op_prefixes):
+        return "cron produced a no-op marker instead of completing the scheduled task"
+
     context_deflections = (
         "i need more context",
         "i need additional context",
         "i need more information",
         "i need additional information",
         "please provide more context",
+        "please provide the source",
+        "please provide the required",
+        "please provide the exact",
         "could you please provide",
         "could you please tell me what you would like me to do",
     )
     if len(squashed) <= 320 and any(phrase in lower for phrase in context_deflections):
         return "cron asked for context instead of completing the scheduled task"
+    if len(squashed) <= 1200 and lower.startswith(context_deflections):
+        return "cron asked for context instead of completing the scheduled task"
+
+    plan_only_prefixes = (
+        "i will review ",
+        "i will perform ",
+        "i'll review ",
+        "i'll perform ",
+        "here is a plan",
+        "here's the plan",
+        "execution plan:",
+        "proposed plan:",
+    )
+    if len(squashed) <= 1200 and lower.startswith(plan_only_prefixes):
+        return "cron returned a plan instead of completing the scheduled task"
 
     if re.search(r"tool ['\"][^'\"]+['\"] does not exist", text, re.IGNORECASE):
         return "nonexistent tool error leaked into final response"
@@ -216,7 +245,10 @@ def _bad_human_facing_cron_output_reason(job: dict, final_response: str) -> str 
 
     raw_tool_markers = (
         "<|tool_code|>",
+        "<tool_code",
         "```tool_code",
+        "[tool]",
+        "[/tool]",
         "<tool_call",
         "recipient_name",
         "tool_uses",
@@ -224,6 +256,8 @@ def _bad_human_facing_cron_output_reason(job: dict, final_response: str) -> str 
         "assistant to=functions.",
     )
     if any(marker in lower for marker in raw_tool_markers):
+        return "raw or fake tool-call syntax leaked into final response"
+    if re.search(r"(?im)^\s*tool_code\b", text):
         return "raw or fake tool-call syntax leaked into final response"
 
     if lower.startswith("[no action required]"):

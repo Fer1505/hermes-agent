@@ -189,7 +189,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         app = web.Application()
         app.router.add_get("/health", lambda _: web.Response(text="ok"))
         app.router.add_post(self.webhook_path, self._handle_webhook)
-        self._runner = web.AppRunner(app)
+        self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.webhook_host, self.webhook_port)
         await site.start()
@@ -247,6 +247,14 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             return f"{base}?password={quote(self.password, safe='')}"
         return base
 
+    @property
+    def _webhook_register_url_for_log(self) -> str:
+        """Safe display form for the registered webhook URL."""
+        base = self._webhook_url
+        if self.password:
+            return f"{base}?password=***"
+        return base
+
     async def _find_registered_webhooks(self, url: str) -> list:
         """Return list of BB webhook entries matching *url*."""
         try:
@@ -274,7 +282,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         existing = await self._find_registered_webhooks(webhook_url)
         if existing:
             logger.info(
-                "[bluebubbles] webhook already registered: %s", webhook_url
+                "[bluebubbles] webhook already registered: %s",
+                self._webhook_register_url_for_log,
             )
             return True
 
@@ -289,7 +298,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             if 200 <= status < 300:
                 logger.info(
                     "[bluebubbles] webhook registered with server: %s",
-                    webhook_url,
+                    self._webhook_register_url_for_log,
                 )
                 return True
             else:
@@ -329,7 +338,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                     removed = True
             if removed:
                 logger.info(
-                    "[bluebubbles] webhook unregistered: %s", webhook_url
+                    "[bluebubbles] webhook unregistered: %s",
+                    self._webhook_register_url_for_log,
                 )
         except Exception as exc:
             logger.debug(
