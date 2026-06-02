@@ -32,9 +32,21 @@ _SENSITIVE_QUERY_PARAMS = frozenset({
     "key",
     "code",           # OAuth authorization codes
     "signature",      # pre-signed URL signatures
+    "sig",            # common short pre-signed URL signature param
+    "expires",        # pre-signed URL expiry
     "x-amz-signature",
     "x-amz-credential",
     "x-amz-security-token",
+    "x-amz-expires",
+    "x-amz-date",
+    "x-amz-algorithm",
+    "x-amz-signedheaders",
+    "x-goog-signature",
+    "x-goog-credential",
+    "x-goog-expires",
+    "x-goog-date",
+    "x-goog-algorithm",
+    "x-goog-signedheaders",
     "awsaccesskeyid",
 })
 
@@ -193,6 +205,19 @@ _DISCORD_MENTION_RE = re.compile(r"<@!?(\d{17,20})>")
 # E.164 phone numbers: +<country><number>, 7-15 digits
 # Negative lookahead prevents matching hex strings or identifiers
 _SIGNAL_PHONE_RE = re.compile(r"(\+[1-9]\d{6,14})(?![A-Za-z0-9])")
+
+# North American phone numbers in logs/transcripts: 555-123-4567,
+# (555) 123-4567, 5551234567, optionally prefixed by +1 / 1.
+_NANP_PHONE_RE = re.compile(
+    r"(?<![0-9A-Za-z])"
+    r"(?:\+?1[ .-]?)?"
+    r"(?:\([0-9]{3}\)|[0-9]{3})"
+    r"[ .-]?"
+    r"[0-9]{3}"
+    r"[ .-]?"
+    r"[0-9]{4}"
+    r"(?![0-9A-Za-z])"
+)
 
 # URLs containing query strings — matches `scheme://...?...[# or end]`.
 # Used to scan text for URLs whose query params may contain secrets.
@@ -470,6 +495,7 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
             return phone[:2] + "****" + phone[-2:]
         return phone[:4] + "****" + phone[-4:]
     text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
+    text = _NANP_PHONE_RE.sub("[REDACTED PHONE]", text)
 
     return text
 

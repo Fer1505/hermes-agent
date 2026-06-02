@@ -19,6 +19,9 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
             "model:\n  provider: openai-codex\n"
             "fallback_model:\n  provider: openrouter\n"
             "  model: meta-llama/llama-4-maverick\n"
+            "fallback_policy:\n"
+            "  gateway:\n"
+            "    allow_on_auth_error: true\n"
         )
 
         monkeypatch.setattr("gateway.run._hermes_home", tmp_path)

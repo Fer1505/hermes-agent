@@ -1554,7 +1554,7 @@ def test_diagnostics_endpoint_severity_filter(client):
         # An error-severity diagnostic (spawn failures) on another
         p2 = kb.create_task(conn, title="spawn", assignee="b")
         conn.execute(
-            "UPDATE tasks SET consecutive_failures=5, last_failure_error='x' WHERE id=?",
+            "UPDATE tasks SET consecutive_failures=2, last_failure_error='x' WHERE id=?",
             (p2,),
         )
         conn.commit()

@@ -35,11 +35,7 @@ export function PageHeaderProvider({
   const displayTitle = titleOverride ?? defaultTitle;
 
   const isChatRoute = pathname === "/chat" || pathname === "/chat/";
-  const isFrameRoute =
-    pathname === "/docs" ||
-    pathname === "/docs/" ||
-    pathname === "/workspace" ||
-    pathname === "/workspace/";
+  const isFrameRoute = pathname === "/docs" || pathname === "/docs/";
 
   const value = useMemo(
     () => ({

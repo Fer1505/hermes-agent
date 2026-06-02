@@ -13,7 +13,6 @@ const BUILTIN: Record<string, keyof Translations["app"]["nav"]> = {
   "/config": "config",
   "/env": "keys",
   "/docs": "documentation",
-  "/workspace": "workspace",
 };
 
 export function resolvePageTitle(

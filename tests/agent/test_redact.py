@@ -287,6 +287,12 @@ class TestProfileFieldRedaction:
         assert "phone_number: ***" in result
         assert "license_state=***" in result
 
+    def test_phone_shaped_value_redacted_without_field_key(self):
+        text = "Dispatch contact 502-555-1234 for driver follow-up"
+        result = redact_sensitive_text(text)
+        assert "502-555-1234" not in result
+        assert "[REDACTED PHONE]" in result
+
 
 class TestElevenLabsTavilyExaKeys:
     """Regression tests for ElevenLabs (sk_), Tavily (tvly-), and Exa (exa_) keys."""
@@ -473,7 +479,30 @@ class TestUrlQueryParamRedaction:
         result = redact_sensitive_text(text)
         assert "LONG_PRESIGNED_SIG" not in result
         assert "X-Amz-Signature=***" in result
-        assert "X-Amz-SignedHeaders=host" in result
+        assert "X-Amz-SignedHeaders=***" in result
+
+    def test_presigned_url_expiry_and_credential_params(self):
+        text = (
+            "https://s3.amazonaws.com/bucket/k?"
+            "X-Amz-Credential=AKIA_EXAMPLE%2Fscope&X-Amz-Expires=900"
+            "&X-Amz-Date=20260602T000000Z&id=public"
+        )
+        result = redact_sensitive_text(text)
+        assert "AKIA_EXAMPLE" not in result
+        assert "900" not in result
+        assert "20260602T000000Z" not in result
+        assert "X-Amz-Credential=***" in result
+        assert "X-Amz-Expires=***" in result
+        assert "X-Amz-Date=***" in result
+        assert "id=public" in result
+
+    def test_google_signed_url_fragment(self):
+        text = "tail&X-Goog-Credential=svc%40example&X-Goog-Signature=SIGNED_VALUE"
+        result = redact_sensitive_text(text)
+        assert "svc%40example" not in result
+        assert "SIGNED_VALUE" not in result
+        assert "X-Goog-Credential=***" in result
+        assert "X-Goog-Signature=***" in result
 
     def test_signature_literal_without_query_marker_unchanged(self):
         text = r"pat = re.compile(r'(AWSAccessKeyId|X-Amz-|Signature=', re.I)"

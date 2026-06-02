@@ -57,7 +57,6 @@ import { useSystemActions } from "@/contexts/useSystemActions";
 import type { SystemAction } from "@/contexts/system-actions-context";
 import ConfigPage from "@/pages/ConfigPage";
 import DocsPage from "@/pages/DocsPage";
-import WorkspacePage from "@/pages/WorkspacePage";
 import EnvPage from "@/pages/EnvPage";
 import SessionsPage from "@/pages/SessionsPage";
 import LogsPage from "@/pages/LogsPage";
@@ -119,7 +118,6 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/config": ConfigPage,
   "/env": EnvPage,
   "/docs": DocsPage,
-  "/workspace": WorkspacePage,
 };
 
 // Route placeholder for /chat.  The persistent ChatPage host (rendered
@@ -161,12 +159,6 @@ const BUILTIN_NAV_REST: NavItem[] = [
     labelKey: "documentation",
     label: "Documentation",
     icon: BookOpen,
-  },
-  {
-    path: "/workspace",
-    labelKey: "workspace",
-    label: "Workspace",
-    icon: Globe,
   },
 ];
 
@@ -320,11 +312,7 @@ export default function App() {
   const { theme } = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
   const closeMobile = useCallback(() => setMobileOpen(false), []);
-  const isFrameRoute =
-    pathname === "/docs" ||
-    pathname === "/docs/" ||
-    pathname === "/workspace" ||
-    pathname === "/workspace/";
+  const isFrameRoute = pathname === "/docs" || pathname === "/docs/";
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isChatRoute = normalizedPath === "/chat";
   const embeddedChat = isDashboardEmbeddedChatEnabled();

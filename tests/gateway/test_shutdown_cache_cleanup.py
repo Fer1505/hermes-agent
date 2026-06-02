@@ -57,6 +57,9 @@ class _FakeGateway:
     def _update_runtime_status(self, *_a, **_kw):
         pass
 
+    def _mark_running_agents_resume_pending(self, *_a, **_kw):
+        return 0
+
     async def _notify_active_sessions_of_shutdown(self):
         pass
 

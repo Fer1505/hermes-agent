@@ -9178,12 +9178,29 @@ class HermesCLI:
                 # _build_system_prompt appends system_message to prompt_parts
                 # which already contain the agent identity — resulting in the
                 # identity block appearing twice (issue #15281).
+                import inspect
+                compress_kwargs = {
+                    "approx_tokens": approx_tokens,
+                    "focus_topic": focus_topic or None,
+                }
+                try:
+                    compress_sig = inspect.signature(self.agent._compress_context)
+                    supports_force = (
+                        "force" in compress_sig.parameters
+                        or any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD
+                            for p in compress_sig.parameters.values()
+                        )
+                    )
+                except (TypeError, ValueError):
+                    supports_force = True
+                if supports_force:
+                    compress_kwargs["force"] = True
+
                 compressed, _ = self.agent._compress_context(
                     original_history,
                     None,
-                    approx_tokens=approx_tokens,
-                    focus_topic=focus_topic or None,
-                    force=True,
+                    **compress_kwargs,
                 )
                 self.conversation_history = compressed
                 # _compress_context ends the old session and creates a new child
