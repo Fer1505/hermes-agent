@@ -35,6 +35,11 @@ export function PageHeaderProvider({
   const displayTitle = titleOverride ?? defaultTitle;
 
   const isChatRoute = pathname === "/chat" || pathname === "/chat/";
+  const isFrameRoute =
+    pathname === "/docs" ||
+    pathname === "/docs/" ||
+    pathname === "/workspace" ||
+    pathname === "/workspace/";
 
   const value = useMemo(
     () => ({
@@ -62,7 +67,7 @@ export function PageHeaderProvider({
           <div
             className={cn(
               "flex h-full w-full min-w-0 flex-1 gap-2 px-3 py-2 sm:gap-3 sm:px-6 sm:py-0",
-              isChatRoute
+              isChatRoute || isFrameRoute
                 ? "flex-row items-center"
                 : "flex-col justify-center sm:flex-row sm:items-center",
             )}
@@ -81,7 +86,7 @@ export function PageHeaderProvider({
               <div
                 className={cn(
                   "flex min-w-0 justify-end sm:max-w-md sm:flex-1",
-                  isChatRoute ? "w-auto shrink-0" : "w-full",
+                  isChatRoute || isFrameRoute ? "w-auto shrink-0" : "w-full",
                 )}
               >
                 {end}

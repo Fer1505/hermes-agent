@@ -1,4 +1,4 @@
-import { useLayoutEffect } from "react";
+import { useEffect } from "react";
 import { ExternalLink } from "lucide-react";
 import { useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
@@ -12,7 +12,7 @@ export default function DocsPage() {
   const { t } = useI18n();
   const { setEnd } = usePageHeader();
 
-  useLayoutEffect(() => {
+  useEffect(() => {
     setEnd(
       <a
         href={HERMES_DOCS_URL}
@@ -21,7 +21,8 @@ export default function DocsPage() {
         className={DS_BUTTON_OUTLINED_LINK_CN}
       >
         <ExternalLink className="size-3.5" />
-        {t.app.openDocumentation}
+        <span className="hidden sm:inline">{t.app.openDocumentation}</span>
+        <span className="sm:hidden">{t.app.nav.documentation}</span>
       </a>,
     );
     return () => {
