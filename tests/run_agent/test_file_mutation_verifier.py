@@ -268,6 +268,49 @@ class TestRecordFileMutationResult:
         # state is about file paths, not individual tool-call IDs.
         assert agent._turn_failed_file_mutations == {}
 
+    def test_non_file_tool_clears_failure_when_disk_changed(self, tmp_path):
+        agent = _bare_agent()
+        target = tmp_path / "a.md"
+        target.write_text("before\n", encoding="utf-8")
+
+        agent._record_file_mutation_result(
+            "patch",
+            {
+                "mode": "replace",
+                "path": str(target),
+                "old_string": "missing",
+                "new_string": "after",
+            },
+            json.dumps({"error": "Could not find old_string"}),
+            is_error=True,
+        )
+        assert str(target) in agent._turn_failed_file_mutations
+
+        target.write_text("after\n", encoding="utf-8")
+        agent._record_file_mutation_result("terminal", {"command": "python"}, "{}", is_error=False)
+
+        assert agent._turn_failed_file_mutations == {}
+
+    def test_non_file_tool_keeps_failure_when_disk_unchanged(self, tmp_path):
+        agent = _bare_agent()
+        target = tmp_path / "a.md"
+        target.write_text("before\n", encoding="utf-8")
+
+        agent._record_file_mutation_result(
+            "patch",
+            {
+                "mode": "replace",
+                "path": str(target),
+                "old_string": "missing",
+                "new_string": "after",
+            },
+            json.dumps({"error": "Could not find old_string"}),
+            is_error=True,
+        )
+        agent._record_file_mutation_result("terminal", {"command": "true"}, "{}", is_error=False)
+
+        assert str(target) in agent._turn_failed_file_mutations
+
 
 # ---------------------------------------------------------------------------
 # _format_file_mutation_failure_footer

@@ -39,6 +39,65 @@ def test_writable_surfaces_support_plural_env_roots(tmp_path, monkeypatch):
     assert is_write_denied(str(outside)) is True
 
 
+def test_workspace_roots_support_plural_config_values(tmp_path, monkeypatch):
+    first = tmp_path / "workspace-one"
+    second = tmp_path / "workspace-two"
+    outside = tmp_path / "outside"
+    first.mkdir()
+    second.mkdir()
+    outside.mkdir()
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"runtime": {"workspaceRoots": [str(first), str(second)]}},
+    )
+
+    assert get_workspace_roots() == [str(first.resolve()), str(second.resolve())]
+    assert get_path_boundary_error(str(first / "a.txt"), purpose="read") is None
+    assert get_path_boundary_error(str(second / "b.txt"), purpose="read") is None
+    assert "Path boundary denied for read" in get_path_boundary_error(
+        str(outside / "c.txt"),
+        purpose="read",
+    )
+
+
+def test_structured_writable_surfaces_allow_file_paths_and_ignore_routes(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "profile"
+    repo = tmp_path / "repo"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    repo.mkdir()
+    outside.mkdir()
+
+    config = {
+        "runtime": {
+            "workspaceRoot": str(workspace),
+            "writableSurfaces": [
+                {
+                    "key": "repo_owned_sources",
+                    "pathOrRoute": f"{repo}, /tasks, /approvals",
+                    "allowedActions": ["repo_scoped_write", "receipt"],
+                },
+                {
+                    "key": "profile_receipts",
+                    "path": str(workspace),
+                    "allowedActions": ["receipt"],
+                },
+            ],
+        }
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+
+    assert get_writable_surfaces() == [str(repo.resolve()), str(workspace.resolve())]
+    assert get_path_boundary_error(str(repo / "code.py"), purpose="read") is None
+    assert get_path_boundary_error(str(workspace / "receipt.md"), purpose="read") is None
+    assert is_write_denied(str(repo / "code.py")) is False
+    assert is_write_denied(str(workspace / "receipt.md")) is False
+    assert is_write_denied(str(outside / "blocked.txt")) is True
+
+
 def test_file_tool_blocks_read_outside_workspace_before_environment_creation(tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     outside = tmp_path / "outside.txt"

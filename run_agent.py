@@ -1736,16 +1736,20 @@ class AIAgent:
     ) -> None:
         """Record a ``write_file`` / ``patch`` outcome for the turn-end verifier.
 
-        On failure, store ``{path: {error_preview, tool}}`` entries.  On
-        success, remove any prior failure entries for the same paths (the
-        model recovered within the turn).  Silently no-ops if the per-turn
-        state dict hasn't been initialised yet (e.g. a tool dispatched
-        outside ``run_conversation``).
+        On failure, store ``{path: {error_preview, tool, fingerprint}}``
+        entries.  On success, remove any prior failure entries for the same
+        paths (the model recovered within the turn).  Later non-file tools
+        also prune entries when the on-disk fingerprint changed; this keeps
+        the footer honest when a lower-level terminal/code-execution path
+        really did mutate the file after an earlier normal file-tool failure.
+        Silently no-ops if the per-turn state dict hasn't been initialised
+        yet (e.g. a tool dispatched outside ``run_conversation``).
         """
-        if tool_name not in _FILE_MUTATING_TOOLS:
-            return
         state = getattr(self, "_turn_failed_file_mutations", None)
         if state is None:
+            return
+        if tool_name not in _FILE_MUTATING_TOOLS:
+            self._prune_file_mutation_failures_by_disk_state(state)
             return
         targets = _extract_file_mutation_targets(tool_name, args)
         if not targets:
@@ -1761,9 +1765,36 @@ class AIAgent:
                     state[path] = {
                         "tool": tool_name,
                         "error_preview": preview,
+                        "fingerprint": self._file_mutation_fingerprint(path),
                     }
         else:
             for path in targets:
+                state.pop(path, None)
+        self._prune_file_mutation_failures_by_disk_state(state)
+
+    @staticmethod
+    def _file_mutation_fingerprint(path: str) -> tuple[bool, int | None, int | None] | None:
+        """Return a cheap on-disk fingerprint for verifier bookkeeping."""
+        try:
+            expanded = os.path.expandvars(os.path.expanduser(str(path)))
+            if not os.path.exists(expanded):
+                return (False, None, None)
+            stat = os.stat(expanded)
+            return (True, int(stat.st_size), int(stat.st_mtime_ns))
+        except Exception:
+            return None
+
+    def _prune_file_mutation_failures_by_disk_state(
+        self,
+        state: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """Clear failed mutation entries whose files changed after failure."""
+        for path, info in list(state.items()):
+            before = info.get("fingerprint")
+            if before is None:
+                continue
+            after = self._file_mutation_fingerprint(path)
+            if after is not None and after != before:
                 state.pop(path, None)
 
     def _file_mutation_verifier_enabled(self) -> bool:
