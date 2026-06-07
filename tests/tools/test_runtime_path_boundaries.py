@@ -77,7 +77,8 @@ def test_structured_writable_surfaces_allow_file_paths_and_ignore_routes(
             "writableSurfaces": [
                 {
                     "key": "repo_owned_sources",
-                    "pathOrRoute": f"{repo}, /tasks, /approvals",
+                    "path": str(repo),
+                    "pathOrRoute": f"/tasks, /approvals, {outside}",
                     "allowedActions": ["repo_scoped_write", "receipt"],
                 },
                 {

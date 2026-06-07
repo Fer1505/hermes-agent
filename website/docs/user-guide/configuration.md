@@ -498,8 +498,8 @@ When on, any flagged `skill_manage` write surfaces as an approval prompt with th
 memory:
   memory_enabled: true
   user_profile_enabled: true
-  memory_char_limit: 2200   # ~800 tokens
-  user_char_limit: 1375     # ~500 tokens
+  memory_char_limit: 64000  # ~23K tokens
+  user_char_limit: 16000    # ~5.8K tokens
 ```
 
 ## File Read Safety

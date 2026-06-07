@@ -24,6 +24,7 @@ from gateway.config import Platform
 from tools.send_message_tool import (
     _derive_forum_thread_name,
     _parse_target_ref,
+    _send_bluebubbles,
     _send_discord,
     _send_matrix_via_adapter,
     _send_signal,
@@ -94,7 +95,7 @@ class TestSendMessageTool:
              patch("gateway.config.load_gateway_config", return_value=config), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch("model_tools._run_async", side_effect=_run_async_immediately), \
-             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True, "message_id": "1"})) as send_mock, \
              patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
             result = json.loads(
                 send_message_tool(
@@ -120,7 +121,7 @@ class TestSendMessageTool:
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch("gateway.channel_directory.resolve_channel_name", return_value="-1001:17585"), \
              patch("model_tools._run_async", side_effect=_run_async_immediately), \
-             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True, "message_id": "bb-1"})) as send_mock, \
              patch("gateway.mirror.mirror_to_session", return_value=True):
             result = json.loads(
                 send_message_tool(
@@ -153,7 +154,7 @@ class TestSendMessageTool:
         with patch("gateway.config.load_gateway_config", return_value=config), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch("model_tools._run_async", side_effect=_run_async_immediately), \
-             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True, "message_id": "1"})) as send_mock, \
              patch("gateway.mirror.mirror_to_session", return_value=True):
             result = json.loads(
                 send_message_tool(
@@ -177,6 +178,41 @@ class TestSendMessageTool:
             force_document=False,
         )
 
+    def test_bluebubbles_one_shot_send_connects_without_webhook(self, monkeypatch):
+        seen = {}
+
+        class FakeBlueBubblesAdapter:
+            def __init__(self, _pconfig):
+                pass
+
+            async def connect(self, **kwargs):
+                seen["connect_kwargs"] = kwargs
+                return True
+
+            async def send(self, chat_id, message):
+                seen["send"] = (chat_id, message)
+                return SimpleNamespace(success=True, message_id="bb-1")
+
+            async def disconnect(self):
+                seen["disconnected"] = True
+
+        monkeypatch.setattr(
+            "gateway.platforms.bluebubbles.check_bluebubbles_requirements",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.bluebubbles.BlueBubblesAdapter",
+            FakeBlueBubblesAdapter,
+        )
+
+        result = asyncio.run(_send_bluebubbles({}, "franklindelarosa@gmail.com", "hello"))
+
+        assert result["success"] is True
+        assert result["message_id"] == "bb-1"
+        assert seen["connect_kwargs"] == {"start_webhook": False}
+        assert seen["send"] == ("franklindelarosa@gmail.com", "hello")
+        assert seen["disconnected"] is True
+
     def test_display_label_target_resolves_via_channel_directory(self, tmp_path):
         config, telegram_cfg = _make_config()
         cache_file = tmp_path / "channel_directory.json"
@@ -193,7 +229,7 @@ class TestSendMessageTool:
              patch("gateway.config.load_gateway_config", return_value=config), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch("model_tools._run_async", side_effect=_run_async_immediately), \
-             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True, "message_id": "1"})) as send_mock, \
              patch("gateway.mirror.mirror_to_session", return_value=True):
             result = json.loads(
                 send_message_tool(
@@ -297,7 +333,7 @@ class TestSendMessageTool:
         with patch("gateway.config.load_gateway_config", return_value=config), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch("model_tools._run_async", side_effect=_run_async_immediately), \
-             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True, "message_id": "1"})), \
              patch("gateway.session_context.get_session_env") as get_session_env_mock, \
              patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
             get_session_env_mock.side_effect = lambda name, default="": {
@@ -322,8 +358,61 @@ class TestSendMessageTool:
             source_label="telegram",
             thread_id=None,
             user_id="user-123",
-            provider_message_id=None,
+            provider_message_id="1",
         )
+
+    def test_telegram_success_without_message_id_fails_closed(self):
+        config, _telegram_cfg = _make_config()
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})), \
+             patch("gateway.channel_directory.mark_channel_delivery_failed") as mark_failed, \
+             patch("gateway.channel_directory.mark_channel_delivery_success") as mark_success, \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:12345",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is False
+        assert result["delivery_proof_missing"] is True
+        assert "delivery proof" in result["error"]
+        mark_failed.assert_called_once()
+        mark_success.assert_not_called()
+        mirror_mock.assert_not_called()
+
+    def test_provider_success_false_without_error_fails_closed(self):
+        config, _telegram_cfg = _make_config()
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": False})), \
+             patch("gateway.channel_directory.mark_channel_delivery_failed") as mark_failed, \
+             patch("gateway.channel_directory.mark_channel_delivery_success") as mark_success, \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:12345",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is False
+        assert "success=false" in result["error"]
+        mark_failed.assert_called_once()
+        mark_success.assert_not_called()
+        mirror_mock.assert_not_called()
 
     def test_top_level_send_failure_redacts_query_token(self):
         config, _telegram_cfg = _make_config()

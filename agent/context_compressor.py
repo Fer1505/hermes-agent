@@ -1712,8 +1712,6 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 _merge_summary_into_tail = False
             compressed.append(msg)
 
-        self.compression_count += 1
-
         compressed = self._sanitize_tool_pairs(compressed)
 
         # Replace image parts in all compressed messages before the newest
@@ -1730,10 +1728,28 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # Anti-thrashing: track compression effectiveness
         savings_pct = (saved_estimate / display_tokens * 100) if display_tokens > 0 else 0
         self._last_compression_savings_pct = savings_pct
+        if savings_pct < 10 and len(compressed) >= n_messages:
+            self._ineffective_compression_count = max(self._ineffective_compression_count + 1, 2)
+            self._last_compress_aborted = True
+            self._last_summary_error = (
+                "compression was ineffective: saved less than 10% and did not reduce message count"
+            )
+            if not self.quiet_mode:
+                logger.warning(
+                    "Compression aborted: %d -> %d messages (~%d tokens saved, %.0f%%). "
+                    "No effective context reduction was achieved.",
+                    n_messages,
+                    len(compressed),
+                    saved_estimate,
+                    savings_pct,
+                )
+            return messages
         if savings_pct < 10:
             self._ineffective_compression_count += 1
         else:
             self._ineffective_compression_count = 0
+
+        self.compression_count += 1
 
         if not self.quiet_mode:
             logger.info(

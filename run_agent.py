@@ -1738,10 +1738,9 @@ class AIAgent:
 
         On failure, store ``{path: {error_preview, tool, fingerprint}}``
         entries.  On success, remove any prior failure entries for the same
-        paths (the model recovered within the turn).  Later non-file tools
-        also prune entries when the on-disk fingerprint changed; this keeps
-        the footer honest when a lower-level terminal/code-execution path
-        really did mutate the file after an earlier normal file-tool failure.
+        paths (the model recovered within the turn).  Non-file tools do not
+        clear failures: an unrelated disk change is not proof that the failed
+        mutation actually landed.
         Silently no-ops if the per-turn state dict hasn't been initialised
         yet (e.g. a tool dispatched outside ``run_conversation``).
         """
@@ -1749,7 +1748,6 @@ class AIAgent:
         if state is None:
             return
         if tool_name not in _FILE_MUTATING_TOOLS:
-            self._prune_file_mutation_failures_by_disk_state(state)
             return
         targets = _extract_file_mutation_targets(tool_name, args)
         if not targets:
@@ -1770,7 +1768,6 @@ class AIAgent:
         else:
             for path in targets:
                 state.pop(path, None)
-        self._prune_file_mutation_failures_by_disk_state(state)
 
     @staticmethod
     def _file_mutation_fingerprint(path: str) -> tuple[bool, int | None, int | None] | None:

@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,18 @@ from gateway import status
 
 
 class TestGatewayPidState:
+    def test_process_start_time_falls_back_to_psutil_when_proc_missing(self, monkeypatch):
+        class FakeProcess:
+            def __init__(self, pid):
+                assert pid == 987654321
+
+            def create_time(self):
+                return 1710000000.123
+
+        monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(Process=FakeProcess))
+
+        assert status.get_process_start_time(987654321) == 1710000000123
+
     def test_write_pid_file_records_gateway_metadata(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 

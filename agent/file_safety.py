@@ -95,29 +95,6 @@ _STRUCTURED_PATH_KEYS = (
 )
 
 
-def _iter_path_or_route_values(value: object) -> Iterable[str]:
-    """Yield concrete filesystem paths from an ambiguous path/route field.
-
-    Olympus runtime manifests historically used ``pathOrRoute`` for both
-    filesystem roots and API-ish routes such as ``/tasks``. Treating every
-    slash-prefixed route as a writable filesystem root is unsafe, while
-    ignoring the field completely breaks profiles that declare real repo
-    roots there.  Only accept absolute/``~`` entries that already resolve to
-    an existing filesystem location; route labels and globs are ignored.
-    """
-    for raw in _iter_scalar_path_values(value):
-        if any(ch in raw for ch in "*?[]{}"):
-            continue
-        expanded = os.path.expandvars(os.path.expanduser(raw))
-        if not os.path.isabs(expanded):
-            continue
-        try:
-            if os.path.exists(os.path.realpath(expanded)):
-                yield raw
-        except OSError:
-            continue
-
-
 def _iter_scalar_path_values(value: object) -> Iterable[str]:
     """Yield string path fragments from scalar/list env or config values."""
     if value is None:
@@ -146,14 +123,11 @@ def _iter_scalar_path_values(value: object) -> Iterable[str]:
 
 
 def _iter_path_values(value: object) -> Iterable[str]:
-    """Yield configured filesystem path values from env/config structures."""
+    """Yield explicitly configured filesystem path values from env/config structures."""
     if isinstance(value, dict):
         for key in _STRUCTURED_PATH_KEYS:
             if key in value:
                 yield from _iter_path_values(value.get(key))
-        for key in ("pathOrRoute", "path_or_route"):
-            if key in value:
-                yield from _iter_path_or_route_values(value.get(key))
         return
     if isinstance(value, (list, tuple, set)):
         for item in value:

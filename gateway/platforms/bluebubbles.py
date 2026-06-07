@@ -128,6 +128,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._runner = None
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
+        self._webhook_active: bool = False
         self._guid_cache: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
@@ -169,13 +170,12 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, start_webhook: bool = True) -> bool:
         if not self.server_url or not self.password:
             logger.error(
                 "[bluebubbles] BLUEBUBBLES_SERVER_URL and BLUEBUBBLES_PASSWORD are required"
             )
             return False
-        from aiohttp import web
 
         # Tighter keepalive so idle CLOSE_WAIT drains promptly (#18451).
         from gateway.platforms._http_client_limits import platform_httpx_limits
@@ -201,6 +201,12 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 self.client = None
             return False
 
+        if not start_webhook:
+            self._mark_connected()
+            return True
+
+        from aiohttp import web
+
         app = web.Application()
         app.router.add_get("/health", lambda _: web.Response(text="ok"))
         app.router.add_post(self.webhook_path, self._handle_webhook)
@@ -219,12 +225,15 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         # Register webhook with BlueBubbles server
         # This is required for the server to know where to send events
         await self._register_webhook()
+        self._webhook_active = True
 
         return True
 
     async def disconnect(self) -> None:
         # Unregister webhook before cleaning up
-        await self._unregister_webhook()
+        if self._webhook_active:
+            await self._unregister_webhook()
+            self._webhook_active = False
 
         if self.client:
             await self.client.aclose()

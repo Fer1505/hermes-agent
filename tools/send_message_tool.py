@@ -57,6 +57,7 @@ _GENERIC_SECRET_ASSIGN_RE = re.compile(
     r"\b(access_token|api[_-]?key|auth[_-]?token|signature|sig)\s*=\s*([^\s,;]+)",
     re.IGNORECASE,
 )
+_PROOF_REQUIRED_PLATFORMS = frozenset({"telegram", "bluebubbles"})
 
 
 def _sanitize_error_text(text) -> str:
@@ -70,6 +71,36 @@ def _sanitize_error_text(text) -> str:
 def _error(message: str) -> dict:
     """Build a standardized error payload with redacted content."""
     return {"error": _sanitize_error_text(message)}
+
+
+def _send_result_error(result, platform_name: str) -> str | None:
+    """Return a normalized provider error for malformed/failed send results."""
+    if not isinstance(result, dict):
+        return f"{platform_name} send returned invalid result: {type(result).__name__}"
+    if result.get("error"):
+        return str(result["error"])
+    if result.get("success") is False:
+        return str(
+            result.get("reason")
+            or result.get("description")
+            or f"{platform_name} send returned success=false without an error"
+        )
+    return None
+
+
+def _has_provider_delivery_proof(result, platform_name: str) -> bool:
+    """Require provider ids for platforms where false positives caused bad receipts."""
+    if not isinstance(result, dict):
+        return False
+    if platform_name not in _PROOF_REQUIRED_PLATFORMS:
+        return True
+    if result.get("skipped"):
+        return True
+    return bool(
+        result.get("message_id")
+        or result.get("message_ids")
+        or result.get("provider_message_id")
+    )
 
 
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
@@ -288,6 +319,17 @@ def _handle_send(args):
                 force_document=force_document_attachments,
             )
         )
+        if isinstance(result, dict):
+            result_error = _send_result_error(result, platform_name)
+            if result_error:
+                result["error"] = result_error
+            elif result.get("success") and not _has_provider_delivery_proof(result, platform_name):
+                result["success"] = False
+                result["delivery_proof_missing"] = True
+                result["error"] = (
+                    f"{platform_name} send returned success=true without provider delivery proof"
+                )
+
         if isinstance(result, dict) and result.get("error"):
             try:
                 from gateway.channel_directory import mark_channel_delivery_failed
@@ -299,7 +341,11 @@ def _handle_send(args):
                 )
             except Exception:
                 pass
-        elif isinstance(result, dict) and result.get("success"):
+        elif (
+            isinstance(result, dict)
+            and result.get("success")
+            and _has_provider_delivery_proof(result, platform_name)
+        ):
             try:
                 from gateway.channel_directory import mark_channel_delivery_success
                 mark_channel_delivery_success(
@@ -314,7 +360,12 @@ def _handle_send(args):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
 
         # Mirror the sent message into the target's gateway session
-        if isinstance(result, dict) and result.get("success") and mirror_text:
+        if (
+            isinstance(result, dict)
+            and result.get("success")
+            and mirror_text
+            and _has_provider_delivery_proof(result, platform_name)
+        ):
             try:
                 from gateway.mirror import mirror_to_session
                 from gateway.session_context import get_session_env
@@ -563,6 +614,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     from gateway.platforms.base import BasePlatformAdapter, utf16_len
     from gateway.platforms.discord import DiscordAdapter
     from gateway.platforms.slack import SlackAdapter
+    platform_name = platform.value if hasattr(platform, "value") else str(platform)
 
     # Telegram adapter import is optional (requires python-telegram-bot)
     try:
@@ -631,8 +683,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 disable_link_previews=disable_link_previews,
                 force_document=force_document,
             )
-            if isinstance(result, dict) and result.get("error"):
-                return result
+            result_error = _send_result_error(result, platform_name)
+            if result_error:
+                return {"error": result_error}
             last_result = result
         return last_result
 
@@ -652,8 +705,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 media_files=media_files if is_last else [],
                 thread_id=thread_id,
             )
-            if isinstance(result, dict) and result.get("error"):
-                return result
+            result_error = _send_result_error(result, platform_name)
+            if result_error:
+                return {"error": result_error}
             last_result = result
         return last_result
 
@@ -669,8 +723,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 media_files=media_files if is_last else [],
                 thread_id=thread_id,
             )
-            if isinstance(result, dict) and result.get("error"):
-                return result
+            result_error = _send_result_error(result, platform_name)
+            if result_error:
+                return {"error": result_error}
             last_result = result
         return last_result
 
@@ -685,8 +740,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 chunk,
                 media_files=media_files if is_last else [],
             )
-            if isinstance(result, dict) and result.get("error"):
-                return result
+            result_error = _send_result_error(result, platform_name)
+            if result_error:
+                return {"error": result_error}
             last_result = result
         return last_result
 
@@ -700,8 +756,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 chunk,
                 media_files=media_files if is_last else None,
             )
-            if isinstance(result, dict) and result.get("error"):
-                return result
+            result_error = _send_result_error(result, platform_name)
+            if result_error:
+                return {"error": result_error}
             last_result = result
         return last_result
 
@@ -717,8 +774,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 media_files=media_files if is_last else None,
                 thread_id=thread_id,
             )
-            if isinstance(result, dict) and result.get("error"):
-                return result
+            result_error = _send_result_error(result, platform_name)
+            if result_error:
+                return {"error": result_error}
             last_result = result
         return last_result
 
@@ -780,8 +838,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 force_document=force_document,
             )
 
-        if isinstance(result, dict) and result.get("error"):
-            return result
+        result_error = _send_result_error(result, platform_name)
+        if result_error:
+            return {"error": result_error}
         last_result = result
 
     if warning and isinstance(last_result, dict) and last_result.get("success"):
@@ -1726,7 +1785,7 @@ async def _send_bluebubbles(extra, chat_id, message):
         from gateway.config import PlatformConfig
         pconfig = PlatformConfig(extra=extra)
         adapter = BlueBubblesAdapter(pconfig)
-        connected = await adapter.connect()
+        connected = await adapter.connect(start_webhook=False)
         if not connected:
             return _error("BlueBubbles: failed to connect to server")
         try:

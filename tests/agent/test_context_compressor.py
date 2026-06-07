@@ -99,6 +99,30 @@ class TestCompress:
         # original content is present in either case.
         assert msgs[-2]["content"] in result[-2]["content"]
 
+    def test_ineffective_noop_compression_aborts_without_rotating_context(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+            )
+
+        msgs = self._make_messages(7)
+        c._protect_head_size = lambda _messages: 2
+        c._align_boundary_forward = lambda _messages, start: start
+        c._find_tail_cut_by_tokens = lambda _messages, start: start + 1
+        c._generate_summary = lambda _turns, focus_topic=None: "summary text"
+
+        with patch("agent.context_compressor.estimate_messages_tokens_rough", return_value=950):
+            result = c.compress(msgs, current_tokens=1000)
+
+        assert result == msgs
+        assert c.compression_count == 0
+        assert c._last_compress_aborted is True
+        assert c._ineffective_compression_count >= 2
+        assert "ineffective" in (c._last_summary_error or "")
+
 
 class TestGenerateSummaryNoneContent:
     """Regression: content=None (from tool-call-only assistant messages) must not crash."""
