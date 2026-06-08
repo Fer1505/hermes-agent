@@ -477,10 +477,10 @@ class TestPreflightCompression:
             )
             result = agent.run_conversation("hello", conversation_history=big_history)
 
-        # Preflight compression is a multi-pass loop (up to 3 passes for very
-        # large sessions, breaking when no further reduction is possible).
-        # First pass must have received the full oversized history.
-        assert mock_compress.call_count >= 1, "Preflight compression never ran"
+        # Preflight compression is intentionally one proactive pass per user
+        # turn; additional compression is reserved for real provider context
+        # errors so we do not rotate several empty continuation sessions.
+        mock_compress.assert_called_once()
         first_call_messages = mock_compress.call_args_list[0].args[0]
         assert len(first_call_messages) >= 40, (
             f"First preflight pass should see the full history, got "
@@ -490,6 +490,46 @@ class TestPreflightCompression:
         assert result["final_response"] == "After preflight"
         assert any(
             ev == "lifecycle" and "Preflight compression" in msg
+            for ev, msg in status_messages
+        )
+
+    def test_preflight_does_not_repeat_when_still_over_threshold(self, agent):
+        """A large compressed prompt should not cause repeated proactive session splits."""
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 2000
+        agent.context_compressor.threshold_tokens = 200
+
+        big_history = []
+        for i in range(20):
+            big_history.append({"role": "user", "content": f"Message number {i} with padding"})
+            big_history.append({"role": "assistant", "content": f"Response number {i} with padding"})
+
+        ok_resp = _mock_response(content="Still answered", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [ok_resp]
+        status_messages = []
+        agent.status_callback = lambda ev, msg: status_messages.append((ev, msg))
+
+        with (
+            patch("agent.conversation_loop.estimate_request_tokens_rough", side_effect=[500, 450]),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [
+                    {"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"},
+                    {"role": "user", "content": "hello"},
+                ],
+                "new system prompt",
+            )
+            result = agent.run_conversation("hello", conversation_history=big_history)
+
+        mock_compress.assert_called_once()
+        assert result["completed"] is True
+        assert result["final_response"] == "Still answered"
+        assert any(
+            ev == "lifecycle" and "still large" in msg
             for ev, msg in status_messages
         )
 

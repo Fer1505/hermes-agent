@@ -418,6 +418,7 @@ def run_conversation(
         _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
     active_system_prompt = agent._cached_system_prompt
+    proactive_compressions_this_turn = 0
 
     # ── Preflight context compression ──
     # Before entering the main loop, check if the loaded conversation
@@ -452,16 +453,13 @@ def run_conversation(
                 f">= {agent.context_compressor.threshold_tokens:,} threshold. "
                 "This may take a moment."
             )
-            # May need multiple passes for very large sessions with small
-            # context windows (each pass summarises the middle N turns).
-            for _pass in range(3):
-                _orig_len = len(messages)
-                messages, active_system_prompt = agent._compress_context(
-                    messages, system_message, approx_tokens=_preflight_tokens,
-                    task_id=effective_task_id,
-                )
-                if len(messages) >= _orig_len:
-                    break  # Cannot compress further
+            _orig_len = len(messages)
+            messages, active_system_prompt = agent._compress_context(
+                messages, system_message, approx_tokens=_preflight_tokens,
+                task_id=effective_task_id,
+            )
+            proactive_compressions_this_turn += 1
+            if len(messages) < _orig_len:
                 # Compression created a new session — clear the history
                 # reference so _flush_messages_to_session_db writes ALL
                 # compressed messages to the new session's SQLite, not
@@ -478,14 +476,28 @@ def run_conversation(
                 agent._last_content_with_tools = None
                 agent._last_content_tools_all_housekeeping = False
                 agent._mute_post_response = False
-                # Re-estimate after compression
+                # Re-estimate after compression. If it is still over the
+                # proactive threshold, continue without rotating another
+                # session; emergency compression still handles real provider
+                # context errors.
                 _preflight_tokens = estimate_request_tokens_rough(
                     messages,
                     system_prompt=active_system_prompt or "",
                     tools=agent.tools or None,
                 )
-                if _preflight_tokens < agent.context_compressor.threshold_tokens:
-                    break  # Under threshold
+                if _preflight_tokens >= agent.context_compressor.threshold_tokens:
+                    logger.warning(
+                        "Preflight compression still above threshold after one "
+                        "proactive pass: ~%s tokens >= %s threshold. Skipping "
+                        "additional automatic passes for this turn.",
+                        f"{_preflight_tokens:,}",
+                        f"{agent.context_compressor.threshold_tokens:,}",
+                    )
+                    agent._emit_status(
+                        "⚠️ Preflight compression ran once, but the turn is "
+                        "still large. Continuing without another automatic "
+                        "session split."
+                    )
 
     # Plugin hook: pre_llm_call
     # Fired once per turn before the tool-calling loop.  Plugins can
@@ -3397,17 +3409,38 @@ def run_conversation(
                         messages, tools=agent.tools or None
                     )
 
-                if agent.compression_enabled and _compressor.should_compress(_real_tokens):
+                if (
+                    agent.compression_enabled
+                    and _compressor.should_compress(_real_tokens)
+                    and proactive_compressions_this_turn == 0
+                ):
                     agent._safe_print("  ⟳ compacting context…")
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
                         approx_tokens=agent.context_compressor.last_prompt_tokens,
                         task_id=effective_task_id,
                     )
+                    proactive_compressions_this_turn += 1
                     # Compression created a new session — clear history so
                     # _flush_messages_to_session_db writes compressed messages
                     # to the new session (see preflight compression comment).
                     conversation_history = None
+                elif (
+                    agent.compression_enabled
+                    and _compressor.should_compress(_real_tokens)
+                    and proactive_compressions_this_turn > 0
+                ):
+                    logger.warning(
+                        "Skipping additional proactive compression in this turn "
+                        "(tokens=%s, threshold=%s). Emergency compression still "
+                        "applies if the provider rejects the next request.",
+                        f"{_real_tokens:,}",
+                        f"{agent.context_compressor.threshold_tokens:,}",
+                    )
+                    agent._emit_status(
+                        "⚠️ Skipping another automatic compression in this turn "
+                        "to avoid repeated session splits."
+                    )
                 
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages
