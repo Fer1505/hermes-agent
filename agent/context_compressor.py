@@ -61,6 +61,7 @@ _SUMMARY_TRIM_NOTICE = (
     "\n\n[Context summary trimmed to the configured compression budget. "
     "Use source-of-truth files and current tool reads for details not repeated here.]\n\n"
 )
+_DEFAULT_PROTECT_LAST_USER_TURNS = 2
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
@@ -529,6 +530,7 @@ class ContextCompressor(ContextEngine):
         api_mode: str = "",
         abort_on_summary_failure: bool = False,
         summary_max_tokens: int | None = None,
+        protect_last_user_turns: int = _DEFAULT_PROTECT_LAST_USER_TURNS,
     ):
         self.model = model
         self.base_url = base_url
@@ -538,6 +540,10 @@ class ContextCompressor(ContextEngine):
         self.threshold_percent = threshold_percent
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
+        try:
+            self.protect_last_user_turns = max(1, int(protect_last_user_turns))
+        except (TypeError, ValueError):
+            self.protect_last_user_turns = _DEFAULT_PROTECT_LAST_USER_TURNS
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         try:
             self.summary_tokens_ceiling = (
@@ -1367,14 +1373,47 @@ The user has requested that this compaction PRIORITISE preserving all informatio
     # Tail protection by token budget
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_real_user_message(msg: Dict[str, Any]) -> bool:
+        """Return True for user-authored turns, excluding synthetic handoffs."""
+        if msg.get("role") != "user":
+            return False
+        content = _content_text_for_contains(msg.get("content") or "").lstrip()
+        if not content:
+            return False
+        if content.startswith(SUMMARY_PREFIX) or content.startswith(LEGACY_SUMMARY_PREFIX):
+            return False
+        if content.startswith("[CONTEXT COMPACTION"):
+            return False
+        if content.startswith("[Your active task list was preserved across context compression]"):
+            return False
+        return True
+
     def _find_last_user_message_idx(
         self, messages: List[Dict[str, Any]], head_end: int
     ) -> int:
-        """Return the index of the last user-role message at or after *head_end*, or -1."""
+        """Return the index of the last real user-role message at or after *head_end*, or -1."""
         for i in range(len(messages) - 1, head_end - 1, -1):
-            if messages[i].get("role") == "user":
+            if self._is_real_user_message(messages[i]):
                 return i
         return -1
+
+    def _find_recent_user_turn_cut(
+        self, messages: List[Dict[str, Any]], head_end: int
+    ) -> int:
+        """Return the earliest index needed to preserve recent real user turns."""
+        if self.protect_last_user_turns <= 1:
+            return self._find_last_user_message_idx(messages, head_end)
+
+        seen = 0
+        fallback = -1
+        for i in range(len(messages) - 1, head_end - 1, -1):
+            if self._is_real_user_message(messages[i]):
+                seen += 1
+                fallback = i
+                if seen >= self.protect_last_user_turns:
+                    return i
+        return fallback
 
     def _ensure_last_user_message_in_tail(
         self,
@@ -1382,7 +1421,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         cut_idx: int,
         head_end: int,
     ) -> int:
-        """Guarantee the most recent user message is in the protected tail.
+        """Guarantee recent real user turns are in the protected tail.
 
         Context compressor bug (#10896): ``_align_boundary_backward`` can pull
         ``cut_idx`` past a user message when it tries to keep tool_call/result
@@ -1393,35 +1432,35 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         the active context, causing the agent to stall, repeat completed work,
         or silently drop the user's latest request.
 
-        Fix: if the last user-role message is not already in the tail
-        (``messages[cut_idx:]``), walk ``cut_idx`` back to include it.  We
-        then re-align backward one more time to avoid splitting any
-        tool_call/result group that immediately precedes the user message.
+        Fix: if recent real user-role messages are not already in the tail
+        (``messages[cut_idx:]``), walk ``cut_idx`` back to include them. This
+        matches the turn-preservation pattern used for session memory: keep
+        the most recent user turns verbatim and summarize older context.
         """
-        last_user_idx = self._find_last_user_message_idx(messages, head_end)
-        if last_user_idx < 0:
+        recent_user_cut = self._find_recent_user_turn_cut(messages, head_end)
+        if recent_user_cut < 0:
             # No user message found beyond head — nothing to anchor.
             return cut_idx
 
-        if last_user_idx >= cut_idx:
-            # Already in the tail; nothing to do.
+        if recent_user_cut >= cut_idx:
+            # Recent user turns are already in the tail; nothing to do.
             return cut_idx
 
-        # The last user message is in the middle (compressed) region.
-        # Pull cut_idx back to it directly — a user message is already a
-        # clean boundary (no tool_call/result splitting risk), so there is no
-        # need to call _align_boundary_backward here; doing so would
-        # unnecessarily pull the cut further back into the preceding
-        # assistant + tool_calls group.
+        # Recent user turns are in the middle (compressed) region. Pull cut_idx
+        # back directly to the earliest one we want to preserve — a user message
+        # is a clean boundary, and calling _align_boundary_backward here would
+        # unnecessarily pull in the preceding assistant + tool_calls group.
         if not self.quiet_mode:
             logger.debug(
-                "Anchoring tail cut to last user message at index %d "
-                "(was %d) to prevent active-task loss after compression",
-                last_user_idx,
+                "Anchoring tail cut to recent user turn at index %d "
+                "(was %d, protect_last_user_turns=%d) to prevent active-task "
+                "loss after compression",
+                recent_user_cut,
                 cut_idx,
+                self.protect_last_user_turns,
             )
         # Safety: never go back into the head region.
-        return max(last_user_idx, head_end + 1)
+        return max(recent_user_cut, head_end + 1)
 
     def _find_tail_cut_by_tokens(
         self, messages: List[Dict[str, Any]], head_end: int,
@@ -1441,7 +1480,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         the cut is placed right after the head so compression still runs.
 
         Never cuts inside a tool_call/result group.  Always ensures the most
-        recent user message is in the tail (see ``_ensure_last_user_message_in_tail``).
+        recent user turns are in the tail (see ``_ensure_last_user_message_in_tail``).
         """
         if token_budget is None:
             token_budget = self.tail_token_budget
@@ -1480,8 +1519,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # Align to avoid splitting tool groups
         cut_idx = self._align_boundary_backward(messages, cut_idx)
 
-        # Ensure the most recent user message is always in the tail so the
-        # active task is never lost to compression (fixes #10896).
+        # Ensure recent real user turns are always in the tail so the active
+        # task and immediate prior user intent are never lost to compression.
         cut_idx = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
 
         return max(cut_idx, head_end + 1)

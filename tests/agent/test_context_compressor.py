@@ -106,6 +106,33 @@ class TestCompress:
         assert summaries
         assert max(len(summary) for summary in summaries) <= 2000 * 4
 
+    def test_tail_preserves_recent_real_user_turns(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                protect_first_n=1,
+                protect_last_n=1,
+                protect_last_user_turns=2,
+                quiet_mode=True,
+            )
+
+        messages = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "protected setup"},
+            {"role": "assistant", "content": "ack"},
+            {"role": "user", "content": "prior real user turn that must stay verbatim"},
+            {"role": "assistant", "content": "large tool call follows"},
+            {"role": "tool", "content": "x" * 10000, "tool_call_id": "call_1"},
+            {"role": "assistant", "content": "tool result summarized"},
+            {"role": "user", "content": f"{SUMMARY_PREFIX}\nold compacted state"},
+            {"role": "user", "content": "[Your active task list was preserved across context compression]\n- item"},
+            {"role": "user", "content": "latest real user turn"},
+            {"role": "assistant", "content": "latest answer"},
+        ]
+
+        cut = c._find_tail_cut_by_tokens(messages, head_end=2, token_budget=1)
+        assert cut == 3
+
     def test_compression_increments_count(self, compressor):
         msgs = self._make_messages(10)
         # Default config (abort_on_summary_failure=False) — fallback path
@@ -181,7 +208,13 @@ class TestGenerateSummaryNoneContent:
     def test_none_content_in_system_message_compress(self):
         """System message with content=None should not crash during compress."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                protect_last_user_turns=1,
+            )
 
         msgs = [{"role": "system", "content": None}] + [
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
@@ -782,7 +815,13 @@ class TestSummaryFailureTrackingForGatewayWarning:
 
     def test_compress_records_fallback_and_dropped_count_on_summary_failure(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                protect_last_user_turns=1,
+            )
 
         msgs = [
             {"role": "system", "content": "sys"},
@@ -814,7 +853,13 @@ class TestSummaryFailureTrackingForGatewayWarning:
         mock_response.choices[0].message.content = "summary text"
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                protect_last_user_turns=1,
+            )
 
         msgs = [
             {"role": "system", "content": "sys"},
@@ -974,7 +1019,13 @@ class TestCompressWithClient:
         mock_client.chat.completions.create.return_value = mock_response
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                protect_last_user_turns=1,
+            )
 
         msgs = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"} for i in range(10)]
         with patch("agent.context_compressor.call_llm", return_value=mock_response):
@@ -1068,7 +1119,13 @@ class TestCompressWithClient:
         mock_response.choices[0].message.content = "summary text"
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                protect_last_user_turns=1,
+            )
 
         # head_last=assistant, tail_first=assistant (same shape as the
         # existing consecutive-user test) → role resolves to "user".
@@ -1136,7 +1193,13 @@ class TestCompressWithClient:
         mock_client.chat.completions.create.return_value = mock_response
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                protect_last_user_turns=1,
+            )
 
         # Last head message (index 2) is "user" → summary should be "assistant"
         # NOTE: protect_first_n=2 preserves 2 non-system messages in addition to
@@ -1283,7 +1346,13 @@ class TestCompressWithClient:
         mock_response.choices[0].message.content = "summary text"
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1, protect_last_n=2)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=1,
+                protect_last_n=2,
+                protect_last_user_turns=1,
+            )
 
         # Head: [system, user]        → last head = user
         # Tail: [assistant, user, assistant] → first tail = assistant

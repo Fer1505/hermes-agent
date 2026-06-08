@@ -1115,6 +1115,13 @@ def init_agent(
             compression_summary_max_tokens = int(_summary_max_raw)
         except (TypeError, ValueError):
             compression_summary_max_tokens = None
+    try:
+        compression_protect_last_user_turns = max(
+            1,
+            int(_compression_cfg.get("protect_last_user_turns", 2)),
+        )
+    except (TypeError, ValueError):
+        compression_protect_last_user_turns = 2
 
     # Read optional explicit context_length override for the auxiliary
     # compression model. Custom endpoints often cannot report this via
@@ -1331,6 +1338,7 @@ def init_agent(
             api_mode=agent.api_mode,
             abort_on_summary_failure=compression_abort_on_summary_failure,
             summary_max_tokens=compression_summary_max_tokens,
+            protect_last_user_turns=compression_protect_last_user_turns,
         )
     agent.compression_enabled = compression_enabled
 
