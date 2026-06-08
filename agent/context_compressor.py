@@ -57,6 +57,10 @@ _MIN_SUMMARY_TOKENS = 2000
 _SUMMARY_RATIO = 0.20
 # Absolute ceiling for summary tokens (even on very large context windows)
 _SUMMARY_TOKENS_CEILING = 12_000
+_SUMMARY_TRIM_NOTICE = (
+    "\n\n[Context summary trimmed to the configured compression budget. "
+    "Use source-of-truth files and current tool reads for details not repeated here.]\n\n"
+)
 
 # Placeholder used when pruning old tool results
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
@@ -506,7 +510,7 @@ class ContextCompressor(ContextEngine):
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
-            int(context_length * 0.05), _SUMMARY_TOKENS_CEILING,
+            int(context_length * 0.05), self.summary_tokens_ceiling,
         )
 
     def __init__(
@@ -524,6 +528,7 @@ class ContextCompressor(ContextEngine):
         provider: str = "",
         api_mode: str = "",
         abort_on_summary_failure: bool = False,
+        summary_max_tokens: int | None = None,
     ):
         self.model = model
         self.base_url = base_url
@@ -534,6 +539,15 @@ class ContextCompressor(ContextEngine):
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
+        try:
+            self.summary_tokens_ceiling = (
+                int(summary_max_tokens)
+                if summary_max_tokens
+                else _SUMMARY_TOKENS_CEILING
+            )
+        except (TypeError, ValueError):
+            self.summary_tokens_ceiling = _SUMMARY_TOKENS_CEILING
+        self.summary_tokens_ceiling = max(256, self.summary_tokens_ceiling)
         self.quiet_mode = quiet_mode
         # When True, summary-generation failure aborts compression entirely
         # (returns messages unchanged, sets _last_compress_aborted=True).
@@ -560,7 +574,7 @@ class ContextCompressor(ContextEngine):
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
         self.tail_token_budget = target_tokens
         self.max_summary_tokens = min(
-            int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING,
+            int(self.context_length * 0.05), self.summary_tokens_ceiling,
         )
 
         if not quiet_mode:
@@ -1487,6 +1501,36 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
         return compress_start < compress_end
 
+    def _trim_summary_to_budget(self, summary: str) -> str:
+        """Hard-cap persisted compaction summaries.
+
+        Summary models can overrun ``max_tokens`` or keep recursively growing an
+        iterative summary. If the oversized summary is persisted, the next turn
+        starts near the compression threshold again and the session thrashes.
+        """
+        if not isinstance(summary, str):
+            return summary
+        max_chars = max(512, self.max_summary_tokens * _CHARS_PER_TOKEN)
+        if len(summary) <= max_chars:
+            return summary
+
+        notice = _SUMMARY_TRIM_NOTICE
+        if len(notice) >= max_chars:
+            return summary[:max_chars]
+        head_budget = max(0, int((max_chars - len(notice)) * 0.70))
+        tail_budget = max(0, max_chars - len(notice) - head_budget)
+        trimmed = summary[:head_budget].rstrip() + notice
+        if tail_budget:
+            trimmed += summary[-tail_budget:].lstrip()
+        if not self.quiet_mode:
+            logger.warning(
+                "Context summary trimmed from %d to %d chars (max_summary_tokens=%d)",
+                len(summary),
+                len(trimmed),
+                self.max_summary_tokens,
+            )
+        return trimmed[:max_chars]
+
     # ------------------------------------------------------------------
     # Main compression entry point
     # ------------------------------------------------------------------
@@ -1686,12 +1730,14 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # user request as fresh input (#11475, #14521). Append the explicit
         # end marker — the same one used in the merge-into-tail path — so
         # the model has a clear "summary above, not new input" signal.
+        summary_suffix = (
+            "\n\n--- END OF CONTEXT SUMMARY — "
+            "respond to the message below, not the summary above ---"
+        )
         if not _merge_summary_into_tail and summary_role == "user":
-            summary = (
-                summary
-                + "\n\n--- END OF CONTEXT SUMMARY — "
-                "respond to the message below, not the summary above ---"
-            )
+            summary = summary + summary_suffix
+
+        summary = self._trim_summary_to_budget(summary)
 
         if not _merge_summary_into_tail:
             compressed.append({"role": summary_role, "content": summary})
@@ -1701,9 +1747,10 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             if _merge_summary_into_tail and i == compress_end:
                 merged_prefix = (
                     summary
-                    + "\n\n--- END OF CONTEXT SUMMARY — "
-                    "respond to the message below, not the summary above ---\n\n"
+                    + summary_suffix
+                    + "\n\n"
                 )
+                merged_prefix = self._trim_summary_to_budget(merged_prefix)
                 msg["content"] = _append_text_to_content(
                     msg.get("content"),
                     merged_prefix,

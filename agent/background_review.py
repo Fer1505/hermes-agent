@@ -26,6 +26,11 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+_BACKGROUND_REVIEW_MAX_MESSAGES = 48
+_BACKGROUND_REVIEW_MAX_CONTENT_CHARS = 2500
+_BACKGROUND_REVIEW_MAX_TOOL_CHARS = 800
+_BACKGROUND_REVIEW_MAX_TOOL_ARGS_CHARS = 1000
+
 
 # Review-prompt strings — used by ``spawn_background_review_thread`` to build
 # the user-message that the forked review agent receives.  AIAgent exposes
@@ -137,6 +142,78 @@ _SKILL_REVIEW_PROMPT = (
     "produced no new technique, just say 'Nothing to save.' and stop. "
     "Otherwise, act."
 )
+
+
+def _clip_text_for_background_review(text: str, limit: int) -> str:
+    if not isinstance(text, str) or len(text) <= limit:
+        return text
+    if limit <= 64:
+        return text[:limit]
+    marker = "\n...[clipped for background review]...\n"
+    head = max(0, (limit - len(marker)) * 2 // 3)
+    tail = max(0, limit - len(marker) - head)
+    return text[:head].rstrip() + marker + text[-tail:].lstrip()
+
+
+def _prepare_background_review_snapshot(messages_snapshot: List[Dict]) -> List[Dict]:
+    """Return a bounded, non-mutating snapshot for the self-review fork.
+
+    The review pass is best-effort housekeeping. It should not carry the full
+    human chat lane, oversized context summaries, or large tool payloads into
+    another agent loop where they can trigger compression and waste time.
+    """
+    if not messages_snapshot:
+        return []
+
+    bounded = messages_snapshot[-_BACKGROUND_REVIEW_MAX_MESSAGES:]
+    prepared: List[Dict] = []
+    dropped = len(messages_snapshot) - len(bounded)
+    if dropped > 0:
+        prepared.append(
+            {
+                "role": "user",
+                "content": (
+                    f"[Background review note: {dropped} older message(s) "
+                    "were omitted from this bounded review snapshot.]"
+                ),
+            }
+        )
+
+    for msg in bounded:
+        copied = dict(msg)
+        content = copied.get("content")
+        limit = (
+            _BACKGROUND_REVIEW_MAX_TOOL_CHARS
+            if copied.get("role") == "tool"
+            else _BACKGROUND_REVIEW_MAX_CONTENT_CHARS
+        )
+        if isinstance(content, str):
+            copied["content"] = _clip_text_for_background_review(content, limit)
+        elif isinstance(content, list):
+            copied["content"] = "[multimodal content omitted from background review]"
+        elif isinstance(content, dict):
+            copied["content"] = "[structured content omitted from background review]"
+
+        tool_calls = copied.get("tool_calls")
+        if isinstance(tool_calls, list):
+            trimmed_calls = []
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    trimmed_calls.append(tc)
+                    continue
+                fn = dict(tc.get("function") or {})
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    fn["arguments"] = _clip_text_for_background_review(
+                        args,
+                        _BACKGROUND_REVIEW_MAX_TOOL_ARGS_CHARS,
+                    )
+                trimmed_calls.append({**tc, "function": fn})
+            copied["tool_calls"] = trimmed_calls
+
+        prepared.append(copied)
+
+    return prepared
 
 _COMBINED_REVIEW_PROMPT = (
     "Review the conversation above and update two things:\n\n"
@@ -398,6 +475,7 @@ def _run_review_in_thread(
             review_agent._user_profile_enabled = agent._user_profile_enabled
             review_agent._memory_nudge_interval = 0
             review_agent._skill_nudge_interval = 0
+            review_agent.compression_enabled = False
             # Suppress all status/warning emits from the fork so the
             # user only sees the final successful-action summary.
             # Without this, mid-review "Iteration budget exhausted",
@@ -554,8 +632,10 @@ def spawn_background_review_thread(
     else:
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
 
+    review_snapshot = _prepare_background_review_snapshot(messages_snapshot)
+
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+        _run_review_in_thread(agent, review_snapshot, prompt)
 
     return _target, prompt
 

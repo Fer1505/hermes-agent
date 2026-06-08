@@ -78,6 +78,34 @@ class TestCompress:
         assert compressor._last_compress_aborted is False
         assert compressor._last_summary_fallback_used is True
 
+    def test_summary_is_hard_capped(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                protect_first_n=1,
+                protect_last_n=1,
+                summary_max_tokens=2000,
+                quiet_mode=True,
+            )
+        c._generate_summary = MagicMock(return_value="A" * 20000)
+
+        msgs = [
+            {"role": "system", "content": "System prompt"},
+            {"role": "user", "content": "start"},
+            *self._make_messages(12),
+            {"role": "user", "content": "latest"},
+        ]
+
+        result = c.compress(msgs, current_tokens=90000)
+        summaries = [
+            msg["content"]
+            for msg in result
+            if isinstance(msg.get("content"), str)
+            and "Context summary trimmed to the configured compression budget" in msg["content"]
+        ]
+        assert summaries
+        assert max(len(summary) for summary in summaries) <= 2000 * 4
+
     def test_compression_increments_count(self, compressor):
         msgs = self._make_messages(10)
         # Default config (abort_on_summary_failure=False) — fallback path

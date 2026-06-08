@@ -76,6 +76,46 @@ def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
     ]
 
 
+def test_background_review_uses_bounded_snapshot_and_disables_compression(monkeypatch):
+    captured = {}
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            self._session_messages = []
+            self.compression_enabled = True
+
+        def run_conversation(self, **kwargs):
+            captured["compression_enabled"] = self.compression_enabled
+            captured["history"] = kwargs["conversation_history"]
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+    messages = [
+        {"role": "tool", "content": "x" * 5000, "tool_call_id": f"call_{i}"}
+        for i in range(80)
+    ]
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=messages,
+        review_skills=True,
+    )
+
+    assert captured["compression_enabled"] is False
+    history = captured["history"]
+    assert len(history) == 49  # 48 recent messages plus one omission note
+    assert "older message(s) were omitted" in history[0]["content"]
+    assert all(len(msg.get("content") or "") <= 2500 for msg in history)
+
+
 def test_background_review_installs_auto_deny_approval_callback(monkeypatch):
     """Regression guard for #15216.
 
