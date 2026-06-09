@@ -67,7 +67,6 @@ def mirror_to_session(
         if provider_message_id:
             mirror_msg["message_id"] = str(provider_message_id)
 
-        _append_to_jsonl(session_id, mirror_msg)
         _append_to_sqlite(session_id, mirror_msg)
 
         logger.debug("Mirror: wrote to session %s (from %s)", session_id, source_label)
@@ -152,15 +151,6 @@ def _find_session_id(
     best_entry = max(candidates, key=lambda entry: entry.get("updated_at", ""))
     return best_entry.get("session_id")
 
-
-def _append_to_jsonl(session_id: str, message: dict) -> None:
-    """Append a message to the JSONL transcript file."""
-    transcript_path = _SESSIONS_DIR / f"{session_id}.jsonl"
-    try:
-        with open(transcript_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(message, ensure_ascii=False) + "\n")
-    except Exception as e:
-        logger.debug("Mirror JSONL write failed: %s", e)
 
 
 def _append_to_sqlite(session_id: str, message: dict) -> None:
