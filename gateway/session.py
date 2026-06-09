@@ -748,6 +748,40 @@ class SessionStore:
             group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
         )
+
+    def _project_entry_to_compression_tip_locked(self, entry: SessionEntry) -> bool:
+        """Move a stale session index entry to its live compression tip.
+
+        Context compression ends the current SQLite session and continues in a
+        child linked by ``parent_session_id``.  The session-key index must point
+        at that child; otherwise a gateway restart, resume, or stale
+        ``sessions.json`` entry can reload the ended parent and repeatedly
+        compress/answer from old context while the live continuation exists
+        elsewhere.
+
+        Must be called with ``self._lock`` held because it mutates
+        ``SessionEntry`` fields.
+        """
+        if not self._db or not entry.session_id:
+            return False
+        try:
+            tip_session_id = self._db.get_compression_tip(entry.session_id)
+        except Exception as e:
+            logger.debug("Compression-tip projection failed for %s: %s", entry.session_id, e)
+            return False
+        if not tip_session_id or tip_session_id == entry.session_id:
+            return False
+
+        logger.info(
+            "SessionStore projected compressed session %s -> %s",
+            entry.session_id,
+            tip_session_id,
+        )
+        entry.session_id = tip_session_id
+        # The stored prompt-token value belongs to the old oversized request.
+        # Reusing it on the child can immediately retrigger hygiene compression.
+        entry.last_prompt_tokens = 0
+        return True
     
     def _is_session_expired(self, entry: SessionEntry) -> bool:
         """Check if a session has expired based on its reset policy.
@@ -877,6 +911,7 @@ class SessionStore:
 
             if session_key in self._entries and not force_new:
                 entry = self._entries[session_key]
+                self._project_entry_to_compression_tip_locked(entry)
 
                 # Auto-reset sessions marked as suspended (e.g. after /stop
                 # broke a stuck loop — #7536).  ``suspended`` is the hard

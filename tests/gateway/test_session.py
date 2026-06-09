@@ -728,6 +728,62 @@ class TestSessionStoreSwitchSession:
         db.close()
 
 
+class TestSessionStoreCompressionTipProjection:
+    """Regression coverage for stale gateway indexes after compression."""
+
+    def test_get_or_create_projects_compression_parent_to_live_child(self, tmp_path):
+        from datetime import datetime
+        from hermes_state import SessionDB
+        from gateway.session import SessionEntry
+
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=config)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        store._db = db
+        store._loaded = True
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="chat-1",
+            chat_type="dm",
+            user_id="user-1",
+            user_name="tester",
+        )
+        session_key = build_session_key(source)
+
+        db.create_session("compressed_parent", source="telegram", user_id="user-1")
+        db.end_session("compressed_parent", "compression")
+        db.create_session(
+            "compressed_child",
+            source="telegram",
+            user_id="user-1",
+            parent_session_id="compressed_parent",
+        )
+        db.append_message("compressed_child", "user", "live continuation")
+
+        store._entries = {
+            session_key: SessionEntry(
+                session_key=session_key,
+                session_id="compressed_parent",
+                created_at=datetime.now(),
+                updated_at=datetime.now(),
+                origin=source,
+                platform=Platform.TELEGRAM,
+                chat_type="dm",
+                last_prompt_tokens=200_000,
+            )
+        }
+
+        entry = store.get_or_create_session(source)
+
+        assert entry.session_id == "compressed_child"
+        assert entry.last_prompt_tokens == 0
+        assert db.get_session("compressed_parent")["end_reason"] == "compression"
+        assert store.load_transcript(entry.session_id)[0]["content"] == "live continuation"
+        db.close()
+
+
 class TestWhatsAppSessionKeyConsistency:
     """Regression: WhatsApp session keys must collapse JID/LID aliases to a
     single stable identity for both DM chat_ids and group participant_ids."""
