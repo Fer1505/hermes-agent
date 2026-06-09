@@ -537,6 +537,31 @@ def _normalize_command_for_detection(command: str) -> str:
     command = command.replace('\x00', '')
     # Normalize Unicode (fullwidth Latin, halfwidth Katakana, etc.)
     command = unicodedata.normalize('NFKC', command)
+    command = _rewrite_resolved_hermes_home(command)
+    return command
+
+
+def _rewrite_resolved_hermes_home(command: str) -> str:
+    """Rewrite the resolved absolute Hermes home prefix to ``~/.hermes/``."""
+    try:
+        from hermes_constants import get_hermes_home
+        home = get_hermes_home().expanduser()
+        candidates = [
+            str(home).rstrip("/"),
+            str(home.resolve(strict=False)).rstrip("/"),
+        ]
+    except Exception:
+        return command
+
+    seen: set[str] = set()
+    for path in candidates:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        normalized = path.rstrip("/")
+        if not normalized.startswith("/") or normalized.count("/") < 2:
+            continue
+        command = command.replace(normalized + "/", "~/.hermes/")
     return command
 
 
@@ -1219,6 +1244,109 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     return {"resolved": resolved, "choice": choice}
 
 
+_SECRET_ENV_EXPANSION_RE = re.compile(
+    r'\$\{?[A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)[A-Z0-9_]*\}?',
+    re.IGNORECASE,
+)
+_FETCH_COMMAND_RE = re.compile(r'(?:^|[;&\n])\s*((?:curl|wget)\b[^|;&\n]*)', re.IGNORECASE)
+_PYTHON_PIPE_RE = re.compile(
+    r'\|\s*(?:env\s+)?python(?:\d+(?:\.\d+)?)?\b(?P<tail>[^|;&\n]*)',
+    re.IGNORECASE,
+)
+_MUTATING_HTTP_METHOD_RE = re.compile(
+    r'(?:^|\s)(?:-X\s*(?:POST|PUT|PATCH|DELETE)\b|'
+    r'--request(?:=|\s+)(?:POST|PUT|PATCH|DELETE)\b|'
+    r'--method(?:=|\s+)(?:POST|PUT|PATCH|DELETE)\b)',
+    re.IGNORECASE,
+)
+_CURL_BODY_FLAG_RE = re.compile(
+    r'(?:^|\s)(?:-d|--data(?:-[a-z]+)?|--data-urlencode)(?:=|\s|$)',
+    re.IGNORECASE,
+)
+_FETCH_WRITE_FLAG_RE = re.compile(
+    r'(?:^|\s)(?:-F|--form(?:=|\s|$)|-T|--upload-file(?:=|\s|$)|'
+    r'--post-data(?:=|\s|$)|--body-data(?:=|\s|$)|--body-file(?:=|\s|$))',
+    re.IGNORECASE,
+)
+
+
+def _tirith_finding_text(finding: object) -> str:
+    if isinstance(finding, dict):
+        values = [
+            finding.get("rule_id"),
+            finding.get("title"),
+            finding.get("description"),
+            finding.get("message"),
+            finding.get("summary"),
+        ]
+        return " ".join(str(value or "") for value in values).lower()
+    return str(finding or "").lower()
+
+
+def _is_tirith_pipe_to_interpreter_only(tirith_result: dict) -> bool:
+    if tirith_result.get("action") not in {"block", "warn"}:
+        return False
+    findings = tirith_result.get("findings") or []
+    if findings:
+        return all(
+            "pipe_to_interpreter" in _tirith_finding_text(finding)
+            or (
+                "pipe" in _tirith_finding_text(finding)
+                and "interpreter" in _tirith_finding_text(finding)
+            )
+            for finding in findings
+        )
+    summary = str(tirith_result.get("summary") or "").lower()
+    return "pipe" in summary and "interpreter" in summary
+
+
+def _fetch_segment_is_mutating(segment: str) -> bool:
+    if _MUTATING_HTTP_METHOD_RE.search(segment):
+        return True
+    if _FETCH_WRITE_FLAG_RE.search(segment):
+        return True
+    if _CURL_BODY_FLAG_RE.search(segment):
+        return not re.search(r'(?:^|\s)(?:-G|--get)\b', segment, re.IGNORECASE)
+    return False
+
+
+def _has_read_only_fetch(segment_source: str) -> bool:
+    fetch_segments = [match.group(1) for match in _FETCH_COMMAND_RE.finditer(segment_source)]
+    if not fetch_segments:
+        return False
+    return all(not _fetch_segment_is_mutating(segment) for segment in fetch_segments)
+
+
+def _has_local_python_data_consumer(command: str) -> bool:
+    for match in _PYTHON_PIPE_RE.finditer(command):
+        tail = (match.group("tail") or "").strip()
+        if "<<" in tail:
+            return True
+        if re.search(r'(?:^|\s)-m\s+[\w.]+', tail):
+            return True
+        if re.search(r'(?:^|\s)(?:\.{0,2}/|~/|[A-Za-z0-9_./-]+\.py)\S*', tail):
+            return True
+    return False
+
+
+def _is_safe_read_only_fetch_to_local_python(command: str, tirith_result: dict) -> bool:
+    """Suppress Tirith's broad pipe warning for local data parsing only.
+
+    This does not allow remote scripts, mutating network requests, credential
+    interpolation, or mixed Tirith findings. It only covers commands like a
+    public read-only API fetch piped into a local Python parser/heredoc.
+    """
+    if not _is_tirith_pipe_to_interpreter_only(tirith_result):
+        return False
+    normalized = _normalize_command_for_detection(command)
+    if _SECRET_ENV_EXPANSION_RE.search(normalized):
+        return False
+    if not _has_read_only_fetch(normalized):
+        return False
+    return _has_local_python_data_consumer(normalized)
+
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
@@ -1296,6 +1424,9 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Dangerous command check (detection only, no approval)
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
+
+    if _is_safe_read_only_fetch_to_local_python(command, tirith_result):
+        tirith_result = {"action": "allow", "findings": [], "summary": ""}
 
     # --- Phase 2: Decide ---
 

@@ -8,6 +8,7 @@ human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 import asyncio
 import hashlib
 import json
+from typing import Optional
 import logging
 import os
 import re
