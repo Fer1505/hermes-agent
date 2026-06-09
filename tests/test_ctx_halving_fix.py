@@ -67,6 +67,13 @@ class TestParseAvailableOutputTokens:
         msg = "max_tokens must be at most 10000 given your prompt (available tokens: 10000)"
         assert self._parse(msg) == 10000
 
+    def test_lm_studio_character_based_output_cap_overflow(self):
+        msg = (
+            "This model's maximum context length is 65536 tokens. However, you "
+            "requested 65536 output tokens and your prompt contains 77409 characters."
+        )
+        assert self._parse(msg) == 39733
+
     def test_single_token_available(self):
         """Edge case: only 1 token left."""
         msg = "max_tokens: 9999 > context_window: 10000 - input_tokens: 9999 = available_tokens: 1"

@@ -933,6 +933,16 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
     is_output_cap_error = (
         "max_tokens" in error_lower
         and ("available_tokens" in error_lower or "available tokens" in error_lower)
+    ) or (
+        # LM Studio / llama.cpp / some OpenAI-compatible servers:
+        #   "This model's maximum context length is 65536 tokens. However, you
+        #    requested 65536 output tokens and your prompt contains 77409
+        #    characters ..."
+        # The "requested N output tokens" phrasing means the OUTPUT cap is the
+        # problem (the input itself fits) -- reduce max_tokens, don't compress.
+        "maximum context length" in error_lower
+        and "requested" in error_lower
+        and "output tokens" in error_lower
     )
     if not is_output_cap_error:
         return None
@@ -951,6 +961,19 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
             tokens = int(match.group(1))
             if tokens >= 1:
                 return tokens
+
+    # LM Studio / llama.cpp style: context window is reported in tokens but the
+    # prompt size is reported in characters. Estimate input tokens
+    # conservatively (~3 chars/token), then use the rest of the window for
+    # output so the retry stays inside the server's hard cap.
+    match_context = re.search(r'maximum context length is (\d+)\s*token', error_lower)
+    match_chars = re.search(r'prompt contains (\d+)\s*character', error_lower)
+    if match_context and match_chars:
+        context_tokens = int(match_context.group(1))
+        estimated_input_tokens = (int(match_chars.group(1)) + 2) // 3
+        available = context_tokens - estimated_input_tokens
+        if available >= 1:
+            return available
     return None
 
 

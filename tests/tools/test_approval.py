@@ -431,6 +431,22 @@ class TestSensitiveRedirectPattern:
         assert dangerous is True
         assert key is not None
 
+    def test_redirect_to_resolved_hermes_home_env(self, tmp_path):
+        hermes_home = tmp_path / "profile"
+        hermes_home.mkdir()
+        with mock_patch.dict("os.environ", {"HERMES_HOME": str(hermes_home)}, clear=False):
+            dangerous, key, desc = detect_dangerous_command(f"echo x > {hermes_home}/.env")
+        assert dangerous is True
+        assert key is not None
+
+    def test_redirect_to_resolved_hermes_home_config(self, tmp_path):
+        hermes_home = tmp_path / "profile"
+        hermes_home.mkdir()
+        with mock_patch.dict("os.environ", {"HERMES_HOME": str(hermes_home)}, clear=False):
+            dangerous, key, desc = detect_dangerous_command(f"echo x > {hermes_home}/config.yaml")
+        assert dangerous is True
+        assert key is not None
+
     def test_append_to_home_ssh_authorized_keys(self):
         dangerous, key, desc = detect_dangerous_command("cat key >> $HOME/.ssh/authorized_keys")
         assert dangerous is True
@@ -507,6 +523,54 @@ class TestProjectSensitiveCopyPattern:
         assert dangerous is False
         assert key is None
         assert desc is None
+
+
+class TestHermesConfigInPlaceEditPattern:
+    def test_sed_in_place_resolved_hermes_home_config(self, tmp_path):
+        hermes_home = tmp_path / "profile"
+        hermes_home.mkdir()
+        with mock_patch.dict("os.environ", {"HERMES_HOME": str(hermes_home)}, clear=False):
+            dangerous, key, desc = detect_dangerous_command(
+                f"sed -i 's/manual/off/' {hermes_home}/config.yaml"
+            )
+        assert dangerous is True
+        assert key is not None
+        assert "hermes config" in desc.lower() or "config/env" in desc.lower()
+
+    def test_sed_in_place_resolved_hermes_home_env(self, tmp_path):
+        hermes_home = tmp_path / "profile"
+        hermes_home.mkdir()
+        with mock_patch.dict("os.environ", {"HERMES_HOME": str(hermes_home)}, clear=False):
+            dangerous, key, desc = detect_dangerous_command(
+                f"sed -i 's/API_KEY=.*/API_KEY=x/' {hermes_home}/.env"
+            )
+        assert dangerous is True
+        assert key is not None
+
+    def test_perl_in_place_resolved_hermes_home_config(self, tmp_path):
+        hermes_home = tmp_path / "profile"
+        hermes_home.mkdir()
+        with mock_patch.dict("os.environ", {"HERMES_HOME": str(hermes_home)}, clear=False):
+            dangerous, key, desc = detect_dangerous_command(
+                f"perl -p -i -e 's/manual/off/' {hermes_home}/config.yaml"
+            )
+        assert dangerous is True
+        assert key is not None
+
+    def test_ruby_in_place_resolved_hermes_home_env(self, tmp_path):
+        hermes_home = tmp_path / "profile"
+        hermes_home.mkdir()
+        with mock_patch.dict("os.environ", {"HERMES_HOME": str(hermes_home)}, clear=False):
+            dangerous, key, desc = detect_dangerous_command(
+                f"ruby -i -pe 'gsub(/API_KEY=.*/, \"API_KEY=x\")' {hermes_home}/.env"
+            )
+        assert dangerous is True
+        assert key is not None
+
+    def test_regular_absolute_config_path_still_uses_project_rule(self):
+        dangerous, key, desc = detect_dangerous_command("sed -i 's/a/b/' /srv/app/config.yaml")
+        assert dangerous is False
+        assert key is None
 
 
 class TestProjectSensitiveTeePattern:
