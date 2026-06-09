@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.channel_directory import (
     build_channel_directory,
+    channel_delivery_status,
     lookup_channel_type,
     mark_channel_delivery_failed,
     mark_channel_delivery_success,
@@ -98,6 +99,162 @@ class TestBuildChannelDirectoryWrites:
                 "thread_id": None,
             }
         ]
+
+    def test_recovers_stale_delivery_metadata_from_send_failure_transcripts(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {})
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        (sessions_dir / "sessions.json").write_text(
+            json.dumps(
+                {
+                    "group": {
+                        "origin": {
+                            "platform": "telegram",
+                            "chat_id": "-1003579233553",
+                            "chat_name": "Franklin, Hermes and Athena",
+                        },
+                        "chat_type": "group",
+                    }
+                }
+            )
+        )
+        (sessions_dir / "session.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "function": {
+                                        "name": "send_message",
+                                        "arguments": json.dumps(
+                                            {
+                                                "action": "send",
+                                                "target": "telegram:Franklin, Hermes and Athena",
+                                                "message": "Status",
+                                            }
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "role": "tool",
+                            "name": "send_message",
+                            "tool_call_id": "call-1",
+                            "content": '{"error": "Telegram send failed: Chat not found"}',
+                            "timestamp": "2026-06-08T15:23:23.966787",
+                        }
+                    ),
+                ]
+            )
+        )
+
+        with (
+            patch("gateway.channel_directory.DIRECTORY_PATH", cache_file),
+            patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}),
+        ):
+            result = asyncio.run(build_channel_directory({}))
+
+        telegram = result["platforms"]["telegram"]
+        assert telegram[0]["delivery_status"] == "stale"
+        assert telegram[0]["last_delivery_error"] == "Telegram send failed: Chat not found"
+
+    def test_later_success_clears_recovered_stale_delivery_metadata(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {})
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        (sessions_dir / "sessions.json").write_text(
+            json.dumps(
+                {
+                    "group": {
+                        "origin": {
+                            "platform": "telegram",
+                            "chat_id": "-1003579233553",
+                            "chat_name": "Franklin, Hermes and Athena",
+                        },
+                        "chat_type": "group",
+                    }
+                }
+            )
+        )
+        (sessions_dir / "session.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "function": {
+                                        "name": "send_message",
+                                        "arguments": json.dumps(
+                                            {
+                                                "action": "send",
+                                                "target": "telegram:-1003579233553",
+                                                "message": "Status",
+                                            }
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "role": "tool",
+                            "name": "send_message",
+                            "tool_call_id": "call-1",
+                            "content": '{"error": "Telegram send failed: Chat not found"}',
+                            "timestamp": "2026-06-08T15:23:23.966787",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "call-2",
+                                    "function": {
+                                        "name": "send_message",
+                                        "arguments": json.dumps(
+                                            {
+                                                "action": "send",
+                                                "target": "telegram:-1003579233553",
+                                                "message": "Status",
+                                            }
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "role": "tool",
+                            "name": "send_message",
+                            "tool_call_id": "call-2",
+                            "content": '{"success": true, "message_id": "777"}',
+                            "timestamp": "2026-06-08T15:24:00.000000",
+                        }
+                    ),
+                ]
+            )
+        )
+
+        with (
+            patch("gateway.channel_directory.DIRECTORY_PATH", cache_file),
+            patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}),
+        ):
+            result = asyncio.run(build_channel_directory({}))
+
+        telegram = result["platforms"]["telegram"]
+        assert "delivery_status" not in telegram[0]
 
 
 class TestResolveChannelName:
@@ -218,6 +375,26 @@ class TestResolveChannelName:
             assert resolve_channel_name("telegram", "Old Group") is None
             assert resolve_channel_name("telegram", "Old Group (group)") is None
             assert resolve_channel_name("telegram", "-100999") == "-100999"
+
+    def test_channel_delivery_status_reports_stale_metadata(self, tmp_path):
+        platforms = {
+            "telegram": [
+                {
+                    "id": "-100999",
+                    "name": "Old Group",
+                    "type": "group",
+                    "delivery_status": "stale",
+                    "stale_reason": "delivery_failed",
+                    "last_delivery_error": "Chat not found",
+                    "last_delivery_failed_at": "2026-01-01T00:00:00",
+                },
+            ]
+        }
+        with self._setup(tmp_path, platforms):
+            status = channel_delivery_status("telegram", "-100999")
+
+        assert status["delivery_status"] == "stale"
+        assert status["last_delivery_error"] == "Chat not found"
 
 
 class TestDeliveryStaleMetadata:
@@ -419,6 +596,29 @@ class TestFormatDirectoryForDisplay:
         assert "telegram:Alice" in result
         assert "telegram:Dev Group" in result
         assert "telegram:Coaching Chat / topic 17585" in result
+
+    def test_stale_targets_are_separated_from_usable_display(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "telegram": [
+                {"id": "123", "name": "Alice", "type": "dm"},
+                {
+                    "id": "-100999",
+                    "name": "Old Group",
+                    "type": "group",
+                    "delivery_status": "stale",
+                    "last_delivery_error": "Chat not found",
+                },
+            ]
+        })
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file):
+            result = format_directory_for_display()
+
+        active_section = result.split("Unavailable stale targets", 1)[0]
+        assert "telegram:Alice" in active_section
+        assert "telegram:Old Group" not in active_section
+        assert "Unavailable stale targets" in result
+        assert "telegram:Old Group (group)" in result
+        assert "do not use" in result
 
     def test_discord_grouped_by_guild(self, tmp_path):
         cache_file = _write_directory(tmp_path, {

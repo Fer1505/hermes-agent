@@ -30,8 +30,16 @@ from tools.send_message_tool import (
     _send_signal,
     _send_telegram,
     _send_to_platform,
+    _successful_send_records,
     send_message_tool,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_successful_send_records():
+    _successful_send_records.clear()
+    yield
+    _successful_send_records.clear()
 
 
 def _run_async_immediately(coro):
@@ -251,6 +259,81 @@ class TestSendMessageTool:
             media_files=[],
             force_document=False,
         )
+
+    def test_stale_explicit_telegram_target_fails_before_provider_call(self, tmp_path):
+        config, _telegram_cfg = _make_config()
+        cache_file = tmp_path / "channel_directory.json"
+        cache_file.write_text(json.dumps({
+            "updated_at": "2026-01-01T00:00:00",
+            "platforms": {
+                "telegram": [
+                    {
+                        "id": "-100999",
+                        "name": "Old Group",
+                        "type": "group",
+                        "delivery_status": "stale",
+                        "stale_reason": "delivery_failed",
+                        "last_delivery_error": "Chat not found",
+                        "last_delivery_failed_at": "2026-01-01T00:00:00",
+                    }
+                ]
+            },
+        }))
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True, "message_id": "1"})) as send_mock:
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:-100999",
+                        "message": "hello",
+                    },
+                    task_id="turn-1",
+                )
+            )
+
+        assert result["delivery_status"] == "stale"
+        assert "Refusing to send to stale target telegram:-100999" in result["error"]
+        send_mock.assert_not_awaited()
+
+    def test_duplicate_successful_send_same_turn_is_skipped(self):
+        config, _telegram_cfg = _make_config()
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True, "message_id": "1"})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            first = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:8624542815",
+                        "message": "hello",
+                    },
+                    task_id="turn-1",
+                )
+            )
+            second = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:8624542815",
+                        "message": "hello",
+                    },
+                    task_id="turn-1",
+                )
+            )
+
+        assert first["success"] is True
+        assert second["success"] is True
+        assert second["skipped"] is True
+        assert second["reason"] == "duplicate_successful_send_same_turn"
+        send_mock.assert_awaited_once()
 
     def test_resolved_slack_thread_name_preserves_thread_id(self):
         slack_cfg = SimpleNamespace(enabled=True, token="xoxb-test", extra={})

@@ -8,6 +8,7 @@ action="list" and for resolving human-friendly channel names to numeric IDs.
 
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -52,6 +53,7 @@ TRANSIENT_DELIVERY_ERROR_MARKERS = (
     "connection reset",
     "network",
 )
+_EXPLICIT_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
 
 
 def _normalize_channel_query(value: str) -> str:
@@ -98,6 +100,31 @@ def _channel_delivery_id(chat_id: str, thread_id: Optional[str] = None) -> str:
     return str(chat_id)
 
 
+def channel_delivery_status(
+    platform_name: str,
+    chat_id: str,
+    *,
+    thread_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return cached delivery metadata for a platform target, when known."""
+    directory = load_directory()
+    channels = directory.get("platforms", {}).get(platform_name, [])
+    if not isinstance(channels, list):
+        return None
+
+    target_id = _channel_delivery_id(str(chat_id), str(thread_id) if thread_id else None)
+    for channel in channels:
+        if not isinstance(channel, dict) or str(channel.get("id")) != target_id:
+            continue
+        return {
+            "delivery_status": channel.get("delivery_status"),
+            "stale_reason": channel.get("stale_reason"),
+            "last_delivery_error": channel.get("last_delivery_error"),
+            "last_delivery_failed_at": channel.get("last_delivery_failed_at"),
+        }
+    return None
+
+
 def _safe_error_text(error: Any) -> str:
     text = str(error or "unknown delivery failure")
     try:
@@ -139,6 +166,156 @@ def _preserve_delivery_metadata(
             if key in previous:
                 entry[key] = previous[key]
     return entries
+
+
+def _parse_json_prefix(value: Any) -> Optional[Dict[str, Any]]:
+    """Parse the leading JSON object from a tool payload.
+
+    Tool loop warnings can be appended after the JSON result, so a strict
+    json.loads() would miss the provider error that matters for stale recovery.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed, _idx = json.JSONDecoder().raw_decode(value.strip())
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _resolve_recovery_target(
+    platforms: Dict[str, List[Dict[str, Any]]],
+    target: Any,
+) -> Optional[tuple[str, str, Optional[str]]]:
+    if not isinstance(target, str) or ":" not in target:
+        return None
+
+    platform_name, target_ref = target.split(":", 1)
+    platform_name = platform_name.strip().lower()
+    target_ref = target_ref.strip()
+    if not platform_name or not target_ref:
+        return None
+
+    explicit_match = _EXPLICIT_TOPIC_TARGET_RE.fullmatch(target_ref)
+    if explicit_match:
+        return platform_name, explicit_match.group(1), explicit_match.group(2)
+
+    query = _normalize_channel_query(target_ref)
+    for channel in platforms.get(platform_name, []):
+        if not isinstance(channel, dict):
+            continue
+        entry_id = channel.get("id")
+        if entry_id is None:
+            continue
+        if str(entry_id) == target_ref:
+            return platform_name, str(entry_id), None
+        if _normalize_channel_query(str(channel.get("name") or "")) == query:
+            return platform_name, str(entry_id), channel.get("thread_id")
+        if _normalize_channel_query(_channel_target_name(platform_name, channel)) == query:
+            return platform_name, str(entry_id), channel.get("thread_id")
+
+    return None
+
+
+def _recent_session_jsonl_paths(limit: int = 200) -> List[Any]:
+    sessions_dir = get_hermes_home() / "sessions"
+    if not sessions_dir.exists():
+        return []
+    try:
+        paths = sorted(
+            sessions_dir.glob("*.jsonl"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except Exception:
+        return []
+    return list(reversed(paths[:limit]))
+
+
+def _recover_session_delivery_metadata(
+    platforms: Dict[str, List[Dict[str, Any]]],
+) -> Dict[tuple[str, str, Optional[str]], Dict[str, Any]]:
+    """Recover stale delivery marks from persisted send_message transcripts."""
+    states: Dict[tuple[str, str, Optional[str]], Dict[str, Any]] = {}
+
+    for path in _recent_session_jsonl_paths():
+        pending_calls: Dict[str, Dict[str, Any]] = {}
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+
+            if event.get("role") == "assistant":
+                for tool_call in event.get("tool_calls") or []:
+                    function = tool_call.get("function") or {}
+                    if function.get("name") != "send_message":
+                        continue
+                    call_id = tool_call.get("id") or tool_call.get("call_id")
+                    if not call_id:
+                        continue
+                    arguments = _parse_json_prefix(function.get("arguments"))
+                    if isinstance(arguments, dict):
+                        pending_calls[str(call_id)] = arguments
+                continue
+
+            if event.get("role") != "tool" or event.get("name") != "send_message":
+                continue
+            call_id = event.get("tool_call_id")
+            arguments = pending_calls.get(str(call_id))
+            if not arguments:
+                continue
+            resolved = _resolve_recovery_target(platforms, arguments.get("target"))
+            if not resolved:
+                continue
+
+            platform_name, chat_id, thread_id = resolved
+            key = (platform_name, chat_id, str(thread_id) if thread_id else None)
+            result = _parse_json_prefix(event.get("content")) or {}
+            error = result.get("error")
+            if error and is_stale_delivery_error(error):
+                states[key] = {
+                    "delivery_status": "stale",
+                    "stale_reason": "delivery_failed",
+                    "last_delivery_error": _safe_error_text(error),
+                    "last_delivery_failed_at": event.get("timestamp") or datetime.now().isoformat(),
+                }
+            elif result.get("success"):
+                states.pop(key, None)
+
+    return states
+
+
+def _apply_recovered_delivery_metadata(
+    platforms: Dict[str, List[Dict[str, Any]]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    recovered = _recover_session_delivery_metadata(platforms)
+    if not recovered:
+        return platforms
+
+    for platform_name, channels in platforms.items():
+        if not isinstance(channels, list):
+            continue
+        for channel in channels:
+            if not isinstance(channel, dict):
+                continue
+            entry_id = channel.get("id")
+            if entry_id is None:
+                continue
+            key = (
+                platform_name,
+                str(entry_id),
+                str(channel.get("thread_id")) if channel.get("thread_id") else None,
+            )
+            metadata = recovered.get(key)
+            if metadata:
+                channel.update(metadata)
+    return platforms
 
 
 def _merge_static_entries(
@@ -218,6 +395,7 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
             entries,
             previous_platforms.get(platform_name, []),
         )
+    platforms = _apply_recovered_delivery_metadata(platforms)
 
     directory = {
         "updated_at": datetime.now().isoformat(),
@@ -523,6 +701,8 @@ def format_directory_for_display() -> str:
         return "No messaging platforms connected or no channels discovered yet."
 
     lines = ["Available messaging targets:\n"]
+    stale_lines: List[str] = []
+    active_count = 0
 
     for plat_name, channels in sorted(platforms.items()):
         if not channels:
@@ -542,22 +722,53 @@ def format_directory_for_display() -> str:
             for guild_name, guild_channels in sorted(guilds.items()):
                 lines.append(f"Discord ({guild_name}):")
                 for ch in sorted(guild_channels, key=lambda c: c["name"]):
+                    if _channel_is_stale(ch):
+                        stale_lines.append(_format_stale_target_line(plat_name, ch))
+                        continue
                     lines.append(f"  discord:{_channel_target_name(plat_name, ch)}")
+                    active_count += 1
             if dms:
-                lines.append("Discord (DMs):")
+                active_dms = [ch for ch in dms if not _channel_is_stale(ch)]
                 for ch in dms:
-                    lines.append(f"  discord:{_channel_target_name(plat_name, ch)}")
+                    if _channel_is_stale(ch):
+                        stale_lines.append(_format_stale_target_line(plat_name, ch))
+                if active_dms:
+                    lines.append("Discord (DMs):")
+                    for ch in active_dms:
+                        lines.append(f"  discord:{_channel_target_name(plat_name, ch)}")
+                        active_count += 1
             lines.append("")
         else:
-            lines.append(f"{plat_name.title()}:")
+            active_channels = []
             for ch in channels:
-                label = _channel_target_name(plat_name, ch)
                 if _channel_is_stale(ch):
-                    label = f"{label} [stale: delivery failed]"
-                lines.append(f"  {plat_name}:{label}")
+                    stale_lines.append(_format_stale_target_line(plat_name, ch))
+                else:
+                    active_channels.append(ch)
+            if active_channels:
+                lines.append(f"{plat_name.title()}:")
+                for ch in active_channels:
+                    label = _channel_target_name(plat_name, ch)
+                    lines.append(f"  {plat_name}:{label}")
+                    active_count += 1
             lines.append("")
 
-    lines.append('Use these as the "target" parameter when sending.')
+    if active_count == 0:
+        lines.append("No currently usable messaging targets are available.")
+        lines.append("")
+
+    if stale_lines:
+        lines.append("Unavailable stale targets (do not use until refreshed):")
+        lines.extend(stale_lines)
+        lines.append("")
+
+    lines.append('Use only the available targets above as the "target" parameter when sending.')
     lines.append('Bare platform name (e.g. "telegram") sends to home channel.')
 
     return "\n".join(lines)
+
+
+def _format_stale_target_line(platform_name: str, channel: Dict[str, Any]) -> str:
+    label = _channel_target_name(platform_name, channel)
+    error = channel.get("last_delivery_error") or channel.get("stale_reason") or "delivery failed"
+    return f"  {platform_name}:{label} — stale, not currently usable ({error})"

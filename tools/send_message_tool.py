@@ -6,6 +6,7 @@ human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -58,6 +59,8 @@ _GENERIC_SECRET_ASSIGN_RE = re.compile(
     re.IGNORECASE,
 )
 _PROOF_REQUIRED_PLATFORMS = frozenset({"telegram", "bluebubbles"})
+_SUCCESSFUL_SEND_TTL_SECONDS = 600
+_successful_send_records: dict[str, float] = {}
 
 
 def _sanitize_error_text(text) -> str:
@@ -101,6 +104,114 @@ def _has_provider_delivery_proof(result, platform_name: str) -> bool:
         or result.get("message_ids")
         or result.get("provider_message_id")
     )
+
+
+def _send_duplicate_key(
+    *,
+    scope: str,
+    platform_name: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    message: str,
+) -> str:
+    digest = hashlib.sha256(message.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return f"{scope}:{platform_name}:{chat_id}:{thread_id or ''}:{digest}"
+
+
+def _prune_successful_send_records(now: float) -> None:
+    expired = [
+        key for key, ts in _successful_send_records.items()
+        if now - ts > _SUCCESSFUL_SEND_TTL_SECONDS
+    ]
+    for key in expired:
+        _successful_send_records.pop(key, None)
+
+
+def _maybe_skip_recent_successful_send(
+    *,
+    scope: str,
+    platform_name: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    message: str,
+) -> Optional[dict]:
+    """Skip accidental duplicate sends in the same agent turn/session scope."""
+    if not scope or not chat_id or not message:
+        return None
+    now = time.time()
+    _prune_successful_send_records(now)
+    key = _send_duplicate_key(
+        scope=scope,
+        platform_name=platform_name,
+        chat_id=str(chat_id),
+        thread_id=thread_id,
+        message=message,
+    )
+    if key not in _successful_send_records:
+        return None
+    return {
+        "success": True,
+        "skipped": True,
+        "reason": "duplicate_successful_send_same_turn",
+        "platform": platform_name,
+        "chat_id": str(chat_id),
+        "note": (
+            "Skipped duplicate send: this exact message was already delivered "
+            "to the same target during the current agent turn."
+        ),
+    }
+
+
+def _record_successful_send(
+    *,
+    scope: str,
+    platform_name: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    message: str,
+) -> None:
+    if not scope or not chat_id or not message:
+        return
+    now = time.time()
+    _prune_successful_send_records(now)
+    key = _send_duplicate_key(
+        scope=scope,
+        platform_name=platform_name,
+        chat_id=str(chat_id),
+        thread_id=thread_id,
+        message=message,
+    )
+    _successful_send_records[key] = now
+
+
+def _stale_target_error(
+    *,
+    platform_name: str,
+    chat_id: str,
+    thread_id: Optional[str],
+) -> Optional[dict]:
+    try:
+        from gateway.channel_directory import channel_delivery_status
+        status = channel_delivery_status(platform_name, chat_id, thread_id=thread_id)
+    except Exception:
+        status = None
+    if not status or status.get("delivery_status") != "stale":
+        return None
+
+    error = status.get("last_delivery_error") or status.get("stale_reason") or "delivery failed"
+    failed_at = status.get("last_delivery_failed_at")
+    target = f"{platform_name}:{chat_id}"
+    if thread_id:
+        target = f"{target}:{thread_id}"
+    return {
+        "error": (
+            f"Refusing to send to stale target {target}: previous delivery failed "
+            f"permanently ({_sanitize_error_text(error)}). Use send_message(action='list') "
+            "and choose a currently available target, or refresh/re-pair the lane first."
+        ),
+        "delivery_status": "stale",
+        "last_delivery_failed_at": failed_at,
+    }
 
 
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
@@ -171,6 +282,14 @@ SEND_MESSAGE_SCHEMA = {
             "message": {
                 "type": "string",
                 "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/hermes/cache/img_xxx.jpg') in the message — the platform will deliver it as a native media attachment."
+            },
+            "allow_duplicate": {
+                "type": "boolean",
+                "description": "Set true only when the user explicitly asks to send the exact same message to the exact same target more than once in the current turn."
+            },
+            "allow_stale": {
+                "type": "boolean",
+                "description": "Set true only when the user explicitly asks to retry a target marked stale after a previous permanent delivery failure."
             }
         },
         "required": []
@@ -185,7 +304,7 @@ def send_message_tool(args, **kw):
     if action == "list":
         return _handle_list()
 
-    return _handle_send(args)
+    return _handle_send(args, **kw)
 
 
 def _handle_list():
@@ -197,10 +316,12 @@ def _handle_list():
         return json.dumps(_error(f"Failed to load channel directory: {e}"))
 
 
-def _handle_send(args):
+def _handle_send(args, **kw):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
+    allow_duplicate = bool(args.get("allow_duplicate", False))
+    allow_stale = bool(args.get("allow_stale", False))
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
@@ -302,9 +423,30 @@ def _handle_send(args):
                 f"or set a home channel via: hermes config set {platform_name.upper()}_HOME_CHANNEL <channel_id>"
             })
 
+    if not allow_stale:
+        stale_error = _stale_target_error(
+            platform_name=platform_name,
+            chat_id=str(chat_id),
+            thread_id=thread_id,
+        )
+        if stale_error:
+            return json.dumps(stale_error)
+
     duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
     if duplicate_skip:
         return json.dumps(duplicate_skip)
+
+    task_scope = str(kw.get("task_id") or "")
+    if not allow_duplicate:
+        duplicate_success_skip = _maybe_skip_recent_successful_send(
+            scope=task_scope,
+            platform_name=platform_name,
+            chat_id=str(chat_id),
+            thread_id=thread_id,
+            message=cleaned_message,
+        )
+        if duplicate_success_skip:
+            return json.dumps(duplicate_success_skip)
 
     try:
         from model_tools import _run_async
@@ -355,6 +497,13 @@ def _handle_send(args):
                 )
             except Exception:
                 pass
+            _record_successful_send(
+                scope=task_scope,
+                platform_name=platform_name,
+                chat_id=str(chat_id),
+                thread_id=thread_id,
+                message=cleaned_message,
+            )
 
         if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
