@@ -806,20 +806,32 @@ class _CodexCompletionsAdapter:
                 # cadence the old in-line ``_check_cancelled()`` used.
                 _check_cancelled()
 
-            event_stream = self._client.responses.create(**stream_kwargs)
-            try:
-                final = _consume_codex_event_stream(
-                    event_stream,
-                    model=resp_kwargs.get("model"),
-                    on_event=_on_each_event,
-                )
-            finally:
-                close_fn = getattr(event_stream, "close", None)
-                if callable(close_fn):
-                    try:
-                        close_fn()
-                    except Exception:
-                        pass
+            create_fn = getattr(self._client.responses, "create", None)
+            if callable(create_fn):
+                event_stream = create_fn(**stream_kwargs)
+                try:
+                    final = _consume_codex_event_stream(
+                        event_stream,
+                        model=resp_kwargs.get("model"),
+                        on_event=_on_each_event,
+                    )
+                finally:
+                    close_fn = getattr(event_stream, "close", None)
+                    if callable(close_fn):
+                        try:
+                            close_fn()
+                        except Exception:
+                            pass
+            else:
+                stream_fn = getattr(self._client.responses, "stream", None)
+                if not callable(stream_fn):
+                    raise AttributeError("Responses client exposes neither create() nor stream()")
+                with stream_fn(**resp_kwargs) as event_stream:
+                    final = _consume_codex_event_stream(
+                        event_stream,
+                        model=resp_kwargs.get("model"),
+                        on_event=_on_each_event,
+                    )
 
             if final is None:
                 raise RuntimeError("Codex auxiliary Responses stream did not return a final response")

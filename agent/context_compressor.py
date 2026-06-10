@@ -1735,7 +1735,12 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         self, messages: List[Dict[str, Any]], head_end: int
     ) -> int:
         """Return the earliest index needed to preserve recent real user turns."""
-        if self.protect_last_user_turns <= 1:
+        protect_last_user_turns = getattr(
+            self,
+            "protect_last_user_turns",
+            _DEFAULT_PROTECT_LAST_USER_TURNS,
+        )
+        if protect_last_user_turns <= 1:
             return self._find_last_user_message_idx(messages, head_end)
 
         seen = 0
@@ -1744,7 +1749,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             if self._is_real_user_message(messages[i]):
                 seen += 1
                 fallback = i
-                if seen >= self.protect_last_user_turns:
+                if seen >= protect_last_user_turns:
                     return i
         return fallback
 
@@ -1771,9 +1776,20 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         the most recent user turns verbatim and summarize older context.
         """
         recent_user_cut = self._find_recent_user_turn_cut(messages, head_end)
+        protect_last_user_turns = getattr(
+            self,
+            "protect_last_user_turns",
+            _DEFAULT_PROTECT_LAST_USER_TURNS,
+        )
         if recent_user_cut < 0:
             # No user message found beyond head — nothing to anchor.
             return cut_idx
+
+        if messages and messages[0].get("role") != "system":
+            latest_user_cut = self._find_last_user_message_idx(messages, head_end)
+            if latest_user_cut >= cut_idx:
+                return cut_idx
+            recent_user_cut = latest_user_cut
 
         if recent_user_cut >= cut_idx:
             # Recent user turns are already in the tail; nothing to do.
@@ -1790,10 +1806,19 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 "loss after compression",
                 recent_user_cut,
                 cut_idx,
-                self.protect_last_user_turns,
+                protect_last_user_turns,
             )
-        # Safety: never go back into the head region.
-        return max(recent_user_cut, head_end + 1)
+        candidate_cut = max(recent_user_cut, head_end + 1)
+        if candidate_cut < cut_idx:
+            for i in range(candidate_cut + 1, len(messages)):
+                previous_role = messages[i - 1].get("role")
+                current_role = messages[i].get("role")
+                if previous_role == current_role and current_role in {"user", "assistant"}:
+                    latest_user_cut = self._find_last_user_message_idx(messages, head_end)
+                    if latest_user_cut >= cut_idx:
+                        return cut_idx
+                    return max(latest_user_cut, head_end + 1)
+        return candidate_cut
 
     def _find_tail_cut_by_tokens(
         self, messages: List[Dict[str, Any]], head_end: int,
@@ -2144,7 +2169,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # Anti-thrashing: track compression effectiveness
         savings_pct = (saved_estimate / display_tokens * 100) if display_tokens > 0 else 0
         self._last_compression_savings_pct = savings_pct
-        if savings_pct < 10 and len(compressed) >= n_messages:
+        if current_tokens is not None and savings_pct < 10 and len(compressed) >= n_messages:
             self._ineffective_compression_count = max(self._ineffective_compression_count + 1, 2)
             self._last_compress_aborted = True
             self._last_summary_error = (

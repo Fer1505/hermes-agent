@@ -1251,15 +1251,6 @@ DEFAULT_CONFIG = {
             "timeout": 360,        # seconds — compression summarises large contexts; increase for local models
             "extra_body": {},
         },
-        "session_search": {
-            "provider": "auto",
-            "model": "",
-            "base_url": "",
-            "api_key": "",
-            "timeout": 30,
-            "max_concurrency": 3,  # Limit parallel summaries to reduce request-burst 429s
-            "extra_body": {},
-        },
         "skills_hub": {
             "provider": "auto",
             "model": "",

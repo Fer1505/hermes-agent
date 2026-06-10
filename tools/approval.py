@@ -1038,7 +1038,8 @@ def check_dangerous_command(command: str, env_type: str,
 
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
     # CLI --yolo remains process-scoped via the env var for local use.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    approval_mode = _get_approval_mode()
+    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
         return {"approved": True, "message": None}
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)

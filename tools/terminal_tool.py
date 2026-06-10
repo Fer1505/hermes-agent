@@ -2023,6 +2023,24 @@ def terminal_tool(
                     "error": workdir_error,
                     "status": "blocked"
                 }, ensure_ascii=False)
+            try:
+                from agent.file_safety import get_path_boundary_error
+                boundary_error = get_path_boundary_error(
+                    workdir,
+                    purpose="workdir",
+                    cwd=os.getenv("TERMINAL_CWD") or os.getcwd(),
+                )
+            except Exception:
+                boundary_error = None
+            if boundary_error:
+                logger.warning("Blocked out-of-bounds workdir: %s (command: %s)",
+                               workdir[:200], _safe_command_preview(command))
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": boundary_error,
+                    "status": "blocked"
+                }, ensure_ascii=False)
 
         # Prepare command for execution
         pty_disabled_reason = None

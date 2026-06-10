@@ -67,6 +67,10 @@ def mirror_to_session(
         if provider_message_id:
             mirror_msg["message_id"] = str(provider_message_id)
 
+        _SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        with open(_SESSIONS_DIR / f"{session_id}.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(mirror_msg, ensure_ascii=False) + "\n")
+
         _append_to_sqlite(session_id, mirror_msg)
 
         logger.debug("Mirror: wrote to session %s (from %s)", session_id, source_label)

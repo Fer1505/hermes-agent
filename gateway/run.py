@@ -1177,9 +1177,12 @@ def _gateway_auth_fallback_disabled(cfg: dict) -> bool:
     policy = cfg.get("fallback_policy") or {}
     if isinstance(policy, dict):
         gateway_policy = policy.get("gateway") or {}
-        if isinstance(gateway_policy, dict) and gateway_policy.get("allow_on_auth_error") is True:
-            return False
-    return True
+        if isinstance(gateway_policy, dict):
+            if gateway_policy.get("allow_on_auth_error") is True:
+                return False
+            if gateway_policy.get("allow_on_auth_error") is False:
+                return True
+    return not bool(get_fallback_chain(cfg))
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
@@ -1273,6 +1276,7 @@ def _try_resolve_fallback_provider(config: dict | None = None) -> dict | None:
             return None
         for entry in fb_list:
             try:
+                fb_model = entry.get("model")
                 explicit_api_key = entry.get("api_key")
                 if not explicit_api_key:
                     key_env = str(

@@ -955,6 +955,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         except TimeoutError:
                             future.cancel()
                             raise
+                        raw_response = {}
                         if send_result and not getattr(send_result, "success", True):
                             err = getattr(send_result, "error", "unknown")
                             try:
@@ -972,13 +973,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 job["id"], platform_name, chat_id, err,
                             )
                             adapter_ok = False  # fall through to standalone path
-                        elif (
-                            send_result
-                            and thread_id
-                            and getattr(send_result, "raw_response", None)
-                            and send_result.raw_response.get("thread_fallback")
-                        ):
-                            requested_thread_id = send_result.raw_response.get("requested_thread_id") or thread_id
+                        else:
+                            response_payload = getattr(send_result, "raw_response", None) if send_result else None
+                            if isinstance(response_payload, dict):
+                                raw_response = response_payload
+                            else:
+                                raw_response = {}
+                        if raw_response.get("thread_fallback") and thread_id:
+                            requested_thread_id = raw_response.get("requested_thread_id") or thread_id
                             msg = (
                                 f"configured thread_id {requested_thread_id} for "
                                 f"{platform_name}:{chat_id} was not found; delivered without thread_id"
