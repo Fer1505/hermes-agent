@@ -805,6 +805,9 @@ class TestCodexStreamCallbacks:
         assert "Hello from Codex!" in deltas
 
     def test_codex_stream_synthesizes_output_when_final_output_is_none(self):
+        """Olympus guarantee: a Codex stream that emits text deltas but ends
+        without a usable final output still synthesizes an assistant message
+        instead of returning empty output (chatgpt.com backend output=None)."""
         from run_agent import AIAgent
 
         agent = AIAgent(
@@ -818,34 +821,34 @@ class TestCodexStreamCallbacks:
         agent.api_mode = "codex_responses"
         agent._interrupt_requested = False
 
-        mock_event_text_1 = SimpleNamespace(
-            type="response.output_text.delta",
-            delta="primary ",
-        )
-        mock_event_text_2 = SimpleNamespace(
-            type="response.output_text.delta",
-            delta="ok",
-        )
+        events = [
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(type="response.output_text.delta", delta="primary "),
+            SimpleNamespace(type="response.output_text.delta", delta="ok"),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", id="r1", usage=None, output=None),
+            ),
+        ]
 
-        mock_stream = MagicMock()
-        mock_stream.__enter__ = MagicMock(return_value=mock_stream)
-        mock_stream.__exit__ = MagicMock(return_value=False)
-        mock_stream.__iter__ = MagicMock(
-            return_value=iter([mock_event_text_1, mock_event_text_2])
-        )
-        mock_stream.get_final_response.return_value = SimpleNamespace(
-            output=None,
-            status="completed",
-        )
+        class _FakeCreateStream:
+            def __iter__(self_inner):
+                return iter(events)
+
+            def close(self_inner):
+                return None
 
         mock_client = MagicMock()
-        mock_client.responses.stream.return_value = mock_stream
+        mock_client.responses.create.return_value = _FakeCreateStream()
 
         response = agent._run_codex_stream({}, client=mock_client)
 
         assert response.output[0].content[0].text == "primary ok"
 
     def test_codex_stream_synthesizes_output_when_sdk_raises_on_none_output(self):
+        """Olympus guarantee: when the event stream dies mid-flight after
+        emitting text deltas, the collected deltas are still synthesized into
+        an assistant message rather than being discarded."""
         from run_agent import AIAgent
 
         agent = AIAgent(
@@ -859,27 +862,26 @@ class TestCodexStreamCallbacks:
         agent.api_mode = "codex_responses"
         agent._interrupt_requested = False
 
-        class BrokenStream:
-            def __enter__(self):
-                return self
+        class _BrokenCreateStream:
+            def __iter__(self_inner):
+                def _gen():
+                    yield SimpleNamespace(type="response.output_text.delta", delta="primary ")
+                    yield SimpleNamespace(type="response.output_text.delta", delta="ok")
+                    raise TypeError("'NoneType' object is not iterable")
 
-            def __exit__(self, exc_type, exc, tb):
-                return False
+                return _gen()
 
-            def __iter__(self):
-                yield SimpleNamespace(type="response.output_text.delta", delta="primary ")
-                yield SimpleNamespace(type="response.output_text.delta", delta="ok")
-                raise TypeError("'NoneType' object is not iterable")
-
-            def get_final_response(self):  # pragma: no cover - iterator raises first
-                raise AssertionError("get_final_response should not be reached")
+            def close(self_inner):
+                return None
 
         mock_client = MagicMock()
-        mock_client.responses.stream.return_value = BrokenStream()
+        mock_client.responses.create.return_value = _BrokenCreateStream()
 
         response = agent._run_codex_stream({}, client=mock_client)
 
         assert response.output[0].content[0].text == "primary ok"
+
+
 
     def test_codex_stream_refreshes_activity_on_every_event(self):
         from run_agent import AIAgent

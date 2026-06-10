@@ -280,7 +280,29 @@ def _consume_codex_event_stream(
     terminal_error: Any = None
     saw_terminal = False
 
-    for event in event_iter:
+    # Olympus recovery (backport "Recover Codex streams with missing output"):
+    # if the event iterator itself dies mid-flight after text deltas were
+    # already streamed to the user, salvage the collected deltas through the
+    # synthesis path below instead of discarding streamed content. Streams
+    # that die before producing anything still raise.
+    event_iter = iter(event_iter)
+    while True:
+        try:
+            event = next(event_iter)
+        except StopIteration:
+            break
+        except (TimeoutError, InterruptedError, KeyboardInterrupt):
+            raise
+        except Exception:
+            if collected_text_deltas or collected_output_items:
+                logger.warning(
+                    "Codex event stream died mid-flight after %d delta(s); "
+                    "salvaging streamed content",
+                    len(collected_text_deltas),
+                    exc_info=True,
+                )
+                break
+            raise
         if on_event is not None:
             try:
                 on_event(event)
