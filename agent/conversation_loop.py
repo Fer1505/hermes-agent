@@ -444,6 +444,12 @@ def run_conversation(
     agent._invalid_tool_retries = 0
     agent._invalid_json_retries = 0
     agent._empty_content_retries = 0
+    # H1 (2026-06-16): cumulative empty-response count for the WHOLE turn. Unlike
+    # _empty_content_retries (deliberately reset to 0 after a mid-turn compression so the
+    # model gets a fresh per-context budget), this total is NOT reset mid-turn. It is the
+    # hard ceiling that terminates the compress -> reset -> empty -> compress loop which
+    # previously burned output tokens while surfacing 0 messages (silent-no-answer defect).
+    agent._empty_content_retries_total = 0
     agent._incomplete_scratchpad_retries = 0
     agent._codex_incomplete_retries = 0
     agent._thinking_prefill_retries = 0
@@ -4296,12 +4302,23 @@ def run_conversation(
                         _has_structured
                         and agent._thinking_prefill_retries >= 2
                     )
-                    if _truly_empty and (not _has_structured or _prefill_exhausted) and agent._empty_content_retries < 3:
+                    _empty_total = getattr(agent, "_empty_content_retries_total", 0)
+                    if (
+                        _truly_empty
+                        and (not _has_structured or _prefill_exhausted)
+                        and agent._empty_content_retries < 3
+                        # H1: cumulative per-turn ceiling that SURVIVES compression resets,
+                        # so the compress->reset->empty loop terminates into fallback/synthesis
+                        # instead of spinning tokens with 0 delivered messages. 6 == the normal
+                        # per-context budget (3) plus one compression-driven fresh budget (3).
+                        and _empty_total < 6
+                    ):
                         agent._empty_content_retries += 1
+                        agent._empty_content_retries_total = _empty_total + 1
                         logger.warning(
                             "Empty response (no content or reasoning) — "
-                            "retry %d/3 (model=%s)",
-                            agent._empty_content_retries, agent.model,
+                            "retry %d/3 (turn total %d/6, model=%s)",
+                            agent._empty_content_retries, agent._empty_content_retries_total, agent.model,
                         )
                         agent._buffer_status(
                             f"⚠️ Empty response from model — retrying "
