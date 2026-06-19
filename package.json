@@ -10,6 +10,12 @@
     "web"
   ],
   "scripts": {
+    "ci:js": "npm run ci:js:shared && npm run ci:js:tui && npm run ci:js:desktop && npm run ci:js:web && npm run ci:js:bootstrap",
+    "ci:js:shared": "npm run type-check --workspace @hermes/shared",
+    "ci:js:tui": "npm run lint --workspace hermes-tui && npm run type-check --workspace hermes-tui && npm test --workspace hermes-tui",
+    "ci:js:desktop": "npm run lint --workspace hermes && npm run type-check --workspace hermes && npm run test:ui --workspace hermes && npm run test:desktop:platforms --workspace hermes",
+    "ci:js:web": "npm run lint --workspace web && npm run build --workspace web",
+    "ci:js:bootstrap": "npm run build --workspace @hermes/bootstrap-installer",
     "postinstall": "echo '✅ Browser tools ready. Run: python run_agent.py --help'"
   },
   "repository": {
@@ -29,6 +35,6 @@
     "lodash": "4.18.1"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": "^22.12.0 || ^24.0.0"
   }
 }
