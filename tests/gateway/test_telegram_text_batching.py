@@ -38,6 +38,9 @@ def _make_adapter():
     adapter._media_group_tasks = {}
     adapter._polling_error_task = None
     adapter._polling_heartbeat_task = None
+    # v0.18 peer relay attrs normally set in __init__; disconnect() touches them.
+    adapter._peer_relay = {"enabled": False}
+    adapter._peer_relay_task = None
     adapter._app = None
     adapter._bot = None
     adapter._set_status_indicator = AsyncMock()
