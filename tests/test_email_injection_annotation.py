@@ -5,7 +5,7 @@ dropping legitimate operator mail. Clean emails pass through unchanged; emails w
 body matches the shared threat scanner get a non-destructive security notice prepended.
 """
 
-from gateway.platforms.email import _annotate_email_injection
+from plugins.platforms.email.adapter import _annotate_email_injection
 
 
 def test_clean_email_unchanged() -> None:
