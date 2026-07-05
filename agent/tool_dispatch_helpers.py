@@ -403,6 +403,20 @@ _UNTRUSTED_TOOL_PREFIXES = (
     "mcp_",
 )
 
+# Exec-lane tools are the channel through which integration/webhook payloads
+# (fleet telematics, ticketing, market-data feeds — any signed-but-content-
+# untrusted external source) reach the model: agents fetch those APIs with
+# ad-hoc code rather than a dedicated fetch tool, so name-based wrapping never
+# sees the external content.  Blanket-wrapping exec output would mark the
+# agent's own trusted computation as untrusted and dull the delimiter's signal,
+# so this lane is CONTENT-TRIGGERED instead: output is wrapped only when the
+# shared threat scanner (tools/threat_patterns.py, the same library behind the
+# inbound-email annotation and memory-load scan) flags injection patterns in it.
+_SCAN_WRAPPED_TOOL_NAMES = frozenset({
+    "execute_code",
+    "terminal",
+})
+
 _UNTRUSTED_WRAP_MIN_CHARS = 32
 
 # Matches the delimiter token in any case so attacker content can't forge or
@@ -417,6 +431,26 @@ def _is_untrusted_tool(name: Optional[str]) -> bool:
     if name in _UNTRUSTED_TOOL_NAMES:
         return True
     return any(name.startswith(p) for p in _UNTRUSTED_TOOL_PREFIXES)
+
+
+def _is_scan_wrapped_tool(name: Optional[str]) -> bool:
+    return bool(name) and name in _SCAN_WRAPPED_TOOL_NAMES
+
+
+def _content_flags_threat(content: str) -> bool:
+    """True when the shared threat scanner flags injection/promptware patterns.
+
+    Lazy import + total exception guard: the scanner must never break tool
+    dispatch — on any scanner failure the exec-lane result simply passes through
+    unwrapped, exactly as before this defense existed (fail-open, matching the
+    inbound-email annotation's contract).
+    """
+    try:
+        from tools.threat_patterns import scan_for_threats
+
+        return bool(scan_for_threats(content, scope="context"))
+    except Exception:
+        return False
 
 
 def _neutralize_delimiters(content: str) -> str:
@@ -445,9 +479,10 @@ def _maybe_wrap_untrusted(name: str, content: Any) -> Any:
     identity, so callers must compare by value, not by ``is``.
 
     Returns ``content`` unchanged when:
-    - the tool is not in the high-risk set
+    - the tool is not in the high-risk set and not in the scan-gated exec lane
     - the content is neither a string nor a list (dict, None, …)
     - (string) the content is too short to be worth wrapping
+    - (exec lane) the threat scanner finds no injection pattern in the content
 
     Wrapped string content is always neutralized (any embedded delimiter token
     is defanged) and wrapped in exactly one well-formed block. There is no
@@ -455,10 +490,14 @@ def _maybe_wrap_untrusted(name: str, content: Any) -> Any:
     that merely starts with the opening tag would be returned with no data
     framing at all — so re-wrapping (harmlessly) is the safe choice.
     """
-    if not _is_untrusted_tool(name):
+    always_untrusted = _is_untrusted_tool(name)
+    scan_gated = not always_untrusted and _is_scan_wrapped_tool(name)
+    if not always_untrusted and not scan_gated:
         return content
     if isinstance(content, str):
         if len(content) < _UNTRUSTED_WRAP_MIN_CHARS:
+            return content
+        if scan_gated and not _content_flags_threat(content):
             return content
         safe_content = _neutralize_delimiters(content)
         return (
@@ -499,5 +538,8 @@ __all__ = [
     "_extract_landed_file_mutation_paths",
     "_extract_error_preview",
     "_trajectory_normalize_msg",
+    "_SCAN_WRAPPED_TOOL_NAMES",
+    "_is_scan_wrapped_tool",
+    "_content_flags_threat",
     "make_tool_result_message",
 ]
