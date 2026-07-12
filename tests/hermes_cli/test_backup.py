@@ -1,8 +1,10 @@
 """Tests for hermes backup and import commands."""
 
+import hashlib
 import json
 import os
 import sqlite3
+import stat
 import zipfile
 from argparse import Namespace
 from pathlib import Path
@@ -19,8 +21,12 @@ def _make_hermes_tree(root: Path) -> None:
     """Create a realistic ~/.hermes directory structure for testing."""
     (root / "config.yaml").write_text("model:\n  provider: openrouter\n")
     (root / ".env").write_text("OPENROUTER_API_KEY=sk-test-123\n")
-    (root / "memory_store.db").write_bytes(b"fake-sqlite")
-    (root / "hermes_state.db").write_bytes(b"fake-state")
+    for db_name in ("memory_store.db", "hermes_state.db"):
+        connection = sqlite3.connect(str(root / db_name))
+        connection.execute("CREATE TABLE backup_fixture (value TEXT)")
+        connection.execute("INSERT INTO backup_fixture VALUES ('durable')")
+        connection.commit()
+        connection.close()
 
     # Sessions
     (root / "sessions").mkdir(exist_ok=True)
@@ -66,6 +72,44 @@ def _make_hermes_tree(root: Path) -> None:
     # Logs (should be included)
     (root / "logs").mkdir(exist_ok=True)
     (root / "logs" / "agent.log").write_text("log line\n")
+
+
+def _write_manifest_zip(
+    zip_path: Path,
+    files: dict[str, str | bytes],
+    *,
+    external_roots: list[str] | None = None,
+    compression: int = zipfile.ZIP_STORED,
+) -> None:
+    """Create a current-format test backup with real member hashes."""
+    members = []
+    encoded: dict[str, bytes] = {}
+    for name, content in files.items():
+        data = content if isinstance(content, bytes) else content.encode("utf-8")
+        encoded[name] = data
+        members.append(
+            {
+                "path": name,
+                "scope": "external" if name.startswith("_external/") else "hermes_home",
+                "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "mode": 0o600,
+            }
+        )
+    manifest = {
+        "format": "hermes-backup",
+        "version": 1,
+        "createdAt": "2026-07-10T00:00:00+00:00",
+        "members": members,
+        "externalRoots": external_roots or [],
+    }
+    with zipfile.ZipFile(zip_path, "w", compression=compression) as zf:
+        for name, data in encoded.items():
+            info = zipfile.ZipInfo(name)
+            info.create_system = 3
+            info.external_attr = (stat.S_IFREG | 0o600) << 16
+            zf.writestr(info, data, compress_type=compression)
+        zf.writestr("_hermes_backup_manifest.json", json.dumps(manifest))
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +247,14 @@ class TestBackup:
         assert out_zip.exists()
         with zipfile.ZipFile(out_zip, "r") as zf:
             names = zf.namelist()
+            assert "_hermes_backup_manifest.json" in names
+            manifest = json.loads(zf.read("_hermes_backup_manifest.json"))
+            declared = {item["path"]: item for item in manifest["members"]}
+            assert set(declared) == set(names) - {"_hermes_backup_manifest.json"}
+            for name, item in declared.items():
+                payload = zf.read(name)
+                assert item["size"] == len(payload)
+                assert item["sha256"] == hashlib.sha256(payload).hexdigest()
             # Config should be present
             assert "config.yaml" in names
             assert ".env" in names
@@ -456,6 +508,15 @@ class TestValidateBackupZip:
             ok, reason = _validate_backup_zip(zf)
         assert ok, reason
 
+    def test_current_manifest_is_authoritative_without_legacy_marker(self, tmp_path):
+        """Current archives identify themselves with the versioned manifest."""
+        from hermes_cli.backup import _validate_backup_zip
+        zip_path = tmp_path / "manifest-only.zip"
+        _write_manifest_zip(zip_path, {"memories/notes.json": "{}"})
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            ok, reason = _validate_backup_zip(zf)
+        assert ok, reason
+
 
 # ---------------------------------------------------------------------------
 # Import tests
@@ -554,7 +615,7 @@ class TestImport:
             run_import(args)
 
     def test_blocks_path_traversal(self, tmp_path, monkeypatch):
-        """Import blocks zip entries with path traversal."""
+        """Any traversal member rejects the archive before marker restoration."""
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -570,11 +631,10 @@ class TestImport:
         args = Namespace(zipfile=str(zip_path), force=True)
 
         from hermes_cli.backup import run_import
-        run_import(args)
+        with pytest.raises(SystemExit):
+            run_import(args)
 
-        # config.yaml should be restored
-        assert (hermes_home / "config.yaml").exists()
-        # traversal file should NOT exist outside hermes home
+        assert not (hermes_home / "config.yaml").exists()
         assert not (tmp_path / "etc" / "passwd").exists()
 
     def test_preserves_live_gateway_state(self, tmp_path, monkeypatch):
@@ -604,11 +664,10 @@ class TestImport:
         args = Namespace(zipfile=str(zip_path), force=True)
 
         from hermes_cli.backup import run_import
-        run_import(args)
+        with pytest.raises(SystemExit):
+            run_import(args)
 
-        # config.yaml is restored normally...
-        assert (hermes_home / "config.yaml").read_text() == "model: test\n"
-        # ...but the live gateway_state.json is untouched.
+        assert not (hermes_home / "config.yaml").exists()
         assert (hermes_home / "gateway_state.json").read_text() == live_state
 
     def test_does_not_seed_gateway_state_when_absent(self, tmp_path, monkeypatch):
@@ -655,10 +714,10 @@ class TestImport:
         args = Namespace(zipfile=str(zip_path), force=True)
 
         from hermes_cli.backup import run_import
-        run_import(args)
+        with pytest.raises(SystemExit):
+            run_import(args)
 
-        # Profile config is restored, but its live gateway state is preserved.
-        assert (hermes_home / "profiles" / "coder" / "config.yaml").read_text() == "model: anthropic\n"
+        assert not (hermes_home / "profiles" / "coder" / "config.yaml").exists()
         assert (
             hermes_home / "profiles" / "coder" / "gateway_state.json"
         ).read_text() == live_state
@@ -688,12 +747,12 @@ class TestImport:
         args = Namespace(zipfile=str(zip_path), force=True)
 
         from hermes_cli.backup import run_import
-        run_import(args)
+        with pytest.raises(SystemExit):
+            run_import(args)
 
-        # Live runtime files are untouched; the backup's foreign ones never land.
         assert (hermes_home / "gateway.pid").read_text() == "4242"
         assert (hermes_home / "processes.json").read_text() == '{"live": true}'
-        # cron.pid / gateway.lock had no live copy and were not seeded.
+        assert not (hermes_home / "config.yaml").exists()
         assert not (hermes_home / "cron.pid").exists()
         assert not (hermes_home / "gateway.lock").exists()
 
@@ -714,14 +773,15 @@ class TestImport:
         args = Namespace(zipfile=str(zip_path), force=False)
 
         from hermes_cli.backup import run_import
-        with patch("builtins.input", return_value="n"):
-            run_import(args)
+        with patch("builtins.input", return_value="n") as prompt:
+            with pytest.raises(SystemExit):
+                run_import(args)
 
-        # Original config should be unchanged
+        prompt.assert_not_called()
         assert (hermes_home / "config.yaml").read_text() == "existing: true\n"
 
-    def test_force_skips_confirmation(self, tmp_path, monkeypatch):
-        """Import with --force skips confirmation and overwrites."""
+    def test_force_cannot_overlay_nonempty_root(self, tmp_path, monkeypatch):
+        """--force cannot opt out of staged all-or-nothing containment."""
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         (hermes_home / "config.yaml").write_text("existing: true\n")
@@ -736,9 +796,10 @@ class TestImport:
         args = Namespace(zipfile=str(zip_path), force=True)
 
         from hermes_cli.backup import run_import
-        run_import(args)
+        with pytest.raises(SystemExit):
+            run_import(args)
 
-        assert (hermes_home / "config.yaml").read_text() == "model: restored\n"
+        assert (hermes_home / "config.yaml").read_text() == "existing: true\n"
 
     def test_missing_file_exits(self, tmp_path, monkeypatch):
         """Import exits with error for nonexistent file."""
@@ -753,19 +814,29 @@ class TestImport:
             run_import(args)
 
     @pytest.mark.skipif(os.name != "posix", reason="POSIX file permissions only")
-    def test_restores_secret_files_with_0600_perms(self, tmp_path, monkeypatch):
-        """Secret files must end up at 0600 after restore (zipfile drops mode bits)."""
+    def test_restores_root_0700_and_all_files_0600(self, tmp_path, monkeypatch):
+        """The restored private state tree must default to owner-only modes."""
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        db_source = tmp_path / "valid.db"
+        connection = sqlite3.connect(str(db_source))
+        connection.execute("CREATE TABLE durable (value TEXT)")
+        connection.commit()
+        connection.close()
+        database_bytes = db_source.read_bytes()
 
         zip_path = tmp_path / "backup.zip"
         self._make_backup_zip(zip_path, {
             "config.yaml": "model: openrouter\n",
             ".env": "OPENROUTER_API_KEY=sk-secret\n",
             "auth.json": '{"providers": {"nous": "token"}}',
-            "state.db": b"SQLite format 3\x00",
+            "state.db": database_bytes,
+            "memory_store.db": database_bytes,
+            "sessions/session.json": "{}",
+            "logs/agent.log": "private log\n",
             "profiles/coder/.env": "ANTHROPIC_API_KEY=sk-ant-secret\n",
         })
 
@@ -774,7 +845,17 @@ class TestImport:
         from hermes_cli.backup import run_import
         run_import(args)
 
-        for rel in (".env", "auth.json", "state.db", "profiles/coder/.env"):
+        assert (hermes_home.stat().st_mode & 0o777) == 0o700
+        for rel in (
+            "config.yaml",
+            ".env",
+            "auth.json",
+            "state.db",
+            "memory_store.db",
+            "sessions/session.json",
+            "logs/agent.log",
+            "profiles/coder/.env",
+        ):
             mode = (hermes_home / rel).stat().st_mode & 0o777
             assert mode == 0o600, f"{rel} restored with mode {oct(mode)}, expected 0o600"
 
@@ -790,6 +871,11 @@ class TestRoundTrip:
         src_home = tmp_path / "source" / ".hermes"
         src_home.mkdir(parents=True)
         _make_hermes_tree(src_home)
+        if os.name == "posix":
+            executable = src_home / "bin" / "tool"
+            executable.parent.mkdir()
+            executable.write_text("#!/bin/sh\nexit 0\n")
+            executable.chmod(0o700)
 
         monkeypatch.setenv("HERMES_HOME", str(src_home))
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "source")
@@ -823,6 +909,10 @@ class TestRoundTrip:
         assert not (dst_home / "plugins" / "__pycache__").exists()
         # PID files should NOT be present
         assert not (dst_home / "gateway.pid").exists()
+        if os.name == "posix":
+            restored_executable = dst_home / "bin" / "tool"
+            assert restored_executable.stat().st_mode & 0o777 == 0o700
+            assert os.access(restored_executable, os.X_OK)
 
 
 # ---------------------------------------------------------------------------
@@ -1007,7 +1097,7 @@ class TestBackupEdgeCases:
         assert not (tmp_path / "out.zip").exists()
 
     def test_permission_error_during_backup(self, tmp_path, monkeypatch):
-        """Backup handles permission errors gracefully."""
+        """A failed SQLite snapshot fails nonzero and promotes no archive."""
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         (hermes_home / "config.yaml").write_text("model: test\n")
@@ -1025,16 +1115,16 @@ class TestBackupEdgeCases:
 
         from hermes_cli.backup import run_backup
         try:
-            run_backup(args)
+            with pytest.raises(SystemExit):
+                run_backup(args)
         finally:
             # Restore permissions for cleanup
             bad_file.chmod(0o644)
 
-        # Zip should still be created with the readable files
-        assert out_zip.exists()
+        assert not out_zip.exists()
 
-    def test_pre1980_timestamp_skipped(self, tmp_path, monkeypatch):
-        """Backup skips files with pre-1980 timestamps (ZIP limitation)."""
+    def test_pre1980_timestamp_is_clamped_without_dropping_file(self, tmp_path, monkeypatch):
+        """ZIP timestamps clamp to 1980 without silently omitting durable data."""
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         (hermes_home / "config.yaml").write_text("model: test\n")
@@ -1058,8 +1148,7 @@ class TestBackupEdgeCases:
         with zipfile.ZipFile(out_zip, "r") as zf:
             names = zf.namelist()
             assert "config.yaml" in names
-            # The pre-1980 file should be skipped, not crash the backup
-            assert "ancient.txt" not in names
+            assert "ancient.txt" in names
 
     def test_skips_output_zip_inside_hermes(self, tmp_path, monkeypatch):
         """Backup skips its own output zip if it's inside hermes root."""
@@ -1141,7 +1230,7 @@ class TestImportEdgeCases:
                 run_import(args)
 
     def test_permission_error_during_import(self, tmp_path, monkeypatch):
-        """Import handles permission errors during extraction."""
+        """A nonempty target is rejected before any extraction or overlay."""
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -1162,12 +1251,12 @@ class TestImportEdgeCases:
 
         from hermes_cli.backup import run_import
         try:
-            run_import(args)
+            with pytest.raises(SystemExit):
+                run_import(args)
         finally:
             locked_dir.chmod(0o755)
 
-        # config.yaml should still be restored despite the error
-        assert (hermes_home / "config.yaml").exists()
+        assert not (hermes_home / "config.yaml").exists()
 
     def test_progress_with_many_files(self, tmp_path, monkeypatch):
         """Import shows progress with 500+ files."""
@@ -1202,8 +1291,8 @@ class TestProfileRestoration:
             for name, content in files.items():
                 zf.writestr(name, content)
 
-    def test_import_creates_profile_wrappers(self, tmp_path, monkeypatch):
-        """Import auto-creates wrapper scripts for restored profiles."""
+    def test_import_does_not_write_profile_wrappers(self, tmp_path, monkeypatch):
+        """Alias creation is a separate post-restore operation, not an import side effect."""
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -1230,13 +1319,7 @@ class TestProfileRestoration:
         assert (hermes_home / "profiles" / "coder" / "config.yaml").exists()
         assert (hermes_home / "profiles" / "researcher" / "config.yaml").exists()
 
-        # Wrapper scripts should be created
-        assert (wrapper_dir / "coder").exists()
-        assert (wrapper_dir / "researcher").exists()
-
-        # Wrappers should contain the right content
-        coder_wrapper = (wrapper_dir / "coder").read_text()
-        assert "hermes -p coder" in coder_wrapper
+        assert list(wrapper_dir.iterdir()) == []
 
     def test_import_skips_profile_dirs_without_config(self, tmp_path, monkeypatch):
         """Import doesn't create wrappers for profile dirs without config."""
@@ -1260,8 +1343,8 @@ class TestProfileRestoration:
         from hermes_cli.backup import run_import
         run_import(args)
 
-        # Only valid profile should get a wrapper
-        assert (wrapper_dir / "valid").exists()
+        # No archive-controlled profile may create an out-of-root wrapper.
+        assert not (wrapper_dir / "valid").exists()
         assert not (wrapper_dir / "empty").exists()
 
     def test_import_without_profiles_module(self, tmp_path, monkeypatch):
@@ -1855,6 +1938,25 @@ class TestPreUpdateBackup:
         assert out.name.startswith("pre-update-")
         assert out.suffix == ".zip"
 
+    def test_promoted_but_unconfirmed_backup_preserves_distinct_receipt(
+        self, hermes_home, monkeypatch
+    ):
+        import hermes_cli.backup as backup_mod
+
+        def fail_directory_fsync(_path):
+            raise OSError("injected output parent fsync failure")
+
+        monkeypatch.setattr(backup_mod, "_fsync_directory", fail_directory_fsync)
+        with pytest.raises(
+            backup_mod.BackupPromotedDurabilityError,
+            match="pre-update archive was promoted to",
+        ):
+            backup_mod.create_pre_update_backup(hermes_home=hermes_home)
+
+        promoted = list((hermes_home / "backups").glob("pre-update-*.zip"))
+        assert len(promoted) == 1
+        assert promoted[0].is_file()
+
     def test_backup_contents_match_full_backup(self, hermes_home):
         """Pre-update backup should include the same user data that
         ``hermes backup`` would, and should exclude the same directories."""
@@ -2229,6 +2331,527 @@ class TestRestoreCronJobsIfEmptied:
         assert result["job_count"] == 2
 
 
+class TestFullBackupContainment:
+    """End-to-end archive and restore boundary checks in temporary homes."""
+
+    def test_sqlite_failure_keeps_prior_output_and_prints_no_success(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        database = sqlite3.connect(str(hermes_home / "state.db"))
+        database.execute("CREATE TABLE durable (value TEXT)")
+        database.commit()
+        database.close()
+        (hermes_home / "config.yaml").write_text("model: test\n")
+        out_zip = tmp_path / "backup.zip"
+        out_zip.write_bytes(b"prior-good-backup")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        import hermes_cli.backup as backup_mod
+        monkeypatch.setattr(backup_mod, "_safe_copy_db", lambda _src, _dst: False)
+
+        with pytest.raises(SystemExit):
+            backup_mod.run_backup(Namespace(output=str(out_zip)))
+
+        assert out_zip.read_bytes() == b"prior-good-backup"
+        assert "Backup complete" not in capsys.readouterr().out
+        assert not list(tmp_path.glob(".backup.zip.*.zip.part"))
+
+    def test_output_parent_fsync_failure_reports_promoted_durability_unknown(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("model: test\n")
+        out_zip = tmp_path / "backup.zip"
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        import hermes_cli.backup as backup_mod
+
+        def fail_directory_fsync(_path):
+            raise OSError("injected output parent fsync failure")
+
+        monkeypatch.setattr(backup_mod, "_fsync_directory", fail_directory_fsync)
+        with pytest.raises(SystemExit):
+            backup_mod.run_backup(Namespace(output=str(out_zip)))
+
+        assert out_zip.exists()
+        output = capsys.readouterr().out
+        assert "was promoted" in output
+        assert "Backup complete" not in output
+
+    def test_manifest_mode_mismatch_rejects_before_restore(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        archive = tmp_path / "mode-mismatch.zip"
+        data = b"model: test\n"
+        manifest = {
+            "format": "hermes-backup",
+            "version": 1,
+            "members": [
+                {
+                    "path": "config.yaml",
+                    "scope": "hermes_home",
+                    "size": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "mode": 0o600,
+                }
+            ],
+            "externalRoots": [],
+        }
+        member = zipfile.ZipInfo("config.yaml")
+        member.create_system = 3
+        member.external_attr = (stat.S_IFREG | 0o700) << 16
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr(member, data)
+            zf.writestr("_hermes_backup_manifest.json", json.dumps(manifest))
+
+        from hermes_cli.backup import run_import
+        with pytest.raises(SystemExit):
+            run_import(Namespace(zipfile=str(archive), force=True))
+
+        assert list(hermes_home.iterdir()) == []
+        assert "mode mismatch" in capsys.readouterr().out
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX permission semantics")
+    def test_older_manifest_without_mode_cannot_grant_execute_permission(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        archive = tmp_path / "legacy-v1-mode.zip"
+        data = b"#!/bin/sh\nexit 0\n"
+        manifest = {
+            "format": "hermes-backup",
+            "version": 1,
+            "members": [
+                {
+                    "path": "tool",
+                    "scope": "hermes_home",
+                    "size": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                }
+            ],
+            "externalRoots": [],
+        }
+        member = zipfile.ZipInfo("tool")
+        member.create_system = 3
+        member.external_attr = (stat.S_IFREG | 0o700) << 16
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr(member, data)
+            zf.writestr("_hermes_backup_manifest.json", json.dumps(manifest))
+
+        from hermes_cli.backup import run_import
+        run_import(Namespace(zipfile=str(archive), force=True))
+
+        restored = hermes_home / "tool"
+        assert restored.stat().st_mode & 0o777 == 0o600
+        assert not os.access(restored, os.X_OK)
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX hard-link semantics")
+    def test_hard_linked_source_fails_without_promoting_archive(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        outside = tmp_path / "outside-secret"
+        outside.write_text("secret")
+        os.link(outside, hermes_home / "linked-secret")
+        (hermes_home / "config.yaml").write_text("model: test\n")
+        out_zip = tmp_path / "backup.zip"
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        from hermes_cli.backup import run_backup
+
+        with pytest.raises(SystemExit):
+            run_backup(Namespace(output=str(out_zip)))
+
+        assert not out_zip.exists()
+        assert "Backup complete" not in capsys.readouterr().out
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX symlink/no-follow semantics")
+    def test_source_swap_to_symlink_fails_before_archive_promotion(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        source = hermes_home / "config.yaml"
+        source.write_text("model: safe\n")
+        outside = tmp_path / "outside-secret"
+        outside.write_text("secret")
+        out_zip = tmp_path / "backup.zip"
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        import hermes_cli.backup as backup_mod
+        real_open = backup_mod.os.open
+        swapped = False
+
+        def swap_before_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if Path(path) == source and not swapped:
+                swapped = True
+                source.unlink()
+                source.symlink_to(outside)
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(backup_mod.os, "open", swap_before_open)
+        with pytest.raises(SystemExit):
+            backup_mod.run_backup(Namespace(output=str(out_zip)))
+
+        assert not out_zip.exists()
+        assert "Backup complete" not in capsys.readouterr().out
+
+    def test_legacy_external_member_rejects_entire_archive(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        archive = tmp_path / "legacy-external.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("config.yaml", "model: test\n")
+            zf.writestr("_external/.honcho/config.json", "{}")
+
+        from hermes_cli.backup import run_import
+        with pytest.raises(SystemExit):
+            run_import(Namespace(zipfile=str(archive), force=True))
+
+        assert not (hermes_home / "config.yaml").exists()
+        assert not (tmp_path / ".honcho").exists()
+
+    def test_current_external_ssh_member_is_not_provider_authorized(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        archive = tmp_path / "ssh.zip"
+        _write_manifest_zip(
+            archive,
+            {
+                "config.yaml": "model: test\n",
+                "_external/.ssh/authorized_keys": "attacker-key\n",
+            },
+            external_roots=[".ssh"],
+        )
+
+        import hermes_cli.backup as backup_mod
+        monkeypatch.setattr(
+            backup_mod,
+            "_collect_memory_provider_declared_paths",
+            lambda: [tmp_path / ".honcho"],
+        )
+        with pytest.raises(SystemExit):
+            backup_mod.run_import(Namespace(zipfile=str(archive), force=True))
+
+        assert not (hermes_home / "config.yaml").exists()
+        assert not (tmp_path / ".ssh").exists()
+
+    def test_external_symlink_target_rejects_before_any_restore(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        outside = tmp_path / "outside-provider"
+        outside.mkdir()
+        (tmp_path / ".honcho").symlink_to(outside, target_is_directory=True)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        archive = tmp_path / "symlink-target.zip"
+        _write_manifest_zip(
+            archive,
+            {
+                "config.yaml": "model: test\n",
+                "_external/.honcho/config.json": "{}",
+            },
+            external_roots=[".honcho"],
+        )
+
+        import hermes_cli.backup as backup_mod
+        monkeypatch.setattr(
+            backup_mod,
+            "_collect_memory_provider_declared_paths",
+            lambda: [tmp_path / ".honcho"],
+        )
+        with pytest.raises(SystemExit):
+            backup_mod.run_import(Namespace(zipfile=str(archive), force=True))
+
+        assert not (hermes_home / "config.yaml").exists()
+        assert not (outside / "config.json").exists()
+
+    def test_compression_ratio_zip_bomb_is_rejected(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        archive = tmp_path / "zip-bomb.zip"
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("config.yaml", "model: test\n")
+            zf.writestr("sessions/bomb.bin", b"0" * (2 * 1024 * 1024))
+
+        from hermes_cli.backup import run_import
+        with pytest.raises(SystemExit):
+            run_import(Namespace(zipfile=str(archive), force=True))
+
+        assert not (hermes_home / "config.yaml").exists()
+
+    def test_member_size_quota_is_checked_before_restore(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        archive = tmp_path / "oversize.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("config.yaml", "model: test and too large\n")
+
+        import hermes_cli.backup as backup_mod
+        monkeypatch.setattr(backup_mod, "_MAX_BACKUP_MEMBER_BYTES", 8)
+        with pytest.raises(SystemExit):
+            backup_mod.run_import(Namespace(zipfile=str(archive), force=True))
+
+        assert not (hermes_home / "config.yaml").exists()
+
+    def test_total_size_quota_is_checked_before_restore(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        archive = tmp_path / "aggregate-oversize.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("config.yaml", "model: test\n")
+            zf.writestr("sessions/one.json", "0123456789")
+
+        import hermes_cli.backup as backup_mod
+        monkeypatch.setattr(backup_mod, "_MAX_BACKUP_TOTAL_BYTES", 16)
+        with pytest.raises(SystemExit):
+            backup_mod.run_import(Namespace(zipfile=str(archive), force=True))
+
+        assert not (hermes_home / "config.yaml").exists()
+
+    def test_directory_entries_count_toward_archive_quota(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        archive = tmp_path / "directory-entry-flood.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("config.yaml", "model: test\n")
+            zf.writestr("one/", b"")
+            zf.writestr("two/", b"")
+            zf.writestr("three/", b"")
+
+        import hermes_cli.backup as backup_mod
+        monkeypatch.setattr(backup_mod, "_MAX_BACKUP_MEMBERS", 2)
+        with pytest.raises(SystemExit):
+            backup_mod.run_import(Namespace(zipfile=str(archive), force=True))
+
+        assert list(hermes_home.iterdir()) == []
+
+    def test_manifest_hash_mismatch_rejects_before_restore(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        archive = tmp_path / "bad-hash.zip"
+        data = b"model: test\n"
+        manifest = {
+            "format": "hermes-backup",
+            "version": 1,
+            "members": [
+                {
+                    "path": "config.yaml",
+                    "scope": "hermes_home",
+                    "size": len(data),
+                    "sha256": "0" * 64,
+                }
+            ],
+            "externalRoots": [],
+        }
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("config.yaml", data)
+            zf.writestr("_hermes_backup_manifest.json", json.dumps(manifest))
+
+        from hermes_cli.backup import run_import
+        with pytest.raises(SystemExit):
+            run_import(Namespace(zipfile=str(archive), force=True))
+
+        assert not (hermes_home / "config.yaml").exists()
+        output = capsys.readouterr().out
+        assert "Import complete" not in output
+        assert "configuration has been restored" not in output
+
+    @pytest.mark.parametrize("database_name", ["state.db", "STATE.DB"])
+    def test_corrupt_sqlite_rejects_before_root_activation(
+        self, tmp_path, monkeypatch, database_name
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        archive = tmp_path / "corrupt-sqlite.zip"
+        _write_manifest_zip(
+            archive,
+            {
+                "config.yaml": "model: test\n",
+                database_name: b"not a sqlite database",
+            },
+        )
+
+        from hermes_cli.backup import run_import
+        with pytest.raises(SystemExit):
+            run_import(Namespace(zipfile=str(archive), force=True))
+
+        assert list(hermes_home.iterdir()) == []
+
+    def test_directory_name_ending_in_db_is_not_treated_as_sqlite(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        archive = tmp_path / "db-directory.zip"
+        _write_manifest_zip(
+            archive,
+            {
+                "config.yaml": "model: test\n",
+                "fixtures.db/readme.txt": "not a database\n",
+            },
+        )
+
+        from hermes_cli.backup import run_import
+        run_import(Namespace(zipfile=str(archive), force=True))
+
+        assert (hermes_home / "fixtures.db" / "readme.txt").read_text() == (
+            "not a database\n"
+        )
+
+    @pytest.mark.parametrize("runtime_name", ["gateway.pid", "GATEWAY.PID"])
+    def test_runtime_only_manifest_cannot_claim_restore_success(
+        self, tmp_path, monkeypatch, capsys, runtime_name
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        archive = tmp_path / "runtime-only.zip"
+        _write_manifest_zip(archive, {runtime_name: "1234"})
+
+        from hermes_cli.backup import run_import
+        with pytest.raises(SystemExit):
+            run_import(Namespace(zipfile=str(archive), force=True))
+
+        assert list(hermes_home.iterdir()) == []
+        assert "Import complete" not in capsys.readouterr().out
+
+    def test_mixed_case_runtime_member_is_dropped(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        archive = tmp_path / "mixed-runtime.zip"
+        _write_manifest_zip(
+            archive,
+            {
+                "config.yaml": "model: test\n",
+                "Gateway_State.json": '{"gateway_state":"running"}',
+            },
+        )
+
+        from hermes_cli.backup import run_import
+        run_import(Namespace(zipfile=str(archive), force=True))
+
+        assert (hermes_home / "config.yaml").exists()
+        assert not (hermes_home / "Gateway_State.json").exists()
+
+    def test_mid_validation_failure_writes_nothing(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        archive = tmp_path / "mid-validation.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("config.yaml", "model: test\n")
+            zf.writestr("sessions/one.json", "{}")
+
+        import hermes_cli.backup as backup_mod
+        real_hash = backup_mod._hash_zip_member
+        calls = 0
+
+        def fail_second_member(zf, info):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise backup_mod.BackupError("injected mid-validation failure")
+            return real_hash(zf, info)
+
+        monkeypatch.setattr(backup_mod, "_hash_zip_member", fail_second_member)
+        with pytest.raises(SystemExit):
+            backup_mod.run_import(Namespace(zipfile=str(archive), force=True))
+
+        assert list(hermes_home.iterdir()) == []
+
+    def test_activation_interrupt_restores_empty_target_directory(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        archive = tmp_path / "activation-interrupt.zip"
+        _write_manifest_zip(archive, {"config.yaml": "model: test\n"})
+
+        import hermes_cli.backup as backup_mod
+
+        def interrupt_activation(_source, _target):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(backup_mod.os, "replace", interrupt_activation)
+        with pytest.raises(KeyboardInterrupt):
+            backup_mod.run_import(Namespace(zipfile=str(archive), force=True))
+
+        assert hermes_home.is_dir()
+        assert list(hermes_home.iterdir()) == []
+
+    def test_parent_fsync_failure_reports_activated_durability_unknown(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        archive = tmp_path / "parent-fsync-failure.zip"
+        _write_manifest_zip(archive, {"config.yaml": "model: test\n"})
+
+        import hermes_cli.backup as backup_mod
+        real_fsync_directory = backup_mod._fsync_directory
+
+        def fail_after_activation(path):
+            if Path(path) == hermes_home.parent and (hermes_home / "config.yaml").exists():
+                raise OSError("injected parent fsync failure")
+            return real_fsync_directory(path)
+
+        monkeypatch.setattr(backup_mod, "_fsync_directory", fail_after_activation)
+        with pytest.raises(SystemExit):
+            backup_mod.run_import(Namespace(zipfile=str(archive), force=True))
+
+        assert (hermes_home / "config.yaml").exists()
+        assert "activated with durability unknown" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------------------
 # Memory-provider external paths (~/.honcho, ~/.hindsight, ...) — captured via
 # MemoryProvider.backup_paths() and restored to their original home-relative
@@ -2240,9 +2863,14 @@ class TestMemoryProviderExternalPaths:
         hermes_home.mkdir(parents=True, exist_ok=True)
         (hermes_home / "config.yaml").write_text("model:\n  provider: openrouter\n")
         (hermes_home / ".env").write_text("OPENROUTER_API_KEY=sk-test\n")
-        (hermes_home / "state.db").write_bytes(b"x")
+        connection = sqlite3.connect(str(hermes_home / "state.db"))
+        connection.execute("CREATE TABLE durable (value TEXT)")
+        connection.commit()
+        connection.close()
 
-    def test_backup_captures_external_paths_under_external_prefix(self, tmp_path, monkeypatch):
+    def test_backup_captures_external_paths_under_external_prefix(
+        self, tmp_path, monkeypatch, capsys
+    ):
         """Provider state under ~/.honcho is archived beneath _external/,
         encoded relative to the home directory."""
         hermes_home = tmp_path / ".hermes"
@@ -2271,6 +2899,9 @@ class TestMemoryProviderExternalPaths:
         assert "_external/.honcho/sub/x.json" in names
         # In-home files still present.
         assert "config.yaml" in names
+        output = capsys.readouterr().out
+        assert "Preservation-only archive" in output
+        assert "Restore with: hermes import" not in output
 
     def test_backup_skips_external_paths_outside_home(self, tmp_path, monkeypatch):
         """A declared path outside the home dir is not portable and must be
@@ -2299,33 +2930,36 @@ class TestMemoryProviderExternalPaths:
         (outside / "leak.json").unlink()
         outside.rmdir()
 
-    def test_import_restores_external_to_home_relative_location(self, tmp_path, monkeypatch):
-        """_external/ members restore to ~/<relpath>, not under HERMES_HOME,
-        and credential-shaped files get 0600."""
+    def test_current_external_import_is_contained_until_provider_bound_v2(
+        self, tmp_path, monkeypatch
+    ):
+        """A v1 manifest cannot authorize writes outside the staged root."""
         dst_home = tmp_path / "dst"
         dst_home.mkdir()
         hermes_home = dst_home / ".hermes"
         hermes_home.mkdir()
 
         zip_path = tmp_path / "backup.zip"
-        with zipfile.ZipFile(zip_path, "w") as zf:
-            zf.writestr("config.yaml", "model: {}\n")
-            zf.writestr(".env", "X=1\n")
-            zf.writestr("state.db", "")
-            zf.writestr("_external/.honcho/config.json", '{"peer":"bob"}')
+        _write_manifest_zip(
+            zip_path,
+            {
+                "config.yaml": "model: {}\n",
+                ".env": "X=1\n",
+                "_external/.honcho/config.json": '{"peer":"bob"}',
+            },
+            external_roots=[".honcho"],
+        )
 
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         monkeypatch.setattr(Path, "home", lambda: dst_home)
 
         from hermes_cli.backup import run_import
-        run_import(Namespace(zipfile=str(zip_path), force=True))
+        with pytest.raises(SystemExit):
+            run_import(Namespace(zipfile=str(zip_path), force=True))
 
         restored = dst_home / ".honcho" / "config.json"
-        assert restored.exists()
-        assert restored.read_text() == '{"peer":"bob"}'
-        # Credential-shaped file tightened.
-        assert (restored.stat().st_mode & 0o777) == 0o600
-        # External state did NOT leak into HERMES_HOME.
+        assert not restored.exists()
+        assert list(hermes_home.iterdir()) == []
         assert not (hermes_home / "_external").exists()
 
     def test_import_blocks_external_path_traversal(self, tmp_path, monkeypatch):
@@ -2347,9 +2981,11 @@ class TestMemoryProviderExternalPaths:
         monkeypatch.setattr(Path, "home", lambda: dst_home)
 
         from hermes_cli.backup import run_import
-        run_import(Namespace(zipfile=str(zip_path), force=True))
+        with pytest.raises(SystemExit):
+            run_import(Namespace(zipfile=str(zip_path), force=True))
 
         assert not sentinel.exists()
+        assert not (hermes_home / "config.yaml").exists()
 
     def test_abc_backup_paths_defaults_empty(self):
         """The ABC default returns [] so providers opt in explicitly."""
