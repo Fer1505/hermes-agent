@@ -162,11 +162,12 @@ def get_current_session_key(default: str = "default") -> str:
     if session_key:
         return session_key
     from gateway.session_context import get_session_env
-    return (
-        get_session_env("HERMES_SESSION_KEY", "")
-        or os.getenv("HERMES_SESSION_KEY", "")
-        or default
-    )
+
+    # get_session_env already performs the legacy environment fallback when
+    # this context has never been bound. Calling os.getenv again here would
+    # defeat its explicit-empty state after clear_session_vars() and leak the
+    # last concurrent session's process-global key into a new tool call.
+    return get_session_env("HERMES_SESSION_KEY", "") or default
 
 
 def _get_session_platform() -> str:

@@ -2705,7 +2705,19 @@ This compaction should PRIORITISE preserving all information related to the focu
         """
         if not isinstance(summary, str):
             return summary
-        max_chars = max(512, self.max_summary_tokens * _CHARS_PER_TOKEN)
+        # ``max_summary_tokens`` is initialized by the constructor and model
+        # switch path. Keep this helper defensive for deserialized/legacy
+        # compressor instances and focused tests that construct via __new__.
+        max_summary_tokens = getattr(self, "max_summary_tokens", None)
+        if not isinstance(max_summary_tokens, int) or max_summary_tokens <= 0:
+            max_summary_tokens = max(
+                _MIN_SUMMARY_TOKENS,
+                min(
+                    int(getattr(self, "context_length", 0) * 0.05),
+                    int(getattr(self, "summary_tokens_ceiling", 4096)),
+                ),
+            )
+        max_chars = max(512, max_summary_tokens * _CHARS_PER_TOKEN)
         if len(summary) <= max_chars:
             return summary
 
@@ -2722,7 +2734,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                 "Context summary trimmed from %d to %d chars (max_summary_tokens=%d)",
                 len(summary),
                 len(trimmed),
-                self.max_summary_tokens,
+                max_summary_tokens,
             )
         return trimmed[:max_chars]
 

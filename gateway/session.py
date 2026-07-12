@@ -1078,6 +1078,14 @@ class SessionStore:
         except Exception as e:
             logger.debug("Compression-tip projection failed for %s: %s", entry.session_id, e)
             return False
+        if not isinstance(tip_session_id, str):
+            logger.warning(
+                "Ignoring invalid compression tip for %s: expected string, got %s",
+                entry.session_id,
+                type(tip_session_id).__name__,
+            )
+            return False
+        tip_session_id = tip_session_id.strip()
         if not tip_session_id or tip_session_id == entry.session_id:
             return False
 

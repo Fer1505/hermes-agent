@@ -4,7 +4,7 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
-from gateway.platforms.telegram import TelegramAdapter
+from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
 def _adapter(tmp_path, *, profile="atlas", peers=None):
