@@ -255,7 +255,11 @@ def extract_local_skills():
         if not os.path.isdir(base_path):
             continue
 
-        for root, _dirs, files in os.walk(base_path):
+        for root, dirs, files in os.walk(base_path):
+            # Do not traverse archived or repository-internal directories. These
+            # are not installable active skills and are intentionally invisible
+            # to the generated documentation tree.
+            dirs[:] = [directory for directory in dirs if not directory.startswith(".")]
             if "SKILL.md" not in files:
                 continue
 

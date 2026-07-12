@@ -453,6 +453,13 @@ def discover_skills() -> list[tuple[dict[str, Any], dict[str, Any]]]:
     results: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for kind, source_dir in SKILL_SOURCES:
         for skill_md in sorted(source_dir.rglob("SKILL.md")):
+            relative_parts = skill_md.relative_to(source_dir).parts
+            # Hidden directories contain retired or repository-internal material.
+            # Docusaurus excludes these paths from its document inventory, so
+            # publishing them in the generated sidebar creates dangling IDs.
+            # More importantly, archived skills must not be presented as active.
+            if any(part.startswith(".") for part in relative_parts[:-1]):
+                continue
             meta = derive_skill_meta(skill_md, source_dir, kind)
             parsed = parse_skill_md(skill_md)
             results.append((meta, parsed))
