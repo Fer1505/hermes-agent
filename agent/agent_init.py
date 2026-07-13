@@ -1249,6 +1249,30 @@ def init_agent(
                         "provider_circuit_failure_threshold",
                         3,
                     ),
+                    write_outbox_enabled=mem_config.get(
+                        "provider_write_outbox_enabled",
+                        True,
+                    ),
+                    write_outbox_max_entries=mem_config.get(
+                        "provider_write_outbox_max_entries",
+                        1000,
+                    ),
+                    write_outbox_max_bytes=mem_config.get(
+                        "provider_write_outbox_max_bytes",
+                        8 * 1024 * 1024,
+                    ),
+                    write_outbox_max_age_seconds=mem_config.get(
+                        "provider_write_outbox_max_age_seconds",
+                        7 * 24 * 60 * 60,
+                    ),
+                    write_outbox_retry_base_seconds=mem_config.get(
+                        "provider_write_outbox_retry_base_seconds",
+                        1.0,
+                    ),
+                    write_outbox_retry_max_seconds=mem_config.get(
+                        "provider_write_outbox_retry_max_seconds",
+                        300.0,
+                    ),
                 )
                 _mp = _load_mem(_mem_provider_name)
                 if _mp and _mp.is_available():

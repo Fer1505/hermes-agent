@@ -2077,6 +2077,15 @@ DEFAULT_CONFIG = {
         "provider_prefetch_timeout_seconds": 5.0,
         "provider_circuit_cooldown_seconds": 30.0,
         "provider_circuit_failure_threshold": 3,
+        # Committed built-in memory writes are mirrored through a profile-
+        # scoped SQLite outbox. Bounds prevent a down provider from consuming
+        # unbounded disk; retained event IDs enable replay/deduplication.
+        "provider_write_outbox_enabled": True,
+        "provider_write_outbox_max_entries": 1000,
+        "provider_write_outbox_max_bytes": 8 * 1024 * 1024,
+        "provider_write_outbox_max_age_seconds": 7 * 24 * 60 * 60,
+        "provider_write_outbox_retry_base_seconds": 1.0,
+        "provider_write_outbox_retry_max_seconds": 300.0,
     },
 
     # Subagent delegation — override the provider:model used by delegate_task

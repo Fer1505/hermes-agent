@@ -26,16 +26,19 @@ Usage in run_agent.py:
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
 import inspect
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
+from agent.memory_write_outbox import MemoryWriteEvent, MemoryWriteOutbox
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.registry import tool_error
 
@@ -411,6 +414,12 @@ class MemoryManager:
         prefetch_timeout_s: float = _DEFAULT_PREFETCH_TIMEOUT_S,
         circuit_cooldown_s: float = _DEFAULT_CIRCUIT_COOLDOWN_S,
         circuit_failure_threshold: int = _DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
+        write_outbox_enabled: bool = True,
+        write_outbox_max_entries: int = 1000,
+        write_outbox_max_bytes: int = 8 * 1024 * 1024,
+        write_outbox_max_age_seconds: float = 7 * 24 * 60 * 60,
+        write_outbox_retry_base_seconds: float = 1.0,
+        write_outbox_retry_max_seconds: float = 300.0,
     ) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
@@ -420,6 +429,27 @@ class MemoryManager:
         self._prefetch_timeout_s = max(0.01, float(prefetch_timeout_s))
         self._circuit_cooldown_s = max(0.0, float(circuit_cooldown_s))
         self._circuit_failure_threshold = max(1, int(circuit_failure_threshold))
+        self._write_outbox_enabled = bool(write_outbox_enabled)
+        self._write_outbox_max_entries = max(1, int(write_outbox_max_entries))
+        self._write_outbox_max_bytes = max(1024, int(write_outbox_max_bytes))
+        self._write_outbox_max_age_seconds = max(
+            60.0,
+            float(write_outbox_max_age_seconds),
+        )
+        self._write_outbox_retry_base_seconds = max(
+            0.0,
+            float(write_outbox_retry_base_seconds),
+        )
+        self._write_outbox_retry_max_seconds = max(
+            self._write_outbox_retry_base_seconds,
+            float(write_outbox_retry_max_seconds),
+        )
+        self._write_outbox: Optional[MemoryWriteOutbox] = None
+        self._write_outbox_lease_owner = f"memory-manager-{uuid.uuid4().hex}"
+        self._write_outbox_rejections = 0
+        self._write_outbox_retry_timer: Optional[threading.Timer] = None
+        self._write_outbox_retry_lock = threading.Lock()
+        self._shutting_down = False
         # Background executor for end-of-turn sync/prefetch. Lazily created on
         # first use so the common builtin-only path spawns no extra threads.
         # A single worker serializes a provider's writes (turn N must land
@@ -688,7 +718,7 @@ class MemoryManager:
                 _ProviderRuntimeState(),
             )
             with state.lock:
-                health[provider.name] = {
+                provider_health = {
                     "initialized": self._initialization_attempted,
                     # Providers are callable during construction so their
                     # prompt metadata remains backwards-compatible, but they
@@ -702,6 +732,22 @@ class MemoryManager:
                     "consecutive_failures": state.consecutive_failures,
                     "circuit_open": now < state.circuit_open_until,
                 }
+            if self._write_outbox is not None and provider.name != "builtin":
+                try:
+                    outbox_stats = self._write_outbox.stats(provider.name)
+                    provider_health["write_outbox_pending"] = outbox_stats["pending"]
+                    provider_health["write_outbox_bytes"] = outbox_stats["payload_bytes"]
+                except Exception as e:
+                    provider_health["write_outbox_error"] = type(e).__name__
+                provider_health["write_outbox_rejections"] = (
+                    self._write_outbox_rejections
+                )
+                with self._write_outbox_retry_lock:
+                    provider_health["write_outbox_retry_scheduled"] = bool(
+                        self._write_outbox_retry_timer
+                        and self._write_outbox_retry_timer.is_alive()
+                    )
+            health[provider.name] = provider_health
         return health
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
@@ -1081,26 +1127,219 @@ class MemoryManager:
     ) -> None:
         """Notify external providers when the built-in memory tool writes.
 
-        Skips the builtin provider itself (it's the source of the write).
+        When initialized with a profile-scoped outbox, enqueue happens before
+        asynchronous delivery. A crash or provider failure therefore leaves a
+        replayable record. Before initialization (including lightweight unit
+        callers), behavior remains the legacy synchronous provider callback.
         """
-        for provider in self.active_providers:
-            if provider.name == "builtin":
-                continue
-            try:
-                metadata_mode = self._provider_memory_write_metadata_mode(provider)
-                if metadata_mode == "keyword":
-                    provider.on_memory_write(
-                        action, target, content, metadata=dict(metadata or {})
-                    )
-                elif metadata_mode == "positional":
-                    provider.on_memory_write(action, target, content, dict(metadata or {}))
-                else:
-                    provider.on_memory_write(action, target, content)
-            except Exception as e:
-                logger.debug(
-                    "Memory provider '%s' on_memory_write failed: %s",
-                    provider.name, e,
+        providers = [p for p in self.active_providers if p.name != "builtin"]
+        if not providers:
+            return
+
+        if self._write_outbox is None:
+            for provider in providers:
+                direct_metadata = dict(metadata or {})
+                direct_metadata.pop("_outbox_operation_index", None)
+                self._deliver_memory_write(
+                    provider,
+                    action,
+                    target,
+                    content,
+                    direct_metadata,
                 )
+            return
+
+        queued = False
+        for provider in providers:
+            event_metadata = dict(metadata or {})
+            event_id = self._memory_write_event_id(
+                provider.name,
+                action,
+                target,
+                content,
+                event_metadata,
+            )
+            event_metadata.pop("_outbox_operation_index", None)
+            event_metadata["outbox_event_id"] = event_id
+            event_metadata["delivery_semantics"] = "at-least-once"
+            try:
+                result = self._write_outbox.enqueue(
+                    event_id=event_id,
+                    provider=provider.name,
+                    action=action,
+                    target=target,
+                    content=content,
+                    metadata=event_metadata,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Memory write outbox enqueue failed for provider '%s': %s",
+                    provider.name,
+                    e,
+                )
+                result = "full"
+
+            if result == "enqueued":
+                queued = True
+            elif result == "duplicate":
+                logger.debug(
+                    "Memory write outbox ignored duplicate event %s",
+                    event_id,
+                )
+            else:
+                # Preserve the previous best-effort behavior if the bounded
+                # queue cannot accept a record. This is fail-visible and does
+                # not discard older durable work to make room.
+                logger.error(
+                    "Memory write outbox rejected event %s (%s); attempting "
+                    "direct provider delivery",
+                    event_id,
+                    result,
+                )
+                self._write_outbox_rejections += 1
+                self._deliver_memory_write(
+                    provider,
+                    action,
+                    target,
+                    content,
+                    event_metadata,
+                )
+        if queued:
+            self._submit_background(self._drain_memory_write_outbox)
+
+    @staticmethod
+    def _memory_write_event_id(
+        provider_name: str,
+        action: str,
+        target: str,
+        content: str,
+        metadata: Dict[str, Any],
+    ) -> str:
+        explicit = str(metadata.get("outbox_event_id") or "").strip()
+        if explicit:
+            return explicit[:128]
+        tool_call_id = str(metadata.get("tool_call_id") or "").strip()
+        if not tool_call_id:
+            return f"mw_{uuid.uuid4().hex}"
+        operation_index = str(metadata.get("_outbox_operation_index", 0))
+        canonical = "\0".join(
+            (provider_name, tool_call_id, operation_index, action, target, content)
+        )
+        return f"mw_{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+    def _deliver_memory_write(
+        self,
+        provider: MemoryProvider,
+        action: str,
+        target: str,
+        content: str,
+        metadata: Dict[str, Any],
+    ) -> bool:
+        try:
+            metadata_mode = self._provider_memory_write_metadata_mode(provider)
+            if metadata_mode == "keyword":
+                provider.on_memory_write(action, target, content, metadata=dict(metadata))
+            elif metadata_mode == "positional":
+                provider.on_memory_write(action, target, content, dict(metadata))
+            else:
+                provider.on_memory_write(action, target, content)
+            return True
+        except Exception as e:
+            logger.debug(
+                "Memory provider '%s' on_memory_write failed: %s",
+                provider.name,
+                e,
+            )
+            return False
+
+    def _drain_memory_write_outbox(self) -> None:
+        outbox = self._write_outbox
+        if outbox is None:
+            return
+        providers = {
+            provider.name: provider
+            for provider in self.active_providers
+            if provider.name != "builtin"
+        }
+        for provider_name, provider in providers.items():
+            while True:
+                try:
+                    events = outbox.claim_due(
+                        provider_name,
+                        lease_owner=self._write_outbox_lease_owner,
+                        limit=1,
+                    )
+                except Exception as e:
+                    logger.warning("Memory write outbox claim failed: %s", e)
+                    break
+                if not events:
+                    break
+                event = events[0]
+                try:
+                    if self._deliver_memory_write_event(provider, event):
+                        outbox.complete(
+                            event.event_id,
+                            lease_owner=self._write_outbox_lease_owner,
+                        )
+                    else:
+                        outbox.fail(
+                            event.event_id,
+                            lease_owner=self._write_outbox_lease_owner,
+                            error="provider callback failed",
+                        )
+                        retry_delay = min(
+                            self._write_outbox_retry_max_seconds,
+                            self._write_outbox_retry_base_seconds
+                            * (2 ** min(event.attempts, 16)),
+                        )
+                        self._schedule_memory_write_outbox_retry(retry_delay)
+                        break
+                except Exception as e:
+                    # Leave the lease to expire rather than risking another
+                    # process delivering the same event concurrently.
+                    logger.warning(
+                        "Memory write outbox completion failed for event %s: %s",
+                        event.event_id,
+                        e,
+                    )
+                    break
+
+    def _schedule_memory_write_outbox_retry(self, delay: float) -> None:
+        if delay <= 0 or self._shutting_down:
+            return
+        with self._write_outbox_retry_lock:
+            timer = self._write_outbox_retry_timer
+            if timer is not None and timer.is_alive():
+                return
+
+            def _retry() -> None:
+                with self._write_outbox_retry_lock:
+                    self._write_outbox_retry_timer = None
+                if not self._shutting_down:
+                    self._submit_background(self._drain_memory_write_outbox)
+
+            timer = threading.Timer(delay, _retry)
+            timer.daemon = True
+            timer.name = "mem-write-outbox-retry"
+            self._write_outbox_retry_timer = timer
+            timer.start()
+
+    def _deliver_memory_write_event(
+        self,
+        provider: MemoryProvider,
+        event: MemoryWriteEvent,
+    ) -> bool:
+        metadata = dict(event.metadata)
+        metadata["outbox_event_id"] = event.event_id
+        metadata["delivery_semantics"] = "at-least-once"
+        metadata["delivery_attempt"] = event.attempts + 1
+        return self._deliver_memory_write(
+            provider,
+            event.action,
+            event.target,
+            event.content,
+            metadata,
+        )
 
     # Actions the bridge mirrors to external providers. The built-in memory
     # tool can also return non-mutating shapes (errors, staged-for-approval
@@ -1163,7 +1402,7 @@ class MemoryManager:
                 "old_text": tool_args.get("old_text"),
             }]
 
-        for op in raw_operations:
+        for operation_index, op in enumerate(raw_operations):
             if not isinstance(op, dict):
                 continue
             action = str(op.get("action") or "")
@@ -1171,6 +1410,7 @@ class MemoryManager:
                 continue
             try:
                 metadata = dict(build_metadata() if build_metadata else {})
+                metadata["_outbox_operation_index"] = operation_index
                 old_text = op.get("old_text")
                 if old_text:
                     metadata["old_text"] = str(old_text)
@@ -1206,6 +1446,12 @@ class MemoryManager:
         daemon, so anything still wedged past the drain window dies with
         the interpreter rather than blocking exit.
         """
+        self._shutting_down = True
+        with self._write_outbox_retry_lock:
+            retry_timer = self._write_outbox_retry_timer
+            self._write_outbox_retry_timer = None
+        if retry_timer is not None:
+            retry_timer.cancel()
         self._drain_sync_executor()
         for provider in reversed(self._providers):
             try:
@@ -1288,5 +1534,34 @@ class MemoryManager:
                 logger.warning(
                     "Memory provider '%s' initialize failed: %s",
                     provider.name, e,
+                )
+        has_active_external = any(
+            provider.name != "builtin" for provider in self.active_providers
+        )
+        if self._write_outbox_enabled and has_active_external:
+            try:
+                from agent.profile_memory_contract import resolve_profile_memory_paths
+
+                profile_paths = resolve_profile_memory_paths(
+                    kwargs.get("hermes_home")
+                )
+                self._write_outbox = MemoryWriteOutbox(
+                    profile_paths.runtime_directory
+                    / "external-memory-write-outbox.sqlite3",
+                    max_entries=self._write_outbox_max_entries,
+                    max_payload_bytes=self._write_outbox_max_bytes,
+                    max_age_seconds=self._write_outbox_max_age_seconds,
+                    retry_base_seconds=self._write_outbox_retry_base_seconds,
+                    retry_max_seconds=self._write_outbox_retry_max_seconds,
+                )
+                # Replay is asynchronous so provider recovery never delays
+                # agent startup. The same single worker preserves write order.
+                self._submit_background(self._drain_memory_write_outbox)
+            except Exception as e:
+                self._write_outbox = None
+                logger.warning(
+                    "Memory write outbox initialization failed; provider mirrors "
+                    "remain best-effort for this process: %s",
+                    e,
                 )
         return activated
