@@ -15,7 +15,7 @@ Registration:
 Lifecycle (called by MemoryManager, wired in run_agent.py):
   initialize()          — connect, create resources, warm up
   system_prompt_block()  — static text for the system prompt
-  prefetch(query)        — background recall before each turn
+  prefetch(query)        — bounded recall before each turn
   sync_turn(user, asst)  — async write after each turn
   get_tool_schemas()     — tool schemas to expose to the model
   handle_tool_call()     — dispatch a tool call
@@ -94,10 +94,11 @@ class MemoryProvider(ABC):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context for the upcoming turn.
 
-        Called before each API call. Return formatted text to inject as
-        context, or empty string if nothing relevant. Implementations
-        should be fast — use background threads for the actual recall
-        and return cached results here.
+        Called before each API call behind the manager's timeout and circuit
+        boundary. Return evidence text, or empty string if nothing relevant.
+        The manager adds provider provenance, marks the result untrusted, and
+        quotes it before injection. Implementations should still be fast and
+        cancellation-aware; a timed-out plugin call is not force-killed.
 
         session_id is provided for providers serving concurrent sessions
         (gateway group chats, cached agents). Providers that don't need

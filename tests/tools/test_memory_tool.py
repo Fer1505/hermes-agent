@@ -479,6 +479,26 @@ class TestMemoryConsolidationGracefulDegrade:
 
 
 class TestMemoryStorePersistence:
+    def test_canonical_nested_memory_wins_over_root_decoys(
+        self, tmp_path, monkeypatch
+    ):
+        profile_root = tmp_path / "profile"
+        learned_dir = profile_root / "memories"
+        learned_dir.mkdir(parents=True)
+        (profile_root / "MEMORY.md").write_text("ROOT DECOY", encoding="utf-8")
+        (profile_root / "USER.md").write_text("ROOT USER DECOY", encoding="utf-8")
+        (learned_dir / "MEMORY.md").write_text("canonical fact", encoding="utf-8")
+        (learned_dir / "USER.md").write_text("canonical user", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(profile_root))
+
+        store = MemoryStore()
+        store.load_from_disk()
+
+        assert store.memory_entries == ["canonical fact"]
+        assert store.user_entries == ["canonical user"]
+        assert "ROOT DECOY" not in store.format_for_system_prompt("memory")
+        assert "ROOT USER DECOY" not in store.format_for_system_prompt("user")
+
     def test_save_and_load_roundtrip(self, tmp_path, monkeypatch):
         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
 

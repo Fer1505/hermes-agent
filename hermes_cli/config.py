@@ -2072,6 +2072,11 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # Manager-owned hot-path containment for third-party recall. These are
+        # config settings (not secrets), so they belong here rather than .env.
+        "provider_prefetch_timeout_seconds": 5.0,
+        "provider_circuit_cooldown_seconds": 30.0,
+        "provider_circuit_failure_threshold": 3,
     },
 
     # Subagent delegation — override the provider:model used by delegate_task

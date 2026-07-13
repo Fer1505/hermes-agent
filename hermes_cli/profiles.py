@@ -32,6 +32,10 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import List, Optional, Tuple
 
+from agent.profile_memory_contract import (
+    LEARNED_MEMORY_RELATIVE_PATH,
+    USER_PROFILE_RELATIVE_PATH,
+)
 from agent.skill_utils import is_excluded_skill_path
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -64,8 +68,8 @@ _CLONE_CONFIG_FILES = [
 # Memory files are part of the agent's curated identity — just as important
 # as SOUL.md for continuity when cloning a profile.
 _CLONE_SUBDIR_FILES = [
-    "memories/MEMORY.md",
-    "memories/USER.md",
+    LEARNED_MEMORY_RELATIVE_PATH.as_posix(),
+    USER_PROFILE_RELATIVE_PATH.as_posix(),
 ]
 
 # Runtime files stripped after --clone-all (shouldn't carry over).

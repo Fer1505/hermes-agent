@@ -30,9 +30,9 @@ import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
 
+from agent.profile_memory_contract import resolve_profile_memory_paths
 from utils import atomic_replace
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
@@ -53,8 +53,8 @@ logger = logging.getLogger(__name__)
 # constant was cached at import time and could go stale if a profile switch
 # happened after the first import.
 def get_memory_dir() -> Path:
-    """Return the profile-scoped memories directory."""
-    return get_hermes_home() / "memories"
+    """Return the v1 profile-scoped learned-memory directory."""
+    return resolve_profile_memory_paths().learned_directory
 
 ENTRY_DELIMITER = "\n§\n"
 
@@ -1140,5 +1140,4 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
 
