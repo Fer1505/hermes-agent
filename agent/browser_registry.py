@@ -11,8 +11,11 @@ Active selection
 ----------------
 The active provider is chosen by configuration with this precedence:
 
-1. ``browser.cloud_provider`` in ``config.yaml`` (explicit override).
-2. Legacy preference order — ``browser-use`` → ``browserbase`` — filtered by
+1. ``browser.cloud_provider`` in ``config.yaml`` (explicit override). A known
+   provider wins, ``local`` disables cloud mode, and an unknown name raises
+   ``LookupError`` instead of changing backends.
+2. When no provider is configured, legacy preference order — ``browser-use``
+   → ``browserbase`` — filtered by
    availability. Matches the historic auto-detect order in
    :func:`tools.browser_tool._get_cloud_provider` (Browser Use checked first
    because it covers both the managed Nous gateway and direct API key path;
@@ -123,7 +126,9 @@ def _resolve(configured: Optional[str]) -> Optional[BrowserProvider]:
        :meth:`is_available` returns False — the dispatcher will surface a
        precise "X_API_KEY is not set" error instead of silently routing
        somewhere else.
-    3. **Legacy preference walk, filtered by availability.** Walk
+    3. **Explicit unknown names fail closed.** Raise ``LookupError`` instead
+       of entering auto-detect or returning the local-mode ``None`` sentinel.
+    4. **Legacy preference walk, filtered by availability.** Walk
        :data:`_LEGACY_PREFERENCE` (``browser-use`` → ``browserbase``) looking
        for a provider whose ``is_available()`` is True.
 
@@ -168,13 +173,11 @@ def _resolve(configured: Optional[str]) -> Optional[BrowserProvider]:
         provider = snapshot.get(configured)
         if provider is not None:
             return provider
-        logger.debug(
-            "browser cloud_provider '%s' configured but not registered; "
-            "falling back to auto-detect",
-            configured,
+        raise LookupError(
+            f"browser.cloud_provider={configured!r} is not registered"
         )
 
-    # 3. Legacy preference walk — only providers in _LEGACY_PREFERENCE are
+    # 4. Legacy preference walk — only providers in _LEGACY_PREFERENCE are
     #    auto-eligible. Filtered by availability so we don't surface a
     #    provider the user has no credentials for. See docstring for why
     #    we do NOT fall back to "any single-eligible registered provider".

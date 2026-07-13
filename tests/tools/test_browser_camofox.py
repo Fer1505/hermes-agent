@@ -147,7 +147,10 @@ class TestCamofoxNavigate:
         monkeypatch.delenv("CAMOFOX_REWRITE_LOOPBACK_URLS", raising=False)
         monkeypatch.delenv("CAMOFOX_LOOPBACK_HOST_ALIAS", raising=False)
         mock_config.return_value = _config_with_camofox(rewrite_loopback_urls=True)
-        mock_post.return_value = _mock_response(json_data={"tabId": "tab_rewrite"})
+        mock_post.return_value = _mock_response(json_data={
+            "tabId": "tab_rewrite",
+            "url": "http://host.docker.internal:8766/#settings",
+        })
 
         result = json.loads(camofox_navigate("http://127.0.0.1:8766/#settings", task_id="t_rewrite"))
 
@@ -295,7 +298,7 @@ class TestCamofoxInteractions:
         mock_post.return_value = _mock_response(json_data={"tabId": "tab8", "url": "https://x.com"})
         camofox_navigate("https://x.com", task_id="t8")
 
-        mock_post.return_value = _mock_response(json_data={"ok": True})
+        mock_post.return_value = _mock_response(json_data={"ok": True, "url": "https://x.com"})
         result = json.loads(camofox_press("Enter", task_id="t8"))
         assert result["success"] is True
         assert result["pressed"] == "Enter"
@@ -455,5 +458,4 @@ class TestBrowserToolRouting:
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
         from tools.browser_tool import check_browser_requirements
         assert check_browser_requirements() is True
-
 

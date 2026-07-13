@@ -9,6 +9,12 @@ from unittest.mock import patch
 
 import pytest
 
+from agent.browser_provider import (
+    REMOTE_PROVIDER_EGRESS as _REAL_REMOTE_PROVIDER_EGRESS,
+    REMOTE_PROVIDER_EGRESS_WITH_CROSS_AUTHORITY_DISCOVERY as _REAL_REMOTE_CROSS_AUTH,
+    BrowserControlTransport as _RealBrowserControlTransport,
+    BrowserEgressCapability as _RealBrowserEgressCapability,
+)
 from hermes_cli.nous_account import NousPortalAccountInfo
 
 
@@ -113,6 +119,12 @@ def _install_fake_tools_package():
 
     sys.modules["agent.browser_provider"] = types.SimpleNamespace(
         BrowserProvider=_StubBrowserProvider,
+        BrowserControlTransport=_RealBrowserControlTransport,
+        BrowserEgressCapability=_RealBrowserEgressCapability,
+        REMOTE_PROVIDER_EGRESS=_REAL_REMOTE_PROVIDER_EGRESS,
+        REMOTE_PROVIDER_EGRESS_WITH_CROSS_AUTHORITY_DISCOVERY=(
+            _REAL_REMOTE_CROSS_AUTH
+        ),
     )
     sys.modules["agent.browser_registry"] = types.SimpleNamespace(
         get_provider=lambda name: None,

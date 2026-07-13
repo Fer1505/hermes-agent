@@ -1,166 +1,191 @@
-"""Tests for cloud browser provider runtime fallback to local Chromium.
+"""Cloud browser fail-closed and explicit local-fallback contracts."""
 
-Covers the fallback logic in _get_session_info() when a cloud provider
-is configured but fails at runtime (issue #10883).
-"""
 import logging
-from unittest.mock import Mock
 
 import pytest
 
+from agent.browser_provider import REMOTE_PROVIDER_EGRESS
 import tools.browser_tool as browser_tool
 
 
 def _reset_session_state(monkeypatch):
-    """Clear caches so each test starts fresh."""
     monkeypatch.setattr(browser_tool, "_active_sessions", {})
     monkeypatch.setattr(browser_tool, "_cached_cloud_provider", None)
     monkeypatch.setattr(browser_tool, "_cloud_provider_resolved", False)
     monkeypatch.setattr(browser_tool, "_start_browser_cleanup_thread", lambda: None)
-    monkeypatch.setattr(browser_tool, "_update_session_activity", lambda t: None)
+    monkeypatch.setattr(browser_tool, "_update_session_activity", lambda task: None)
+    monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
+
+
+def _valid_cloud_session(**overrides):
+    session = {
+        "session_name": "cloud-session",
+        "bb_session_id": "provider-session-1",
+        "cdp_url": "wss://browser.example/devtools/browser/abc",
+        "features": {"cloud": True},
+    }
+    session.update(overrides)
+    return session
+
+
+class FakeCloudProvider:
+    egress_capability = REMOTE_PROVIDER_EGRESS
+
+    def __init__(self, result=None, error=None):
+        self.result = _valid_cloud_session() if result is None else result
+        self.error = error
+        self.closed = []
+
+    def create_session(self, task_id):
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+    def close_session(self, session_id):
+        self.closed.append(session_id)
+        return True
 
 
 class TestCloudProviderRuntimeFallback:
-    """Tests for _get_session_info cloud → local fallback."""
-
-    def test_cloud_failure_falls_back_to_local(self, monkeypatch):
-        """When cloud provider.create_session raises, fall back to local."""
+    def test_cloud_failure_fails_closed_by_default(self, monkeypatch):
         _reset_session_state(monkeypatch)
-
-        provider = Mock()
-        provider.create_session.side_effect = RuntimeError("401 Unauthorized")
+        provider = FakeCloudProvider(error=RuntimeError("401 Unauthorized"))
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
+        local = lambda task: pytest.fail("local browser must not be selected")
+        monkeypatch.setattr(browser_tool, "_create_local_session", local)
+        monkeypatch.setattr(
+            browser_tool, "_allow_local_fallback_on_cloud_failure", lambda: False
+        )
 
-        session = browser_tool._get_session_info("task-1")
+        with pytest.raises(RuntimeError, match="fallback is disabled by default"):
+            browser_tool._get_session_info("task-1")
 
-        assert session["fallback_from_cloud"] is True
-        assert "401 Unauthorized" in session["fallback_reason"]
-        assert session["fallback_provider"] == "Mock"
-        assert session["features"]["local"] is True
-        assert session["cdp_url"] is None
-
-    def test_cloud_success_no_fallback(self, monkeypatch):
-        """When cloud succeeds, no fallback markers are present."""
+    def test_explicit_opt_in_allows_marked_local_fallback(self, monkeypatch):
         _reset_session_state(monkeypatch)
-
-        provider = Mock()
-        provider.create_session.return_value = {
-            "session_name": "cloud-sess",
-            "bb_session_id": "bb_123",
-            "cdp_url": None,
-            "features": {"browser_use": True},
-        }
+        provider = FakeCloudProvider(error=RuntimeError("cloud unavailable"))
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
+        monkeypatch.setattr(
+            browser_tool, "_allow_local_fallback_on_cloud_failure", lambda: True
+        )
 
         session = browser_tool._get_session_info("task-2")
 
-        assert session["session_name"] == "cloud-sess"
-        assert "fallback_from_cloud" not in session
-        assert "fallback_reason" not in session
+        assert session["features"]["local"] is True
+        assert session["fallback_from_cloud"] is True
+        assert session["fallback_provider"] == "FakeCloudProvider"
+        assert "cloud unavailable" in session["fallback_reason"]
 
-    def test_cloud_and_local_both_fail(self, monkeypatch):
-        """When both cloud and local fail, raise RuntimeError with both contexts."""
+    def test_valid_cloud_session_records_truthful_egress_contract(self, monkeypatch):
         _reset_session_state(monkeypatch)
-
-        provider = Mock()
-        provider.create_session.side_effect = RuntimeError("cloud boom")
+        provider = FakeCloudProvider()
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
         monkeypatch.setattr(
-            browser_tool, "_create_local_session",
-            Mock(side_effect=OSError("no chromium")),
+            browser_tool, "_is_public_network_url", lambda *args, **kwargs: True
         )
 
-        with pytest.raises(RuntimeError, match="cloud boom.*local.*no chromium"):
-            browser_tool._get_session_info("task-3")
+        session = browser_tool._get_session_info("task-3")
+
+        assert session["cdp_url"].startswith("wss://")
+        assert session["egress"] == REMOTE_PROVIDER_EGRESS.as_session_metadata()
+        assert "fallback_from_cloud" not in session
+
+    @pytest.mark.parametrize(
+        "cdp_url",
+        [
+            None,
+            "",
+            "not-a-url",
+            "ws://bad host/devtools/browser/x",
+            "ws://browser.example:notaport/devtools/browser/x",
+        ],
+    )
+    def test_absent_or_invalid_cdp_never_becomes_local_session(
+        self, monkeypatch, cdp_url
+    ):
+        _reset_session_state(monkeypatch)
+        provider = FakeCloudProvider(result=_valid_cloud_session(cdp_url=cdp_url))
+        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
+        monkeypatch.setattr(
+            browser_tool, "_allow_local_fallback_on_cloud_failure", lambda: False
+        )
+        monkeypatch.setattr(
+            browser_tool,
+            "_create_local_session",
+            lambda task: pytest.fail("invalid cloud metadata selected local backend"),
+        )
+
+        with pytest.raises(RuntimeError, match="CDP endpoint|cdp_url"):
+            browser_tool._get_session_info("task-invalid")
+
+        assert provider.closed == ["provider-session-1"]
+
+    def test_configuration_error_never_uses_compatibility_fallback(self, monkeypatch):
+        _reset_session_state(monkeypatch)
+        provider = browser_tool._failed_configured_provider(
+            "misspelled-provider", "no provider with that name is registered"
+        )
+        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
+        monkeypatch.setattr(
+            browser_tool, "_allow_local_fallback_on_cloud_failure", lambda: True
+        )
+        monkeypatch.setattr(
+            browser_tool,
+            "_create_local_session",
+            lambda task: pytest.fail("configuration errors must never run locally"),
+        )
+
+        with pytest.raises(RuntimeError, match="configuration failed closed"):
+            browser_tool._get_session_info("task-config-error")
 
     def test_no_provider_uses_local_directly(self, monkeypatch):
-        """When no cloud provider is configured, local mode is used with no fallback markers."""
         _reset_session_state(monkeypatch)
-
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: None)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
 
-        session = browser_tool._get_session_info("task-4")
+        session = browser_tool._get_session_info("task-local")
 
         assert session["features"]["local"] is True
         assert "fallback_from_cloud" not in session
 
     def test_cdp_override_bypasses_provider(self, monkeypatch):
-        """CDP override takes priority — cloud provider is never consulted."""
         _reset_session_state(monkeypatch)
-
-        provider = Mock()
+        provider = FakeCloudProvider(error=AssertionError("provider was consulted"))
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "ws://host:9222/devtools/browser/abc")
+        monkeypatch.setattr(
+            browser_tool,
+            "_get_cdp_override",
+            lambda: "ws://host:9222/devtools/browser/abc",
+        )
 
-        session = browser_tool._get_session_info("task-5")
+        session = browser_tool._get_session_info("task-cdp")
 
-        provider.create_session.assert_not_called()
         assert session["cdp_url"] == "ws://host:9222/devtools/browser/abc"
 
-    def test_fallback_logs_warning_with_provider_name(self, monkeypatch, caplog):
-        """Fallback emits a warning log with the provider class name and error."""
+    def test_opt_in_fallback_logs_provider_and_error(self, monkeypatch, caplog):
         _reset_session_state(monkeypatch)
-
-        BrowserUseProviderFake = type("BrowserUseProvider", (), {
-            "create_session": Mock(side_effect=ConnectionError("timeout")),
-        })
-        provider = BrowserUseProviderFake()
+        provider = FakeCloudProvider(error=ConnectionError("timeout"))
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
+        monkeypatch.setattr(
+            browser_tool, "_allow_local_fallback_on_cloud_failure", lambda: True
+        )
 
         with caplog.at_level(logging.WARNING, logger="tools.browser_tool"):
-            session = browser_tool._get_session_info("task-6")
+            browser_tool._get_session_info("task-log")
 
-        assert session["fallback_from_cloud"] is True
-        assert any("BrowserUseProvider" in r.message and "timeout" in r.message
-                    for r in caplog.records)
+        assert any(
+            "FakeCloudProvider" in record.message and "timeout" in record.message
+            for record in caplog.records
+        )
 
-    def test_cloud_failure_does_not_poison_next_task(self, monkeypatch):
-        """A fallback for one task_id doesn't affect a new task_id when cloud recovers."""
-        _reset_session_state(monkeypatch)
 
-        call_count = 0
+def test_local_fallback_policy_uses_config_yaml(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.read_raw_config",
+        lambda: {"browser": {"allow_local_fallback_on_cloud_failure": "true"}},
+    )
+    assert browser_tool._allow_local_fallback_on_cloud_failure() is True
 
-        def create_session_flaky(task_id):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise RuntimeError("transient failure")
-            return {
-                "session_name": "cloud-ok",
-                "bb_session_id": "bb_999",
-                "cdp_url": None,
-                "features": {"browser_use": True},
-            }
-
-        provider = Mock()
-        provider.create_session.side_effect = create_session_flaky
-        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
-
-        # First call fails → fallback
-        s1 = browser_tool._get_session_info("task-a")
-        assert s1["fallback_from_cloud"] is True
-
-        # Second call (different task) → cloud succeeds
-        s2 = browser_tool._get_session_info("task-b")
-        assert "fallback_from_cloud" not in s2
-        assert s2["session_name"] == "cloud-ok"
-
-    def test_cloud_returns_invalid_session_triggers_fallback(self, monkeypatch):
-        """Cloud provider returning None or empty dict triggers fallback."""
-        _reset_session_state(monkeypatch)
-
-        provider = Mock()
-        provider.create_session.return_value = None
-        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
-        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
-
-        session = browser_tool._get_session_info("task-7")
-
-        assert session["fallback_from_cloud"] is True
-        assert "invalid session" in session["fallback_reason"]
+    monkeypatch.setattr(
+        "hermes_cli.config.read_raw_config",
+        lambda: {"browser": {"allow_local_fallback_on_cloud_failure": False}},
+    )
+    assert browser_tool._allow_local_fallback_on_cloud_failure() is False

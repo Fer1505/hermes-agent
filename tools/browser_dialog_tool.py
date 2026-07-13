@@ -4,10 +4,9 @@ This tool is response-only — the agent first reads ``pending_dialogs`` from
 ``browser_snapshot`` output, then calls ``browser_dialog(action=...)`` to
 accept or dismiss.
 
-Gated on the same ``_browser_cdp_check`` as ``browser_cdp`` so it only
-appears when a CDP endpoint is reachable (Browserbase with a
-``connectUrl``, local Chromium-family browser via ``/browser connect``, or
-``browser.cdp_url`` set in config).
+Gated only on CDP endpoint reachability. The separate
+``browser.allow_raw_cdp`` opt-in controls the unrestricted generic
+``browser_cdp`` escape hatch and must never hide dialog handling.
 
 See ``website/docs/developer-guide/browser-supervisor.md`` for the full
 design.
@@ -118,19 +117,19 @@ def browser_dialog(
 
 
 def _browser_dialog_check() -> bool:
-    """Gate: same as ``browser_cdp`` — only offered when CDP is reachable.
+    """Gate dialog handling only on CDP endpoint reachability.
 
-    Kept identical so the two tools appear and disappear together. The
-    supervisor itself is started lazily by ``browser_navigate`` /
-    ``/browser connect`` / Browserbase session creation, so a reachable
-    CDP URL is enough to commit to showing the tool.
+    The supervisor itself is started lazily by ``browser_navigate`` /
+    ``/browser connect`` / Browserbase session creation, so a reachable CDP
+    URL is enough to commit to showing the tool. Raw-CDP policy is deliberately
+    not consulted here.
     """
     try:
-        from tools.browser_cdp_tool import _browser_cdp_check  # type: ignore[import-not-found]
+        from tools.browser_cdp_tool import _browser_cdp_endpoint_available  # type: ignore[import-not-found]
     except Exception as exc:  # pragma: no cover — defensive
         logger.debug("browser_dialog check: browser_cdp_tool import failed: %s", exc)
         return False
-    return _browser_cdp_check()
+    return _browser_cdp_endpoint_available()
 
 
 registry.register(

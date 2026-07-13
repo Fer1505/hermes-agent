@@ -29,18 +29,84 @@ logger = logging.getLogger(__name__)
 CDP_DOCS_URL = "https://chromedevtools.github.io/devtools-protocol/"
 
 
-def _redact_cdp_output(value: Any) -> Any:
-    """Redact browser-originated CDP result data before returning it."""
+_SENSITIVE_CDP_FIELD_NAMES = frozenset(
+    {
+        "accesstoken",
+        "apikey",
+        "authorization",
+        "authtoken",
+        "clientsecret",
+        "cookie",
+        "idtoken",
+        "password",
+        "passwd",
+        "proxyauthorization",
+        "refreshtoken",
+        "secret",
+        "setcookie",
+        "token",
+    }
+)
+
+
+def _normalized_cdp_field_name(value: object) -> str:
+    """Normalize a CDP/HTTP field name for exact sensitive-key matching."""
+    return "".join(ch for ch in str(value).lower() if ch.isalnum())
+
+
+def _redacted_cdp_field_value(value: Any) -> Any:
+    """Replace an explicitly credential-bearing field without exposing bytes."""
+    if value in (None, ""):
+        return value
+    if isinstance(value, list):
+        return [_redacted_cdp_field_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redacted_cdp_field_value(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _redacted_cdp_field_value(item) for key, item in value.items()}
+    return "«redacted-secret»"
+
+
+def _redact_cdp_output(value: Any, *, _cookie_context: bool = False) -> Any:
+    """Recursively redact browser-originated CDP result data.
+
+    Pattern redaction catches recognizable provider keys in arbitrary strings.
+    CDP also returns opaque cookies and tokens whose values have no recognizable
+    prefix, so exact credential-bearing field names and cookie ``value`` fields
+    are masked structurally. Both stateless and supervisor-routed calls must use
+    this same function before their payload reaches the model.
+    """
     from agent.redact import redact_sensitive_text
 
     if isinstance(value, str):
         return redact_sensitive_text(value, force=True)
     if isinstance(value, list):
-        return [_redact_cdp_output(item) for item in value]
+        return [
+            _redact_cdp_output(item, _cookie_context=_cookie_context)
+            for item in value
+        ]
     if isinstance(value, tuple):
-        return tuple(_redact_cdp_output(item) for item in value)
+        return tuple(
+            _redact_cdp_output(item, _cookie_context=_cookie_context)
+            for item in value
+        )
     if isinstance(value, dict):
-        return {key: _redact_cdp_output(item) for key, item in value.items()}
+        redacted: Dict[Any, Any] = {}
+        for key, item in value.items():
+            normalized_key = _normalized_cdp_field_name(key)
+            if normalized_key in _SENSITIVE_CDP_FIELD_NAMES:
+                redacted[key] = _redacted_cdp_field_value(item)
+                continue
+            if _cookie_context and normalized_key == "value":
+                redacted[key] = _redacted_cdp_field_value(item)
+                continue
+            redacted[key] = _redact_cdp_output(
+                item,
+                _cookie_context=(
+                    _cookie_context or normalized_key in {"cookie", "cookies"}
+                ),
+            )
+        return redacted
     return value
 
 # ``websockets`` is a direct hermes-agent dependency because the browser CDP
@@ -307,7 +373,7 @@ def _browser_cdp_via_supervisor(
         "method": method,
         "frame_id": frame_id,
         "session_id": child_sid,
-        "result": result_msg.get("result", {}),
+        "result": _redact_cdp_output(result_msg.get("result", {})),
     }
     return json.dumps(payload, ensure_ascii=False)
 
@@ -445,13 +511,15 @@ BROWSER_CDP_SCHEMA: Dict[str, Any] = {
         "Send a raw Chrome DevTools Protocol (CDP) command. Escape hatch for "
         "browser operations not covered by browser_navigate, browser_click, "
         "browser_console, etc.\n\n"
-        "**Requires a reachable CDP endpoint.** Available when the user has "
-        "run '/browser connect' to attach to a running Chrome, Brave, Chromium, "
-        "or Edge browser, or when 'browser.cdp_url' is set in config.yaml. "
+        "**Disabled by default.** Requires 'browser.allow_raw_cdp: true' in "
+        "config.yaml and a reachable CDP endpoint. The endpoint is available "
+        "when the user has run '/browser connect' to attach to a running Chrome, "
+        "Brave, Chromium, or Edge browser, or when 'browser.cdp_url' is set. "
         "Not currently wired up for cloud backends (Browserbase, Browser Use, "
         "Firecrawl) — those expose CDP per session but live-session routing is "
         "a follow-up. Camofox is REST-only and will never support CDP. If the "
-        "tool is in your toolset at all, a CDP endpoint is already reachable.\n\n"
+        "tool is in your toolset at all, both the explicit raw-tool opt-in and "
+        "endpoint checks have passed.\n\n"
         f"**CDP method reference:** {CDP_DOCS_URL} — use web_extract on a "
         "method's URL (e.g. '/tot/Page/#method-handleJavaScriptDialog') "
         "to look up parameters and return shape.\n\n"
@@ -537,12 +605,33 @@ BROWSER_CDP_SCHEMA: Dict[str, Any] = {
 }
 
 
-def _browser_cdp_check() -> bool:
-    """Availability check for browser_cdp.
+def _browser_cdp_endpoint_available() -> bool:
+    """Return whether the shared high-level CDP transport is reachable.
 
-    The tool is only offered when the Python side can actually reach a CDP
-    endpoint right now — meaning a static URL is set via ``/browser connect``
-    (``BROWSER_CDP_URL``) or ``browser.cdp_url`` in ``config.yaml``.
+    This transport check is intentionally independent of the raw-tool policy:
+    the supervisor and ``browser_dialog`` must keep working when unrestricted
+    model-facing CDP is disabled.
+    """
+    try:
+        from tools.browser_tool import (  # type: ignore[import-not-found]
+            _get_cdp_override,
+            check_browser_requirements,
+        )
+    except ImportError as exc:  # pragma: no cover — defensive
+        logger.debug("browser CDP endpoint check: browser_tool import failed: %s", exc)
+        return False
+    if not check_browser_requirements():
+        return False
+    return bool(_get_cdp_override())
+
+
+def _browser_cdp_check() -> bool:
+    """Availability check for the unrestricted model-facing browser_cdp tool.
+
+    The raw model-facing escape hatch is offered only when the operator has set
+    ``browser.allow_raw_cdp: true`` *and* the Python side can reach a static CDP
+    endpoint via ``/browser connect`` (``BROWSER_CDP_URL``) or
+    ``browser.cdp_url`` in ``config.yaml``.
 
     Backends that do *not* currently expose CDP to us — Camofox (REST-only),
     the default local agent-browser mode (Playwright hides its internal CDP
@@ -555,16 +644,22 @@ def _browser_cdp_check() -> bool:
     ``registry.register(...)`` calls).
     """
     try:
-        from tools.browser_tool import (  # type: ignore[import-not-found]
-            _get_cdp_override,
-            check_browser_requirements,
-        )
+        from hermes_cli.config import cfg_get, read_raw_config
+        from utils import is_truthy_value
     except ImportError as exc:  # pragma: no cover — defensive
-        logger.debug("browser_cdp check: browser_tool import failed: %s", exc)
+        logger.debug("browser_cdp check: config import failed: %s", exc)
         return False
-    if not check_browser_requirements():
+    try:
+        allow_raw_cdp = is_truthy_value(
+            cfg_get(read_raw_config(), "browser", "allow_raw_cdp"),
+            default=False,
+        )
+    except Exception as exc:  # pragma: no cover — fail closed on config errors
+        logger.debug("browser_cdp check: allow_raw_cdp config read failed: %s", exc)
         return False
-    return bool(_get_cdp_override())
+    if not allow_raw_cdp:
+        return False
+    return _browser_cdp_endpoint_available()
 
 
 registry.register(

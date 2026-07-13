@@ -56,14 +56,14 @@ class TestAuthHeadersSent:
 
     @patch("tools.browser_camofox.requests.post")
     def test_ensure_tab_sends_auth(self, mock_post):
-        mock_post.return_value = _mock_response(json_data={"tabId": "t1"})
+        mock_post.return_value = _mock_response(json_data={"tabId": "t1", "url": "https://example.com"})
         camofox_navigate("https://example.com", task_id="auth_test_1")
         _, kwargs = mock_post.call_args
         assert kwargs["headers"] == {"Authorization": "Bearer my-api-key"}
 
     @patch("tools.browser_camofox.requests.post")
     def test_post_sends_auth(self, mock_post):
-        mock_post.return_value = _mock_response(json_data={"tabId": "t2"})
+        mock_post.return_value = _mock_response(json_data={"tabId": "t2", "url": "https://example.com"})
         camofox_navigate("https://example.com", task_id="auth_test_2")
         mock_post.return_value = _mock_response(json_data={"ok": True, "url": "https://x.com"})
         camofox_navigate("https://x.com", task_id="auth_test_2")
@@ -74,7 +74,7 @@ class TestAuthHeadersSent:
     @patch("tools.browser_camofox.requests.post")
     @patch("tools.browser_camofox.requests.get")
     def test_get_sends_auth(self, mock_get, mock_post):
-        mock_post.return_value = _mock_response(json_data={"tabId": "t3"})
+        mock_post.return_value = _mock_response(json_data={"tabId": "t3", "url": "https://example.com"})
         camofox_navigate("https://example.com", task_id="auth_test_3")
         mock_get.return_value = _mock_response(json_data={
             "snapshot": '- heading "Hello"',
@@ -87,7 +87,7 @@ class TestAuthHeadersSent:
     @patch("tools.browser_camofox.requests.post")
     @patch("tools.browser_camofox.requests.delete")
     def test_delete_sends_auth(self, mock_delete, mock_post):
-        mock_post.return_value = _mock_response(json_data={"tabId": "t4"})
+        mock_post.return_value = _mock_response(json_data={"tabId": "t4", "url": "https://example.com"})
         camofox_navigate("https://example.com", task_id="auth_test_4")
         mock_delete.return_value = _mock_response(json_data={"ok": True})
         camofox_close(task_id="auth_test_4")
@@ -105,7 +105,7 @@ class TestNoAuthHeadersWhenKeyUnset:
 
     @patch("tools.browser_camofox.requests.post")
     def test_no_auth_on_tab_creation(self, mock_post):
-        mock_post.return_value = _mock_response(json_data={"tabId": "t5"})
+        mock_post.return_value = _mock_response(json_data={"tabId": "t5", "url": "https://example.com"})
         camofox_navigate("https://example.com", task_id="noauth_test_1")
         _, kwargs = mock_post.call_args
         assert kwargs.get("headers") == {}

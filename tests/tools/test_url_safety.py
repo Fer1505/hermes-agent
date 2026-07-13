@@ -7,6 +7,7 @@ from tools.url_safety import (
     is_safe_url,
     async_is_safe_url,
     is_always_blocked_url,
+    is_public_network_url,
     normalize_url_for_request,
     redirect_target_from_response,
     _is_blocked_ip,
@@ -42,6 +43,36 @@ class TestNormalizeUrlForRequest:
             normalize_url_for_request("https://münich.example/Köln")
             == "https://xn--mnich-kva.example/K%C3%B6ln"
         )
+
+
+class TestIsPublicNetworkUrl:
+    def test_all_public_answers_allowed_for_websocket_scheme(self):
+        with patch("socket.getaddrinfo", return_value=[
+            (2, 1, 6, "", ("93.184.216.34", 0)),
+            (2, 1, 6, "", ("8.8.8.8", 0)),
+        ]):
+            assert is_public_network_url(
+                "wss://relay.example/devtools/browser/x",
+                allowed_schemes=frozenset({"ws", "wss"}),
+            ) is True
+
+    def test_mixed_public_private_answers_fail_closed(self):
+        with patch("socket.getaddrinfo", return_value=[
+            (2, 1, 6, "", ("93.184.216.34", 0)),
+            (2, 1, 6, "", ("10.0.0.7", 0)),
+        ]):
+            assert is_public_network_url("https://mixed.example") is False
+
+    @pytest.mark.parametrize("address", ["127.0.0.1", "169.254.1.2", "240.0.0.1"])
+    def test_private_link_local_and_reserved_answers_fail_closed(self, address):
+        with patch("socket.getaddrinfo", return_value=[
+            (2, 1, 6, "", (address, 0)),
+        ]):
+            assert is_public_network_url("https://blocked.example") is False
+
+    def test_dns_failure_fails_closed(self):
+        with patch("socket.getaddrinfo", side_effect=socket.gaierror("no answer")):
+            assert is_public_network_url("https://missing.example") is False
 
 
 class TestIsSafeUrl:

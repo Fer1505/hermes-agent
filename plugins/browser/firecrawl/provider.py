@@ -33,7 +33,11 @@ from typing import Any, Dict
 
 import requests
 
-from agent.browser_provider import BrowserProvider
+from agent.browser_provider import (
+    REMOTE_PROVIDER_EGRESS,
+    BrowserEgressCapability,
+    BrowserProvider,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +58,11 @@ class FirecrawlBrowserProvider(BrowserProvider):
     @property
     def display_name(self) -> str:
         return "Firecrawl"
+
+    @property
+    def egress_capability(self) -> BrowserEgressCapability:
+        """Pages run remotely; provider-managed egress is not verified by Hermes."""
+        return REMOTE_PROVIDER_EGRESS
 
     def is_available(self) -> bool:
         return bool(os.environ.get("FIRECRAWL_API_KEY"))

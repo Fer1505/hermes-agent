@@ -1,4 +1,4 @@
-"""Camofox browser backend — local anti-detection browser via REST API.
+"""Camofox browser backend — anti-detection browser via REST API.
 
 Camofox-browser is a self-hosted Node.js server wrapping Camoufox (Firefox
 fork with C++ fingerprint spoofing).  It exposes a REST API that maps 1:1
@@ -6,7 +6,10 @@ to our browser tool interface: accessibility snapshots with element refs,
 click/type/scroll by ref, screenshots, etc.
 
 When ``CAMOFOX_URL`` is set (e.g. ``http://localhost:9377``), the browser
-tools route through this module instead of the ``agent-browser`` CLI.
+tools route through this module instead of the ``agent-browser`` CLI. Only a
+loopback control authority is treated as co-resident with Hermes. Docker
+aliases, LAN hosts, and remote authorities are external, uncontrolled browser
+boundaries and receive the ordinary private-network navigation policy.
 
 Setup::
 
@@ -39,6 +42,7 @@ import requests
 from hermes_cli.config import cfg_get, load_config, read_raw_config
 from tools.browser_camofox_state import get_camofox_identity
 from tools.registry import tool_error
+from tools.url_safety import is_always_blocked_url, is_safe_url
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +52,9 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT = 30  # fallback when config is unreadable
 _SNAPSHOT_MAX_CHARS = 80_000  # camofox paginates at this limit
+_FINAL_URL_KNOWN = "known"
+_FINAL_URL_UNKNOWN = "unknown"
+_FINAL_URL_QUARANTINED = "quarantined"
 _vnc_url: Optional[str] = None  # cached from /health response
 _vnc_url_checked = False  # only probe once per process
 
@@ -265,6 +272,39 @@ def _is_loopback_hostname(hostname: Optional[str]) -> bool:
         return False
 
 
+def get_camofox_boundary_metadata() -> Dict[str, Any]:
+    """Return the truthful network boundary for the configured control URL.
+
+    This describes placement and current enforcement, not a security claim.
+    Hermes cannot control Camofox subresources, WebSockets, browser-process
+    egress, or DNS resolution through the REST API.
+    """
+    try:
+        parsed = urlsplit(get_camofox_url())
+        authority_is_loopback = (
+            parsed.scheme.lower() in {"http", "https"}
+            and _is_loopback_hostname(parsed.hostname)
+        )
+    except ValueError:
+        authority_is_loopback = False
+
+    return {
+        "execution_location": "co-resident" if authority_is_loopback else "external",
+        "network_boundary": (
+            "local-terminal-shared" if authority_is_loopback else "external-uncontrolled"
+        ),
+        "control_transport": "rest",
+        "control_authority": "loopback" if authority_is_loopback else "non-loopback",
+        "page_egress_enforced": False,
+        "dns_pinned": False,
+    }
+
+
+def is_camofox_co_resident() -> bool:
+    """Return True only for an explicit loopback Camofox control authority."""
+    return get_camofox_boundary_metadata()["control_authority"] == "loopback"
+
+
 def _rewrite_loopback_url_for_camofox(url: str) -> tuple[str, Optional[Dict[str, str]]]:
     """Rewrite loopback page URLs for Docker-hosted Camofox, if configured.
 
@@ -373,6 +413,9 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                 "session_key": identity_override["session_key"],
                 "managed": True,
                 "adopt_existing_tab": _adopt_existing_tab_enabled(camofox_cfg),
+                "browser_boundary": get_camofox_boundary_metadata(),
+                "main_frame_url_state": _FINAL_URL_UNKNOWN,
+                "content_quarantined": False,
             }
         elif bool(camofox_cfg.get("managed_persistence")):
             identity = get_camofox_identity(task_id)
@@ -382,6 +425,9 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                 "session_key": identity["session_key"],
                 "managed": True,
                 "adopt_existing_tab": _adopt_existing_tab_enabled(camofox_cfg),
+                "browser_boundary": get_camofox_boundary_metadata(),
+                "main_frame_url_state": _FINAL_URL_UNKNOWN,
+                "content_quarantined": False,
             }
         else:
             session = {
@@ -390,16 +436,27 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                 "session_key": f"task_{task_id[:16]}",
                 "managed": False,
                 "adopt_existing_tab": False,
+                "browser_boundary": get_camofox_boundary_metadata(),
+                "main_frame_url_state": _FINAL_URL_UNKNOWN,
+                "content_quarantined": False,
             }
+        # An externally adopted tab has no verified main-frame URL yet. Keep
+        # its content unavailable until navigate/back returns an exact safe
+        # URL; a backend name alone is not evidence that the page is public.
+        if _external_camofox(session):
+            session["content_quarantined"] = True
         _sessions[task_id] = session
         return _adopt_existing_tab(session)
 
 
-def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, Any]:
-    """Ensure a tab exists for the session, creating one if needed."""
+def _ensure_tab_with_response(
+    task_id: Optional[str],
+    url: str = "about:blank",
+) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Ensure a tab exists and preserve the server's exact create response."""
     session = _get_session(task_id)
     if session["tab_id"]:
-        return session
+        return session, None
     base = get_camofox_url()
     resp = requests.post(
         f"{base}/tabs",
@@ -414,6 +471,12 @@ def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, A
     resp.raise_for_status()
     data = resp.json()
     session["tab_id"] = data.get("tabId")
+    return session, data
+
+
+def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, Any]:
+    """Ensure a tab exists for the session, creating one if needed."""
+    session, _ = _ensure_tab_with_response(task_id, url)
     return session
 
 
@@ -486,6 +549,133 @@ def _delete(path: str, body: dict = None, timeout: Optional[int] = None) -> dict
 
 
 # ---------------------------------------------------------------------------
+# Network-boundary enforcement
+# ---------------------------------------------------------------------------
+
+def _session_boundary(session: Dict[str, Any]) -> Dict[str, Any]:
+    boundary = session.get("browser_boundary")
+    if not isinstance(boundary, dict):
+        boundary = get_camofox_boundary_metadata()
+        session["browser_boundary"] = boundary
+    return boundary
+
+
+def _with_boundary(payload: Dict[str, Any], session: Dict[str, Any]) -> Dict[str, Any]:
+    payload["browser_boundary"] = dict(_session_boundary(session))
+    return payload
+
+
+def _external_camofox(session: Dict[str, Any]) -> bool:
+    return _session_boundary(session).get("network_boundary") == "external-uncontrolled"
+
+
+def _navigation_policy_error(url: str, session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return a pre-navigation policy error for this Camofox boundary."""
+    if is_always_blocked_url(url):
+        return _with_boundary({
+            "success": False,
+            "error": "Blocked: URL targets a cloud metadata endpoint",
+        }, session)
+    if _external_camofox(session) and not is_safe_url(url):
+        return _with_boundary({
+            "success": False,
+            "error": "Blocked: URL targets a private or internal address",
+        }, session)
+    return None
+
+
+def _quarantine_landed_content(session: Dict[str, Any]) -> bool:
+    """Best-effort blank a tab and keep content unavailable until a safe nav."""
+    session["content_quarantined"] = True
+    session["main_frame_url_state"] = _FINAL_URL_QUARANTINED
+    session.pop("main_frame_url", None)
+    tab_id = session.get("tab_id")
+    if not tab_id:
+        return False
+    try:
+        _post(
+            f"/tabs/{tab_id}/navigate",
+            {"userId": session["user_id"], "url": "about:blank"},
+            timeout=10,
+        )
+        return True
+    except Exception as exc:
+        logger.warning("Could not quarantine Camofox tab %s: %s", tab_id, exc)
+        return False
+
+
+def _landed_url_error(
+    session: Dict[str, Any],
+    data: object,
+    *,
+    action: str,
+) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Validate the exact main-frame URL returned by a Camofox action.
+
+    Camofox has no independent, authoritative URL probe in this integration.
+    A missing URL is therefore reported as unknown and quarantined; the
+    requested URL must never be substituted as proof of where the browser
+    actually landed.
+    """
+    final_url = data.get("url") if isinstance(data, dict) else None
+    if not isinstance(final_url, str) or not final_url.strip():
+        session["main_frame_url_state"] = _FINAL_URL_UNKNOWN
+        session.pop("main_frame_url", None)
+        quarantined = _quarantine_landed_content(session)
+        return None, _with_boundary({
+            "success": False,
+            "error": (
+                f"Camofox {action} completed but the REST response did not include "
+                "the final main-frame URL. The landing state is unknown and "
+                "page content is blocked until a new verified navigation."
+            ),
+            "final_url_state": _FINAL_URL_UNKNOWN,
+            "content_quarantined": True,
+            "quarantine_navigation_succeeded": quarantined,
+        }, session)
+
+    final_url = final_url.strip()
+    if is_always_blocked_url(final_url):
+        quarantined = _quarantine_landed_content(session)
+        return None, _with_boundary({
+            "success": False,
+            "error": f"Blocked: Camofox {action} landed on a cloud metadata endpoint",
+            "final_url_state": _FINAL_URL_KNOWN,
+            "content_quarantined": True,
+            "quarantine_navigation_succeeded": quarantined,
+        }, session)
+
+    if _external_camofox(session) and not is_safe_url(final_url):
+        quarantined = _quarantine_landed_content(session)
+        return None, _with_boundary({
+            "success": False,
+            "error": f"Blocked: Camofox {action} landed on a private or internal address",
+            "final_url_state": _FINAL_URL_KNOWN,
+            "content_quarantined": True,
+            "quarantine_navigation_succeeded": quarantined,
+        }, session)
+
+    session["main_frame_url_state"] = _FINAL_URL_KNOWN
+    session["main_frame_url"] = final_url
+    session["content_quarantined"] = False
+    return final_url, None
+
+
+def _content_access_error(session: Dict[str, Any]) -> Optional[str]:
+    if not session.get("content_quarantined"):
+        return None
+    return json.dumps(_with_boundary({
+        "success": False,
+        "error": (
+            "Blocked: Camofox page content is quarantined because the previous "
+            "navigation result was unsafe or its final main-frame URL was unknown. "
+            "Call browser_navigate with a permitted URL before reading page content."
+        ),
+        "final_url_state": session.get("main_frame_url_state", _FINAL_URL_UNKNOWN),
+    }, session))
+
+
+# ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
 
@@ -494,10 +684,15 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
     try:
         browser_url, rewrite_info = _rewrite_loopback_url_for_camofox(url)
         session = _get_session(task_id)
+        policy_error = _navigation_policy_error(url, session)
+        if policy_error is None and browser_url != url:
+            policy_error = _navigation_policy_error(browser_url, session)
+        if policy_error is not None:
+            return json.dumps(policy_error)
+
         if not session["tab_id"]:
             # Create tab with the target URL directly
-            session = _ensure_tab(task_id, browser_url)
-            data = {"ok": True, "url": browser_url}
+            session, data = _ensure_tab_with_response(task_id, browser_url)
         else:
             # Navigate existing tab — recover from stale tab 404
             try:
@@ -514,15 +709,20 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
                         session["tab_id"],
                     )
                     session["tab_id"] = None
-                    session = _ensure_tab(task_id, browser_url)
-                    data = {"ok": True, "url": browser_url}
+                    session, data = _ensure_tab_with_response(task_id, browser_url)
                 else:
                     raise
-        result = {
+
+        final_url, landed_error = _landed_url_error(session, data, action="navigate")
+        if landed_error is not None:
+            return json.dumps(landed_error)
+
+        result = _with_boundary({
             "success": True,
-            "url": data.get("url", browser_url),
-            "title": data.get("title", ""),
-        }
+            "url": final_url,
+            "final_url_state": _FINAL_URL_KNOWN,
+            "title": data.get("title", "") if isinstance(data, dict) else "",
+        }, session)
         if rewrite_info:
             result["requested_url"] = url
             result["url_rewrite"] = rewrite_info
@@ -577,6 +777,9 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
         session = _get_session(task_id)
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
+        content_error = _content_access_error(session)
+        if content_error is not None:
+            return content_error
 
         data = _get(
             f"/tabs/{session['tab_id']}/snapshot",
@@ -599,11 +802,12 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
             else:
                 snapshot = _truncate_snapshot(snapshot)
 
-        return json.dumps({
+        return json.dumps(_with_boundary({
             "success": True,
             "snapshot": snapshot,
             "element_count": refs_count,
-        })
+            "final_url_state": session.get("main_frame_url_state", _FINAL_URL_UNKNOWN),
+        }, session))
     except Exception as e:
         return tool_error(str(e), success=False)
 
@@ -614,6 +818,9 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
         session = _get_session(task_id)
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
+        content_error = _content_access_error(session)
+        if content_error is not None:
+            return content_error
 
         # Strip @ prefix if present (our tool convention)
         clean_ref = ref.lstrip("@")
@@ -622,11 +829,15 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
             f"/tabs/{session['tab_id']}/click",
             {"userId": session["user_id"], "ref": clean_ref},
         )
-        return json.dumps({
+        final_url, landed_error = _landed_url_error(session, data, action="click")
+        if landed_error is not None:
+            return json.dumps(landed_error)
+        return json.dumps(_with_boundary({
             "success": True,
             "clicked": clean_ref,
-            "url": data.get("url", ""),
-        })
+            "url": final_url,
+            "final_url_state": _FINAL_URL_KNOWN,
+        }, session))
     except Exception as e:
         return tool_error(str(e), success=False)
 
@@ -637,6 +848,9 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
         session = _get_session(task_id)
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
+        content_error = _content_access_error(session)
+        if content_error is not None:
+            return content_error
 
         clean_ref = ref.lstrip("@")
 
@@ -661,7 +875,7 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
             "element": clean_ref,
         }
         response = redact_browser_typed_text_for_display(response, text)
-        return json.dumps(response)
+        return json.dumps(_with_boundary(response, session))
     except Exception as e:
         from agent.display import redact_browser_typed_text_for_display
 
@@ -674,12 +888,15 @@ def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
         session = _get_session(task_id)
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
+        content_error = _content_access_error(session)
+        if content_error is not None:
+            return content_error
 
         _post(
             f"/tabs/{session['tab_id']}/scroll",
             {"userId": session["user_id"], "direction": direction},
         )
-        return json.dumps({"success": True, "scrolled": direction})
+        return json.dumps(_with_boundary({"success": True, "scrolled": direction}, session))
     except Exception as e:
         return tool_error(str(e), success=False)
 
@@ -695,7 +912,14 @@ def camofox_back(task_id: Optional[str] = None) -> str:
             f"/tabs/{session['tab_id']}/back",
             {"userId": session["user_id"]},
         )
-        return json.dumps({"success": True, "url": data.get("url", "")})
+        final_url, landed_error = _landed_url_error(session, data, action="back")
+        if landed_error is not None:
+            return json.dumps(landed_error)
+        return json.dumps(_with_boundary({
+            "success": True,
+            "url": final_url,
+            "final_url_state": _FINAL_URL_KNOWN,
+        }, session))
     except Exception as e:
         return tool_error(str(e), success=False)
 
@@ -706,12 +930,23 @@ def camofox_press(key: str, task_id: Optional[str] = None) -> str:
         session = _get_session(task_id)
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
+        content_error = _content_access_error(session)
+        if content_error is not None:
+            return content_error
 
-        _post(
+        data = _post(
             f"/tabs/{session['tab_id']}/press",
             {"userId": session["user_id"], "key": key},
         )
-        return json.dumps({"success": True, "pressed": key})
+        final_url, landed_error = _landed_url_error(session, data, action="press")
+        if landed_error is not None:
+            return json.dumps(landed_error)
+        return json.dumps(_with_boundary({
+            "success": True,
+            "pressed": key,
+            "url": final_url,
+            "final_url_state": _FINAL_URL_KNOWN,
+        }, session))
     except Exception as e:
         return tool_error(str(e), success=False)
 
@@ -726,7 +961,7 @@ def camofox_close(task_id: Optional[str] = None) -> str:
         _delete(
             f"/sessions/{session['user_id']}",
         )
-        return json.dumps({"success": True, "closed": True})
+        return json.dumps(_with_boundary({"success": True, "closed": True}, session))
     except Exception as e:
         return json.dumps({"success": True, "closed": True, "warning": str(e)})
 
@@ -741,6 +976,9 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
         session = _get_session(task_id)
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
+        content_error = _content_access_error(session)
+        if content_error is not None:
+            return content_error
 
         import re
 
@@ -769,11 +1007,11 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
                 if alt or src:
                     images.append({"src": src, "alt": alt})
 
-        return json.dumps({
+        return json.dumps(_with_boundary({
             "success": True,
             "images": images,
             "count": len(images),
-        })
+        }, session))
     except Exception as e:
         return tool_error(str(e), success=False)
 
@@ -785,6 +1023,9 @@ def camofox_vision(question: str, annotate: bool = False,
         session = _get_session(task_id)
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
+        content_error = _content_access_error(session)
+        if content_error is not None:
+            return content_error
 
         # Get screenshot as binary PNG
         resp = _get_raw(
@@ -862,11 +1103,11 @@ def camofox_vision(question: str, annotate: bool = False,
         from agent.redact import redact_sensitive_text
         analysis = redact_sensitive_text(analysis)
 
-        return json.dumps({
+        return json.dumps(_with_boundary({
             "success": True,
             "analysis": analysis,
             "screenshot_path": screenshot_path,
-        })
+        }, session))
     except Exception as e:
         return tool_error(str(e), success=False)
 
@@ -877,6 +1118,7 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
     Camofox does not expose browser console logs via its REST API.
     Returns an empty result with a note.
     """
+    boundary = get_camofox_boundary_metadata()
     return json.dumps({
         "success": True,
         "console_messages": [],
@@ -885,7 +1127,5 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
         "total_errors": 0,
         "note": "Console log capture is not available with the Camofox backend. "
                 "Use browser_snapshot or browser_vision to inspect page state.",
+        "browser_boundary": boundary,
     })
-
-
-

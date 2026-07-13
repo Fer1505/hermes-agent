@@ -373,6 +373,74 @@ def _allows_private_ip_resolution(hostname: str, scheme: str) -> bool:
     return scheme == "https" and hostname in _TRUSTED_PRIVATE_IP_HOSTS
 
 
+def is_public_network_url(
+    url: str,
+    *,
+    allowed_schemes: frozenset[str] = frozenset({"http", "https"}),
+) -> bool:
+    """Strict public-network DNS preflight for security-sensitive endpoints.
+
+    Unlike :func:`is_safe_url`, this check never honors the global private-URL
+    override or hostname exceptions. Every resolved answer must be public;
+    private, loopback, link-local, reserved, multicast, unspecified, CGNAT,
+    mixed public/private answers, DNS failure, and unparseable answers all fail
+    closed. ``allowed_schemes`` lets non-HTTP control protocols such as CDP
+    websocket URLs reuse the same IP classification.
+
+    This is only a preflight. It does not pin the address used by the eventual
+    HTTP or websocket client, so DNS rebinding remains possible until the
+    caller uses a connection-level validator or an egress relay.
+    """
+    try:
+        parsed = urlparse(url)
+        scheme = (parsed.scheme or "").strip().lower()
+        hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+        if scheme not in allowed_schemes or not hostname:
+            return False
+        if hostname in _BLOCKED_HOSTNAMES:
+            logger.warning("Blocked public-network preflight for internal hostname: %s", hostname)
+            return False
+
+        try:
+            addr_info = socket.getaddrinfo(
+                hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM
+            )
+        except (socket.gaierror, OSError):
+            logger.warning("Blocked public-network preflight — DNS failed for: %s", hostname)
+            return False
+        if not addr_info:
+            return False
+
+        for _family, _, _, _, sockaddr in addr_info:
+            ip_str = sockaddr[0]
+            if "%" in ip_str:
+                ip_str = ip_str.split("%", 1)[0]
+            try:
+                ip = ipaddress.ip_address(ip_str)
+            except ValueError:
+                logger.warning(
+                    "Blocked public-network preflight — unparseable address for: %s",
+                    hostname,
+                )
+                return False
+            if ip in _ALWAYS_BLOCKED_IPS or any(
+                ip in network for network in _ALWAYS_BLOCKED_NETWORKS
+            ) or _is_blocked_ip(ip):
+                logger.warning(
+                    "Blocked public-network preflight for non-public address: %s -> %s",
+                    hostname,
+                    ip_str,
+                )
+                return False
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Blocked public-network preflight after URL validation error: %s",
+            type(exc).__name__,
+        )
+        return False
+
+
 def is_safe_url(url: str) -> bool:
     """Return True if the URL target is not a private/internal address.
 

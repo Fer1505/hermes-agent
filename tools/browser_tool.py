@@ -64,6 +64,7 @@ import time
 import requests
 from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 from agent.auxiliary_client import call_llm
 from agent.redact import redact_cdp_url
 from hermes_constants import agent_browser_runnable, get_hermes_home
@@ -113,12 +114,14 @@ try:
     from tools.url_safety import (
         is_safe_url as _is_safe_url,
         is_always_blocked_url as _is_always_blocked_url,
+        is_public_network_url as _is_public_network_url,
         normalize_url_for_request as _normalize_url_for_request,
         sensitive_query_param_name as _sensitive_query_param_name,
     )
 except Exception:
     _is_safe_url = lambda url: False  # noqa: E731 — fail-closed: block all if safety module unavailable
     _is_always_blocked_url = lambda url: True  # noqa: E731 — fail-closed on the floor too
+    _is_public_network_url = lambda url, **kwargs: False  # noqa: E731 — fail-closed
     _normalize_url_for_request = lambda url: url  # noqa: E731 — best-effort fallback
     _sensitive_query_param_name = lambda url: None  # noqa: E731 — best-effort fallback
 # Browser-provider ABC + registry — PR #25214 moved the per-vendor providers
@@ -126,7 +129,12 @@ except Exception:
 # and into ``plugins/browser/<vendor>/``. The dispatcher consults the
 # registry; the legacy class names are re-exported below as backward-compat
 # shims for callers that import them from this module.
-from agent.browser_provider import BrowserProvider as CloudBrowserProvider  # noqa: F401  (legacy alias)
+from agent.browser_provider import (
+    REMOTE_PROVIDER_EGRESS,
+    BrowserControlTransport,
+    BrowserEgressCapability,
+    BrowserProvider as CloudBrowserProvider,  # noqa: F401  (legacy alias)
+)
 from agent.browser_registry import (  # noqa: F401  (test-patchable surface)
     get_provider as _registry_get_browser_provider,
 )
@@ -140,13 +148,17 @@ from plugins.browser.firecrawl.provider import (  # noqa: F401
     FirecrawlBrowserProvider as FirecrawlProvider,
 )
 from tools.tool_backend_helpers import normalize_browser_cloud_provider
-# Camofox local anti-detection browser backend (optional).
+# Camofox self-hosted anti-detection browser backend (optional).
 # When CAMOFOX_URL is set, all browser operations route through the
 # camofox REST API instead of the agent-browser CLI.
 try:
-    from tools.browser_camofox import is_camofox_mode as _is_camofox_mode
+    from tools.browser_camofox import (
+        is_camofox_co_resident as _is_camofox_co_resident,
+        is_camofox_mode as _is_camofox_mode,
+    )
 except ImportError:
     _is_camofox_mode = lambda: False  # noqa: E731
+    _is_camofox_co_resident = lambda: False  # noqa: E731
 
 logger = logging.getLogger(__name__)
 
@@ -387,7 +399,163 @@ def _get_extraction_model() -> Optional[str]:
     return os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip() or None
 
 
-def _resolve_cdp_override(cdp_url: str) -> str:
+_CDP_PROVENANCE_OPERATOR = "operator-override"
+_CDP_PROVENANCE_CLOUD_PROVIDER = "cloud-provider"
+_PROVIDER_CDP_ALLOWED_SCHEMES = frozenset({"http", "https", "ws", "wss"})
+_PROVIDER_CDP_WEBSOCKET_SCHEMES = frozenset({"ws", "wss"})
+_MAX_CDP_DISCOVERY_BYTES = 64 * 1024
+
+
+def _validated_provider_cdp_parts(
+    endpoint: str,
+    *,
+    allowed_schemes: frozenset[str],
+):
+    """Parse and public-network preflight a provider-returned CDP endpoint."""
+    if not isinstance(endpoint, str):
+        raise ValueError("Provider CDP endpoint must be a string")
+    raw = endpoint.strip()
+    if not raw or any(char.isspace() or ord(char) < 32 for char in raw):
+        raise ValueError("Provider CDP endpoint is empty or malformed")
+    try:
+        parsed = urlsplit(raw)
+        _ = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Provider CDP endpoint is malformed") from exc
+    if parsed.scheme.lower() not in allowed_schemes or not parsed.hostname:
+        raise ValueError("Provider CDP endpoint uses an unsupported URL scheme")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Provider CDP endpoint must not contain URL userinfo credentials")
+    if parsed.fragment:
+        raise ValueError("Provider CDP endpoint must not contain a URL fragment")
+    if not _is_public_network_url(raw, allowed_schemes=allowed_schemes):
+        raise ValueError("Provider CDP endpoint did not pass public-network preflight")
+    return parsed
+
+
+def _cdp_authority(parsed) -> tuple[str, int | None]:
+    """Return a normalized authority, mapping HTTP↔WS default ports."""
+    scheme = parsed.scheme.lower()
+    default_port = 443 if scheme in {"https", "wss"} else 80
+    return ((parsed.hostname or "").lower().rstrip("."), parsed.port or default_port)
+
+
+def _bounded_cdp_discovery_json(response: requests.Response) -> Dict[str, Any]:
+    """Decode a bounded JSON object without buffering an untrusted body."""
+    content_length = response.headers.get("content-length")
+    if isinstance(content_length, str) and content_length.strip().isdigit():
+        if int(content_length) > _MAX_CDP_DISCOVERY_BYTES:
+            raise ValueError("CDP discovery response exceeds the size limit")
+
+    body = bytearray()
+    for chunk in response.iter_content(chunk_size=8192):
+        if not chunk:
+            continue
+        body.extend(chunk)
+        if len(body) > _MAX_CDP_DISCOVERY_BYTES:
+            raise ValueError("CDP discovery response exceeds the size limit")
+    try:
+        payload = json.loads(bytes(body).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("CDP discovery response is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("CDP discovery response must be a JSON object")
+    return payload
+
+
+def _resolve_provider_cdp_endpoint(
+    cdp_url: str,
+    capability: BrowserEgressCapability,
+) -> str:
+    """Resolve a provider endpoint under its explicit, unpinned contract."""
+    parsed = _validated_provider_cdp_parts(
+        cdp_url,
+        allowed_schemes=_PROVIDER_CDP_ALLOWED_SCHEMES,
+    )
+    scheme = parsed.scheme.lower()
+
+    # A concrete websocket is already the final control endpoint. A bare
+    # websocket authority (with no path/query) retains legacy discovery
+    # behavior by mapping ws→http and wss→https.
+    if scheme in _PROVIDER_CDP_WEBSOCKET_SCHEMES and (
+        parsed.path not in {"", "/"} or parsed.query
+    ):
+        return cdp_url.strip()
+
+    if scheme in _PROVIDER_CDP_WEBSOCKET_SCHEMES:
+        discovery_scheme = "https" if scheme == "wss" else "http"
+        parsed = urlsplit(
+            urlunsplit(
+                (discovery_scheme, parsed.netloc, parsed.path, parsed.query, "")
+            )
+        )
+
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/json/version"):
+        path = f"{path}/json/version" if path else "/json/version"
+    version_url = urlunsplit(
+        (parsed.scheme, parsed.netloc, path, parsed.query, "")
+    )
+    discovery_parts = _validated_provider_cdp_parts(
+        version_url,
+        allowed_schemes=frozenset({"http", "https"}),
+    )
+
+    response = None
+    try:
+        response = requests.get(
+            version_url,
+            timeout=10,
+            allow_redirects=False,
+            stream=True,
+        )
+        if 300 <= response.status_code < 400:
+            raise ValueError("CDP discovery redirects are not allowed")
+        response.raise_for_status()
+        payload = _bounded_cdp_discovery_json(response)
+    except Exception as exc:
+        logger.warning(
+            "Provider CDP discovery failed for %s: %s",
+            _sanitize_url_for_logs(version_url),
+            type(exc).__name__,
+        )
+        raise RuntimeError(
+            f"Provider CDP discovery failed ({type(exc).__name__})"
+        ) from None
+    finally:
+        if response is not None:
+            response.close()
+
+    ws_url = payload.get("webSocketDebuggerUrl")
+    if not isinstance(ws_url, str) or not ws_url.strip():
+        raise ValueError("CDP discovery did not return webSocketDebuggerUrl")
+    ws_url = ws_url.strip()
+    websocket_parts = _validated_provider_cdp_parts(
+        ws_url,
+        allowed_schemes=_PROVIDER_CDP_WEBSOCKET_SCHEMES,
+    )
+    if (
+        _cdp_authority(discovery_parts) != _cdp_authority(websocket_parts)
+        and not capability.allows_cross_authority_cdp_discovery
+    ):
+        raise ValueError(
+            "Provider CDP discovery returned a cross-authority websocket "
+            "without declaring that behavior"
+        )
+    logger.info(
+        "Resolved provider CDP endpoint %s -> %s (public preflight; DNS unpinned)",
+        _sanitize_url_for_logs(version_url),
+        _sanitize_url_for_logs(ws_url),
+    )
+    return ws_url
+
+
+def _resolve_cdp_override(
+    cdp_url: str,
+    *,
+    provenance: str = _CDP_PROVENANCE_OPERATOR,
+    source_contract: Optional[BrowserEgressCapability] = None,
+) -> str:
     """Normalize a user-supplied CDP endpoint into a concrete connectable URL.
 
     Accepts:
@@ -399,6 +567,13 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     webSocketDebuggerUrl so downstream tools always receive a concrete browser
     websocket instead of an ambiguous host:port URL.
     """
+    if provenance == _CDP_PROVENANCE_CLOUD_PROVIDER:
+        if not isinstance(source_contract, BrowserEgressCapability):
+            raise ValueError("Provider CDP endpoint requires an egress source contract")
+        return _resolve_provider_cdp_endpoint(cdp_url, source_contract)
+    if provenance != _CDP_PROVENANCE_OPERATOR:
+        raise ValueError("Unknown CDP endpoint provenance")
+
     raw = (cdp_url or "").strip()
     if not raw:
         return ""
@@ -419,10 +594,18 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     else:
         version_url = discovery_url.rstrip("/") + "/json/version"
 
+    response = None
     try:
-        response = requests.get(version_url, timeout=10)
+        response = requests.get(
+            version_url,
+            timeout=10,
+            allow_redirects=False,
+            stream=True,
+        )
+        if 300 <= response.status_code < 400:
+            raise ValueError("CDP discovery redirects are not allowed")
         response.raise_for_status()
-        payload = response.json()
+        payload = _bounded_cdp_discovery_json(response)
     except Exception as exc:
         logger.warning(
             "Failed to resolve CDP endpoint %s via %s: %s",
@@ -431,6 +614,9 @@ def _resolve_cdp_override(cdp_url: str) -> str:
             _sanitize_url_for_logs(exc),
         )
         return raw
+    finally:
+        if response is not None:
+            response.close()
 
     ws_url = str(payload.get("webSocketDebuggerUrl") or "").strip()
     if ws_url:
@@ -610,6 +796,47 @@ _cached_browser_engine: Optional[str] = None
 _browser_engine_resolved = False
 
 
+class _FailedConfiguredBrowserProvider(CloudBrowserProvider):
+    """Fail-closed stand-in for an explicit provider that cannot be loaded."""
+
+    def __init__(self, configured_name: str, reason: str) -> None:
+        self._configured_name = configured_name
+        self._reason = reason
+        self.configuration_error = True
+
+    @property
+    def name(self) -> str:
+        return self._configured_name
+
+    @property
+    def display_name(self) -> str:
+        return self._configured_name
+
+    @property
+    def egress_capability(self) -> BrowserEgressCapability:
+        return REMOTE_PROVIDER_EGRESS
+
+    def is_available(self) -> bool:
+        return False
+
+    def create_session(self, task_id: str) -> Dict[str, object]:
+        raise RuntimeError(
+            f"Configured browser cloud provider {self._configured_name!r} "
+            f"is unavailable: {self._reason}"
+        )
+
+    def close_session(self, session_id: str) -> bool:
+        return False
+
+    def emergency_cleanup(self, session_id: str) -> None:
+        return None
+
+
+def _failed_configured_provider(name: str, reason: str) -> CloudBrowserProvider:
+    """Return a non-local backend marker without poisoning the resolver cache."""
+    return _FailedConfiguredBrowserProvider(name, reason)
+
+
 def _is_legacy_provider_registry_overridden() -> bool:
     """Return True when a test has patched ``_PROVIDER_REGISTRY`` to a custom value.
 
@@ -663,6 +890,10 @@ def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
     historic auto-detect order, now expressed as the
     :data:`agent.browser_registry._LEGACY_PREFERENCE` walk.
 
+    An explicitly configured provider is authoritative. Unknown names and
+    construction failures return a fail-closed provider marker; they never
+    enter auto-detect or silently select a local browser.
+
     Selection routes through :mod:`agent.browser_registry` so third-party
     browser plugins (``~/.hermes/plugins/browser/<vendor>/``) participate
     in explicit-config resolution. Test fixtures that override
@@ -696,32 +927,36 @@ def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
                     factory = _PROVIDER_REGISTRY.get(provider_key)
                     if factory is not None:
                         resolved = factory()
+                    else:
+                        return _failed_configured_provider(
+                            provider_key, "no provider with that name is registered"
+                        )
                 else:
                     # Ensure plugins are discovered so the registry is
                     # populated. Idempotent — cheap on subsequent calls.
                     _ensure_browser_plugins_loaded()
                     resolved = _registry_get_browser_provider(provider_key)
                     if resolved is None:
-                        # Explicit config name unknown to the registry —
-                        # might be a typo, an uninstalled plugin, or a
-                        # registry-population failure. Warn the user
-                        # (legacy code would have surfaced a typed
-                        # credentials error via direct class instantiation;
-                        # post-migration we surface this WARNING instead).
                         logger.warning(
                             "browser.cloud_provider=%r is not a registered "
-                            "browser plugin; falling back to auto-detect "
-                            "(install the corresponding plugin or fix the "
-                            "config key spelling).",
+                            "browser plugin; refusing automatic or local fallback "
+                            "(install the plugin or fix the config key spelling).",
                             provider_key,
                         )
-            except Exception:
+                        return _failed_configured_provider(
+                            provider_key, "no provider with that name is registered"
+                        )
+            except Exception as exc:
                 logger.warning(
-                    "Failed to instantiate explicit cloud_provider %r; will retry on next call",
+                    "Failed to instantiate explicit cloud_provider %r; refusing "
+                    "automatic or local fallback and retrying resolution on the next call",
                     provider_key,
                     exc_info=True,
                 )
-                return None
+                return _failed_configured_provider(
+                    provider_key,
+                    f"provider initialization failed ({type(exc).__name__})",
+                )
     except Exception as e:
         # Config file may be temporarily unreadable; still try auto-detect so
         # env-based / managed-gateway credentials can resolve. Don't pin cache.
@@ -788,12 +1023,10 @@ def _is_local_mode() -> bool:
 def _is_local_backend() -> bool:
     """Return True when the browser runs locally AND the terminal is also local.
 
-    SSRF protection is only meaningful for cloud backends (Browserbase,
-    BrowserUse) where the agent could reach internal resources on a remote
-    machine.  For local backends — Camofox, or the built-in headless
-    Chromium without a cloud provider — the user already has full terminal
-    and network access on the same machine, so the check adds no security
-    value.
+    SSRF protection is required whenever page traffic originates outside the
+    local terminal's network position. A Camofox REST backend is co-resident
+    only when its configured control authority is loopback; Docker aliases,
+    LAN names, and remote authorities are external and uncontrolled.
 
     However, when the terminal runs in a container (docker, modal, daytona,
     ssh, singularity), the browser on the host can access internal networks
@@ -814,13 +1047,13 @@ def _is_local_backend() -> bool:
     # non-local; keep the two helpers in agreement.
     if _get_cdp_override():
         return False
+    terminal_backend = os.getenv("TERMINAL_ENV", "local").strip().lower()
     if _is_camofox_mode():
-        return True
+        return _is_camofox_co_resident() and terminal_backend in ("local", "")
     if _get_cloud_provider() is not None:
         return False
     # When terminal runs in a container, browser on host can access
     # internal networks the terminal can't → treat as non-local.
-    terminal_backend = os.getenv("TERMINAL_ENV", "local").strip().lower()
     return terminal_backend in ("local", "")
 
 
@@ -1262,7 +1495,8 @@ def _navigation_session_key(task_id: str, url: str) -> str:
          default True).
       3. The URL resolves to a private/LAN/loopback address.
       4. A CDP override is not active (that path owns the whole session).
-      5. Camofox mode is not active (Camofox is already local-only).
+      5. Camofox mode is not active (its REST adapter enforces its own
+         co-resident/external boundary and does not use Chromium sidecars).
 
     When all are true, returns ``f"{task_id}::local"`` so the hybrid-routing
     path spawns a local Chromium sidecar while the cloud session (if any)
@@ -1274,7 +1508,12 @@ def _navigation_session_key(task_id: str, url: str) -> str:
         return task_id
     if _is_camofox_mode():
         return task_id
-    if _get_cloud_provider() is None:
+    provider = _get_cloud_provider()
+    if provider is None:
+        return task_id
+    # A typo or unloadable explicit provider must fail on the cloud-session
+    # path. It must not qualify for the private-URL local-sidecar exception.
+    if getattr(provider, "configuration_error", False) is True:
         return task_id
     if not _auto_local_for_private_urls():
         return task_id
@@ -1994,7 +2233,133 @@ def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
         "bb_session_id": None,
         "cdp_url": cdp_url,
         "features": {"cdp_override": True},
+        "cdp_endpoint": {
+            "provenance": _CDP_PROVENANCE_OPERATOR,
+            "network_policy": "operator-trusted-unpinned",
+        },
     }
+
+
+def _allow_local_fallback_on_cloud_failure() -> bool:
+    """Return the explicit config.yaml opt-in for degraded local execution."""
+    try:
+        from hermes_cli.config import read_raw_config
+
+        return is_truthy_value(
+            cfg_get(
+                read_raw_config(),
+                "browser",
+                "allow_local_fallback_on_cloud_failure",
+                default=False,
+            ),
+            default=False,
+        )
+    except Exception as exc:
+        logger.debug("Could not read cloud fallback policy; failing closed: %s", exc)
+        return False
+
+
+def _provider_egress_capability(
+    provider: CloudBrowserProvider,
+) -> BrowserEgressCapability:
+    """Resolve and validate the provider's explicit egress contract."""
+    if getattr(type(provider), "egress_capability", None) is None:
+        raise ValueError(
+            f"Cloud provider {type(provider).__name__} does not declare an "
+            "egress_capability contract"
+        )
+    capability = provider.egress_capability
+    if not isinstance(capability, BrowserEgressCapability):
+        raise ValueError(
+            f"Cloud provider {type(provider).__name__} returned an invalid "
+            "egress_capability contract"
+        )
+    return capability
+
+
+def _validate_cloud_session(
+    provider: CloudBrowserProvider,
+    session_info: object,
+) -> Dict[str, Any]:
+    """Validate cloud metadata before it can select the CDP backend."""
+    if not isinstance(session_info, dict) or not session_info:
+        raise ValueError(f"Cloud provider returned invalid session: {session_info!r}")
+
+    validated = dict(session_info)
+    for key in ("session_name", "bb_session_id"):
+        value = validated.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"Cloud provider returned invalid session metadata: {key} "
+                "must be a non-empty string"
+            )
+    if not isinstance(validated.get("features"), dict):
+        raise ValueError(
+            "Cloud provider returned invalid session metadata: features must be a dict"
+        )
+
+    capability = _provider_egress_capability(provider)
+    if (
+        capability.control_transport is not BrowserControlTransport.CDP
+        or not capability.requires_cdp_url
+    ):
+        raise ValueError(
+            f"Cloud provider {type(provider).__name__} declares an unsupported "
+            "egress transport contract"
+        )
+
+    raw_cdp_url = validated.get("cdp_url")
+    if not isinstance(raw_cdp_url, str) or not raw_cdp_url.strip():
+        raise ValueError(
+            "Cloud provider returned invalid session metadata: cdp_url must be "
+            "a non-empty websocket URL"
+        )
+    resolved_cdp_url = _resolve_cdp_override(
+        raw_cdp_url,
+        provenance=_CDP_PROVENANCE_CLOUD_PROVIDER,
+        source_contract=capability,
+    )
+    parsed = urlsplit(resolved_cdp_url)
+    try:
+        _ = parsed.port
+    except ValueError:
+        invalid_port = True
+    else:
+        invalid_port = False
+    if (
+        parsed.scheme.lower() not in {"ws", "wss"}
+        or not parsed.hostname
+        or invalid_port
+        or any(char.isspace() or ord(char) < 32 for char in resolved_cdp_url)
+    ):
+        raise ValueError(
+            "Cloud provider returned invalid session metadata: cdp_url must "
+            "resolve to a ws:// or wss:// endpoint"
+        )
+
+    validated["cdp_url"] = resolved_cdp_url
+    validated["egress"] = capability.as_session_metadata()
+    validated["cdp_endpoint"] = {
+        "provenance": _CDP_PROVENANCE_CLOUD_PROVIDER,
+        "network_policy": "public-preflight-unpinned",
+    }
+    return validated
+
+
+def _close_rejected_cloud_session(
+    provider: CloudBrowserProvider,
+    session_info: object,
+) -> None:
+    """Best-effort cleanup when a created cloud session fails validation."""
+    if not isinstance(session_info, dict):
+        return
+    session_id = session_info.get("bb_session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        return
+    try:
+        provider.close_session(session_id)
+    except Exception as exc:
+        logger.warning("Could not close rejected cloud browser session: %s", exc)
 
 
 def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
@@ -2046,21 +2411,27 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
         if provider is None:
             session_info = _create_local_session(task_id)
         else:
+            created_session: object = None
             try:
-                session_info = provider.create_session(task_id)
-                # Validate cloud provider returned a usable session
-                if not session_info or not isinstance(session_info, dict):
-                    raise ValueError(f"Cloud provider returned invalid session: {session_info!r}")
-                if session_info.get("cdp_url"):
-                    # Some cloud providers (including Browser-Use v3) return an HTTP
-                    # CDP discovery URL instead of a raw websocket endpoint.
-                    session_info = dict(session_info)
-                    session_info["cdp_url"] = _resolve_cdp_override(str(session_info["cdp_url"]))
+                created_session = provider.create_session(task_id)
+                session_info = _validate_cloud_session(provider, created_session)
             except Exception as e:
                 provider_name = type(provider).__name__
+                _close_rejected_cloud_session(provider, created_session)
+                if getattr(provider, "configuration_error", False) is True:
+                    raise RuntimeError(
+                        f"Cloud provider configuration failed closed: {e}"
+                    ) from e
+                if not _allow_local_fallback_on_cloud_failure():
+                    raise RuntimeError(
+                        f"Cloud provider {provider_name} failed ({e}). Local browser "
+                        "fallback is disabled by default; set "
+                        "browser.allow_local_fallback_on_cloud_failure: true in "
+                        "config.yaml to opt in."
+                    ) from e
                 logger.warning(
-                    "Cloud provider %s failed (%s); attempting fallback to local "
-                    "Chromium for task %s",
+                    "Cloud provider %s failed (%s); explicit policy permits fallback "
+                    "to local Chromium for task %s",
                     provider_name, e, task_id,
                     exc_info=True,
                 )
@@ -2729,9 +3100,10 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         })
 
     # SSRF protection — block private/internal addresses before navigating.
-    # Skipped for local backends (Camofox, headless Chromium without a cloud
-    # provider) because the agent already has full local network access via
-    # the terminal tool.  Also skipped when hybrid routing will auto-spawn a
+    # Skipped only when the browser shares the local terminal's network
+    # position (loopback-controlled Camofox or local headless Chromium).
+    # External Camofox authorities are uncontrolled remote boundaries. Also
+    # skipped when hybrid routing will auto-spawn a
     # local Chromium sidecar for this URL (cloud provider configured +
     # private URL + ``browser.auto_local_for_private_urls`` enabled) — the
     # cloud provider never sees the URL in that case.  Can also be opted
@@ -3694,9 +4066,27 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
 
 def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate JS via Camofox's /tabs/{tab_id}/eval endpoint (if available)."""
-    from tools.browser_camofox import _ensure_tab, _post
+    from tools.browser_camofox import (
+        _content_access_error,
+        _ensure_tab,
+        _external_camofox,
+        _post,
+        _with_boundary,
+    )
     try:
         tab_info = _ensure_tab(task_id or "default")
+        content_error = _content_access_error(tab_info)
+        if content_error is not None:
+            return content_error
+        if _external_camofox(tab_info):
+            return json.dumps(_with_boundary({
+                "success": False,
+                "error": (
+                    "Blocked: JavaScript evaluation is unavailable for an external "
+                    "Camofox boundary because the REST API cannot independently "
+                    "verify the final main-frame URL after script execution."
+                ),
+            }, tab_info))
         tab_id = tab_info.get("tab_id") or tab_info.get("id")
         resp = _post(f"/tabs/{tab_id}/evaluate", body={"expression": expression, "userId": tab_info["user_id"]})
 

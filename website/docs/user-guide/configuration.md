@@ -1775,6 +1775,9 @@ browser:
   # Optional CDP override — when set, Hermes attaches directly to your own
   # Chromium-family browser (via /browser connect) rather than starting a headless browser.
   cdp_url: ""
+  # Expose unrestricted raw CDP commands to the model. Keep false unless the
+  # attached browser/session and page content are fully trusted.
+  allow_raw_cdp: false
   # Dialog supervisor — controls how native JS dialogs (alert / confirm / prompt)
   # are handled when a CDP backend is attached (Browserbase, local Chromium-family
   # browser via /browser connect). Ignored on Camofox and default local agent-browser mode.

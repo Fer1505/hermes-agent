@@ -1,9 +1,9 @@
 """Tests that browser_navigate SSRF checks respect local-backend mode and
 the allow_private_urls setting.
 
-Local backends (Camofox, headless Chromium without a cloud provider) skip
-SSRF checks entirely — the agent already has full local-network access via
-the terminal tool.
+Local backends (loopback-controlled Camofox, headless Chromium without a cloud
+provider) skip ordinary private-network checks when the terminal is local.
+External Camofox authorities do not inherit that exemption.
 
 Cloud backends (Browserbase, BrowserUse) enforce SSRF by default.  Users
 can opt out for cloud mode via ``browser.allow_private_urls: true``.
@@ -170,11 +170,22 @@ class TestPreNavigationSsrf:
 
 class TestIsLocalBackend:
     def test_camofox_is_local(self, monkeypatch):
-        """Camofox mode counts as a local backend."""
+        """Loopback-controlled Camofox with a local terminal is co-resident."""
         monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: True)
+        monkeypatch.setattr(browser_tool, "_is_camofox_co_resident", lambda: True)
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: "anything")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
 
         assert browser_tool._is_local_backend() is True
+
+    @pytest.mark.parametrize("control_host", ["camofox", "192.168.1.20", "browser.example.com"])
+    def test_external_camofox_is_not_local(self, monkeypatch, control_host):
+        monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: True)
+        monkeypatch.setattr(browser_tool, "_is_camofox_co_resident", lambda: False)
+        monkeypatch.setenv("CAMOFOX_URL", f"http://{control_host}:9377")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+
+        assert browser_tool._is_local_backend() is False
 
     def test_no_cloud_provider_is_local(self, monkeypatch):
         """No cloud provider configured → local backend."""
@@ -215,13 +226,14 @@ class TestIsLocalBackend:
 
         assert browser_tool._is_local_backend() is True
 
-    def test_camofox_overrides_container_backend(self, monkeypatch):
-        """Camofox mode always counts as local, even with container terminal."""
+    def test_camofox_loopback_does_not_override_container_terminal(self, monkeypatch):
+        """A sandboxed terminal does not share even loopback Camofox egress."""
         monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: True)
+        monkeypatch.setattr(browser_tool, "_is_camofox_co_resident", lambda: True)
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: None)
         monkeypatch.setenv("TERMINAL_ENV", "docker")
 
-        assert browser_tool._is_local_backend() is True
+        assert browser_tool._is_local_backend() is False
 
 
 # ---------------------------------------------------------------------------

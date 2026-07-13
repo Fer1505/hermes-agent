@@ -153,6 +153,59 @@ http_access deny all
 
 Adjust the allowlist to match your LLM provider and messaging platform.
 
+## Cloud Browser Control Endpoints
+
+Cloud browser providers return a Chrome DevTools Protocol (CDP) endpoint that
+Hermes uses as a control channel. Provider-returned endpoints are not treated
+like operator-supplied `browser.cdp_url` overrides:
+
+- provider discovery and websocket URLs must use an expected HTTP(S) or WS(S)
+  scheme, contain no URL userinfo credentials, and resolve only to public
+  addresses;
+- mixed public/private DNS answers, private, loopback, link-local, reserved,
+  multicast, unspecified, CGNAT, and failed DNS resolution are rejected;
+- discovery responses do not follow redirects and their decoded JSON body is
+  capped at 64 KiB;
+- the returned websocket URL is validated again; a different authority is
+  accepted only when that provider explicitly declares cross-authority CDP
+  discovery in its capability contract.
+
+This is a fail-closed DNS preflight, not connection pinning. The discovery
+HTTP client, CDP supervisor, stateless websocket client, and `agent-browser`
+can resolve the hostname again when connecting. A connection-level validator
+or egress relay is still required to close that DNS-rebinding window.
+
+Explicit operator CDP overrides retain private and loopback support for local
+Chrome workflows. They are recorded as operator-trusted, unpinned endpoints;
+their HTTP discovery responses still use the same no-redirect, bounded parser.
+
+## Camofox Browser Boundary
+
+Camofox uses a REST control plane rather than CDP. Hermes classifies it from
+the configured `CAMOFOX_URL` authority, not from the backend name:
+
+- `localhost`, an address in `127.0.0.0/8`, and `::1` are co-resident control
+  authorities;
+- Docker aliases, `host.docker.internal`, LAN hosts, and remote authorities
+  are `external-uncontrolled` and do not inherit the local-terminal SSRF
+  exemption;
+- an external Camofox receives the ordinary private/internal URL policy unless
+  the operator explicitly enables private URLs; the cloud-metadata floor is
+  unconditional for both co-resident and external Camofox.
+
+Hermes validates the final main-frame URL returned by Camofox after navigate,
+click, key press, and back actions. An unsafe landing is quarantined and page
+content is withheld. If the REST response omits that URL, Hermes records the
+state as unknown and does not substitute the requested URL as evidence.
+
+The resulting session/tool metadata reports the execution location, network
+boundary, REST control transport, and that page egress and DNS pinning are not
+enforced. These checks govern only URLs visible at the REST action boundary.
+They cannot constrain subresources, page WebSockets, DNS rebinding between the
+check and browser connection, or browser-process egress. External deployments
+need a mandatory outbound proxy, OS firewall, or egress relay for those
+guarantees.
+
 ## Validating the Setup
 
 After bringing up the stack, verify isolation:

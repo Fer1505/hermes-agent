@@ -10,6 +10,7 @@ import asyncio
 import json
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List
 
 import pytest
@@ -18,6 +19,20 @@ import websockets
 from websockets.asyncio.server import serve
 
 from tools import browser_cdp_tool
+
+
+def _write_raw_cdp_config(value: str) -> Path:
+    """Write one raw-CDP config value into the isolated test HERMES_HOME."""
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home()
+    home.mkdir(parents=True, exist_ok=True)
+    config_path = home / "config.yaml"
+    config_path.write_text(
+        f"browser:\n  allow_raw_cdp: {value}\n",
+        encoding="utf-8",
+    )
+    return config_path
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +258,119 @@ def test_browser_level_redacts_secret_result(cdp_server):
     assert result["result"]["result"]["value"].startswith("sk-")
 
 
+def test_stateless_result_redacts_opaque_credentials_and_cookie_values(cdp_server):
+    cdp_server.on(
+        "Network.getAllCookies",
+        lambda params, sid: {
+            "cookies": [
+                {
+                    "name": "sessionid",
+                    "value": "opaque-cookie-value-without-known-prefix",
+                    "domain": "example.test",
+                }
+            ],
+            "headers": {
+                "Authorization": "Bearer opaque-auth-value",
+                "Cookie": "sessionid=opaque-cookie-value",
+                "X-Public": "visible",
+            },
+            "accessToken": "opaque-access-value",
+        },
+    )
+
+    result = json.loads(
+        browser_cdp_tool.browser_cdp(method="Network.getAllCookies")
+    )["result"]
+
+    assert result["cookies"][0] == {
+        "name": "sessionid",
+        "value": "«redacted-secret»",
+        "domain": "example.test",
+    }
+    assert result["headers"]["Authorization"] == "«redacted-secret»"
+    assert result["headers"]["Cookie"] == "«redacted-secret»"
+    assert result["headers"]["X-Public"] == "visible"
+    assert result["accessToken"] == "«redacted-secret»"
+
+
+def test_supervisor_frame_result_uses_same_recursive_redaction(monkeypatch):
+    from tools import browser_supervisor
+    from agent import async_utils
+
+    class _Snapshot:
+        frame_tree = {
+            "top": None,
+            "children": [
+                {
+                    "frame_id": "frame-secret",
+                    "session_id": "session-secret",
+                }
+            ],
+        }
+
+    class _Loop:
+        @staticmethod
+        def is_running():
+            return True
+
+    class _Supervisor:
+        _loop = _Loop()
+
+        @staticmethod
+        def snapshot():
+            return _Snapshot()
+
+        @staticmethod
+        async def _cdp(method, params, *, session_id, timeout):
+            return {
+                "result": {
+                    "cookies": [
+                        {
+                            "name": "sessionid",
+                            "value": "opaque-frame-cookie",
+                            "domain": "frame.test",
+                        }
+                    ],
+                    "refresh_token": "opaque-frame-token",
+                    "public": "visible",
+                }
+            }
+
+    class _Completed:
+        def __init__(self, coro):
+            self._coro = coro
+
+        def result(self, timeout=None):
+            return asyncio.run(self._coro)
+
+    monkeypatch.setattr(
+        browser_supervisor.SUPERVISOR_REGISTRY,
+        "get",
+        lambda task_id: _Supervisor(),
+    )
+    monkeypatch.setattr(
+        async_utils,
+        "safe_schedule_threadsafe",
+        lambda coro, loop: _Completed(coro),
+    )
+
+    result = json.loads(
+        browser_cdp_tool.browser_cdp(
+            method="Network.getAllCookies",
+            frame_id="frame-secret",
+            task_id="task-secret",
+        )
+    )["result"]
+
+    assert result["cookies"][0] == {
+        "name": "sessionid",
+        "value": "«redacted-secret»",
+        "domain": "frame.test",
+    }
+    assert result["refresh_token"] == "«redacted-secret»"
+    assert result["public"] == "visible"
+
+
 def test_empty_params_sends_empty_object(cdp_server):
     cdp_server.on("Browser.getVersion", lambda params, sid: {"product": "Mock/1.0"})
     json.loads(browser_cdp_tool.browser_cdp(method="Browser.getVersion"))
@@ -393,6 +521,12 @@ def test_dispatch_through_registry(cdp_server):
 # ---------------------------------------------------------------------------
 
 
+def test_default_config_keeps_raw_cdp_model_tool_disabled():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["browser"]["allow_raw_cdp"] is False
+
+
 def test_check_fn_false_when_no_cdp_url(monkeypatch):
     """Gate closes when no CDP URL is set — even if the browser toolset is
     otherwise configured."""
@@ -400,17 +534,43 @@ def test_check_fn_false_when_no_cdp_url(monkeypatch):
 
     monkeypatch.setattr(bt, "check_browser_requirements", lambda: True)
     monkeypatch.setattr(bt, "_get_cdp_override", lambda: "")
+    _write_raw_cdp_config("true")
     assert browser_cdp_tool._browser_cdp_check() is False
 
 
-def test_check_fn_true_when_cdp_url_set(monkeypatch):
-    """Gate opens as soon as a CDP URL is resolvable."""
+def test_check_fn_false_without_explicit_raw_cdp_opt_in(monkeypatch):
+    """A reachable endpoint alone must not expose unrestricted raw CDP."""
     import tools.browser_tool as bt
 
     monkeypatch.setattr(bt, "check_browser_requirements", lambda: True)
     monkeypatch.setattr(
         bt, "_get_cdp_override", lambda: "ws://localhost:9222/devtools/browser/x"
     )
+    _write_raw_cdp_config("false")
+    assert browser_cdp_tool._browser_cdp_check() is False
+
+
+def test_check_fn_quoted_false_stays_false(monkeypatch):
+    """Strict bool normalization must not treat quoted 'false' as truthy."""
+    import tools.browser_tool as bt
+
+    monkeypatch.setattr(bt, "check_browser_requirements", lambda: True)
+    monkeypatch.setattr(
+        bt, "_get_cdp_override", lambda: "ws://localhost:9222/devtools/browser/x"
+    )
+    _write_raw_cdp_config('"false"')
+    assert browser_cdp_tool._browser_cdp_check() is False
+
+
+def test_check_fn_true_when_opted_in_and_cdp_url_set(monkeypatch):
+    """Gate opens only when config opt-in and endpoint requirements both hold."""
+    import tools.browser_tool as bt
+
+    monkeypatch.setattr(bt, "check_browser_requirements", lambda: True)
+    monkeypatch.setattr(
+        bt, "_get_cdp_override", lambda: "ws://localhost:9222/devtools/browser/x"
+    )
+    _write_raw_cdp_config("true")
     assert browser_cdp_tool._browser_cdp_check() is True
 
 
@@ -423,4 +583,32 @@ def test_check_fn_false_when_browser_requirements_fail(monkeypatch):
     monkeypatch.setattr(
         bt, "_get_cdp_override", lambda: "ws://localhost:9222/devtools/browser/x"
     )
+    _write_raw_cdp_config("true")
     assert browser_cdp_tool._browser_cdp_check() is False
+
+
+def test_registry_exposure_tracks_real_config_opt_in(monkeypatch):
+    """Real registered entry is filtered until raw CDP is explicitly enabled."""
+    import tools.browser_tool as bt
+    from tools import browser_dialog_tool
+    from tools.registry import invalidate_check_fn_cache, registry
+
+    monkeypatch.setattr(bt, "check_browser_requirements", lambda: True)
+    monkeypatch.setattr(
+        bt, "_get_cdp_override", lambda: "ws://localhost:9222/devtools/browser/x"
+    )
+
+    _write_raw_cdp_config('"false"')
+    invalidate_check_fn_cache()
+    definitions = registry.get_definitions({"browser_cdp", "browser_dialog"})
+    assert [item["function"]["name"] for item in definitions] == ["browser_dialog"]
+    assert browser_dialog_tool._browser_dialog_check() is True
+    assert browser_cdp_tool._browser_cdp_check() is False
+
+    _write_raw_cdp_config("true")
+    invalidate_check_fn_cache()
+    definitions = registry.get_definitions({"browser_cdp", "browser_dialog"})
+    assert [item["function"]["name"] for item in definitions] == [
+        "browser_cdp",
+        "browser_dialog",
+    ]

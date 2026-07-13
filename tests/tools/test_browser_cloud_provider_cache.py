@@ -6,8 +6,9 @@ must not be cached for the lifetime of the process. Cache only when:
 * The user explicitly opts in to ``cloud_provider: local``, OR
 * A provider is successfully resolved.
 
-All other ``None`` outcomes (no credentials yet, config read error, explicit
-provider instantiation failure) leave the cache unset so the next call retries.
+Transient auto-detect ``None`` outcomes leave the cache unset so the next call
+retries. Explicit invalid providers return a non-local fail-closed marker and
+also remain uncached so repaired plugin/config state can recover.
 """
 import logging
 from unittest.mock import Mock
@@ -103,7 +104,7 @@ class TestCloudProviderCachePolicy:
     def test_explicit_provider_instantiation_failure_does_not_cache(
         self, monkeypatch, caplog
     ):
-        """If `_PROVIDER_REGISTRY[key]()` raises, log warning and don't cache."""
+        """A broken explicit provider fails closed without poisoning retry."""
         def exploding_factory():
             raise RuntimeError("missing dependency")
 
@@ -116,10 +117,34 @@ class TestCloudProviderCachePolicy:
         )
 
         with caplog.at_level(logging.WARNING, logger="tools.browser_tool"):
-            assert browser_tool._get_cloud_provider() is None
+            failed = browser_tool._get_cloud_provider()
 
+        assert failed is not None
+        assert failed.configuration_error is True
+        with pytest.raises(RuntimeError, match="provider initialization failed"):
+            failed.create_session("task")
         assert browser_tool._cloud_provider_resolved is False
         assert any(
             "browser-use" in r.message and r.levelno == logging.WARNING
             for r in caplog.records
         )
+
+    def test_explicit_unknown_provider_is_not_auto_detected_or_local(
+        self, monkeypatch
+    ):
+        """A typo is represented as a failing cloud backend, never as None."""
+        monkeypatch.setattr(
+            browser_tool,
+            "_PROVIDER_REGISTRY",
+            {"browser-use": browser_tool.BrowserUseProvider},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.read_raw_config",
+            lambda: {"browser": {"cloud_provider": "typo-provider"}},
+        )
+
+        failed = browser_tool._get_cloud_provider()
+
+        assert failed is not None
+        assert failed.configuration_error is True
+        assert browser_tool._is_local_mode() is False

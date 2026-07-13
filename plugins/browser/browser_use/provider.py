@@ -36,7 +36,11 @@ from typing import Any, Dict, Optional
 
 import requests
 
-from agent.browser_provider import BrowserProvider
+from agent.browser_provider import (
+    REMOTE_PROVIDER_EGRESS_WITH_CROSS_AUTHORITY_DISCOVERY,
+    BrowserEgressCapability,
+    BrowserProvider,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +121,11 @@ class BrowserUseBrowserProvider(BrowserProvider):
     @property
     def display_name(self) -> str:
         return "Browser Use"
+
+    @property
+    def egress_capability(self) -> BrowserEgressCapability:
+        """Pages run remotely; provider-managed egress is not verified by Hermes."""
+        return REMOTE_PROVIDER_EGRESS_WITH_CROSS_AUTHORITY_DISCOVERY
 
     def is_available(self) -> bool:
         return self._get_config_or_none(refresh_token=False) is not None

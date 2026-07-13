@@ -12,7 +12,7 @@ Covers:
     * legacy preference walk: browser-use → browserbase (filtered by
       availability)
     * firecrawl is NOT in the legacy walk — explicit-only
-    * unknown name falls through to auto-detect
+    * unknown explicit names fail closed
     * ``local`` short-circuits to None
 
 These tests use *real* imports from the plugin modules — no mocking of
@@ -118,6 +118,51 @@ class TestBundledPluginsRegister:
         # Every cloud-browser plugin needs the agent-browser post-setup hook
         # so the picker auto-installs the CLI on selection.
         assert schema.get("post_setup") == "agent_browser"
+
+    @pytest.mark.parametrize(
+        "plugin_name,allows_cross_authority_discovery",
+        [
+            ("browserbase", False),
+            ("browser-use", True),
+            ("firecrawl", False),
+        ],
+    )
+    def test_each_plugin_declares_remote_provider_managed_egress(
+        self, plugin_name: str, allows_cross_authority_discovery: bool
+    ) -> None:
+        """Bundled providers make their real page-network boundary explicit."""
+        _ensure_plugins_loaded()
+        from agent.browser_registry import get_provider
+
+        provider = get_provider(plugin_name)
+        assert provider is not None
+        assert "egress_capability" in type(provider).__dict__
+        assert provider.egress_capability.execution_location == "provider-remote"
+        assert (
+            provider.egress_capability.network_boundary
+            == "provider-managed-unverified"
+        )
+        assert provider.egress_capability.requires_cdp_url is True
+        assert (
+            provider.egress_capability.allows_cross_authority_cdp_discovery
+            is allows_cross_authority_discovery
+        )
+
+    def test_egress_contract_rejects_unrecognized_boundary_labels(self) -> None:
+        from agent.browser_provider import (
+            BrowserControlTransport,
+            BrowserEgressCapability,
+            BrowserExecutionLocation,
+        )
+
+        with pytest.raises(TypeError, match="network_boundary"):
+            BrowserEgressCapability(
+                execution_location=BrowserExecutionLocation.PROVIDER_REMOTE,
+                network_boundary="provider-managed",  # type: ignore[arg-type]
+                control_transport=BrowserControlTransport.CDP,
+                requires_cdp_url=True,
+                allows_cross_authority_cdp_discovery=False,
+            )
 
     @pytest.mark.parametrize(
         "plugin_name",
@@ -245,13 +290,13 @@ class TestRegistryResolution:
         assert provider is not None
         assert provider.name == "firecrawl"
 
-    def test_explicit_unknown_falls_back_to_auto_detect(self) -> None:
-        """Rule 1 miss: unknown name → fall through to legacy walk."""
+    def test_explicit_unknown_fails_closed(self) -> None:
+        """An explicit typo must not auto-detect or return the local sentinel."""
         _ensure_plugins_loaded()
         from agent.browser_registry import _resolve
 
-        # With no credentials anywhere, auto-detect should also fail.
-        assert _resolve("not-a-real-provider") is None
+        with pytest.raises(LookupError, match="not-a-real-provider"):
+            _resolve("not-a-real-provider")
 
     def test_legacy_walk_prefers_browser_use_over_browserbase(
         self, monkeypatch: pytest.MonkeyPatch

@@ -152,9 +152,14 @@ already requests.
 
 ### Availability gating
 
-Both surfaces gate on `_browser_cdp_check` (supervisor can only run when a CDP
-endpoint is reachable). On Camofox / no-backend sessions, the dialog tool is
-hidden and the snapshot omits the new fields — no schema bloat.
+The supervisor and `browser_dialog` gate only on
+`_browser_cdp_endpoint_available` because dialog handling is a high-level
+browser feature. The unrestricted generic `browser_cdp` model tool adds a
+separate `_browser_cdp_check` policy requiring
+`browser.allow_raw_cdp: true`. Disabling raw CDP therefore never hides dialogs,
+stops the supervisor, or removes frame metadata. On Camofox / no-backend
+sessions, the dialog tool is hidden and the snapshot omits the new fields — no
+schema bloat.
 
 ## Cross-origin iframe interaction
 

@@ -12,7 +12,7 @@ Hermes Agent includes a full browser automation toolset with multiple backend op
 - **Browserbase cloud mode** via [Browserbase](https://browserbase.com) for managed cloud browsers and anti-bot tooling
 - **Browser Use cloud mode** via [Browser Use](https://browser-use.com) as an alternative cloud browser provider
 - **Firecrawl cloud mode** via [Firecrawl](https://firecrawl.dev) for cloud browsers with built-in scraping
-- **Camofox local mode** via [Camofox](https://github.com/jo-inc/camofox-browser) for local anti-detection browsing (Firefox-based fingerprint spoofing)
+- **Camofox self-hosted mode** via [Camofox](https://github.com/jo-inc/camofox-browser) for anti-detection browsing (Firefox-based fingerprint spoofing)
 - **Local Chromium-family CDP** — connect browser tools to your own Chrome, Brave, Chromium, or Edge instance using `/browser connect`
 - **Local browser mode** via the `agent-browser` CLI and a local Chromium installation
 
@@ -120,9 +120,9 @@ auto-installs it). Post-navigation redirects from a public URL onto a private
 address are still blocked (you can't use a redirect-to-internal trick to reach
 your LAN through the public path).
 
-### Camofox local mode
+### Camofox self-hosted mode
 
-[Camofox](https://github.com/jo-inc/camofox-browser) is a self-hosted Node.js server wrapping Camoufox (a Firefox fork with C++ fingerprint spoofing). It provides local anti-detection browsing without cloud dependencies.
+[Camofox](https://github.com/jo-inc/camofox-browser) is a self-hosted Node.js server wrapping Camoufox (a Firefox fork with C++ fingerprint spoofing). It provides anti-detection browsing without a managed browser provider.
 
 ```bash
 # Clone the Camofox browser server first
@@ -207,6 +207,14 @@ The rewrite only applies to page navigation URLs with loopback hosts (`localhost
 Or configure via `hermes tools` → Browser Automation → Camofox.
 
 When `CAMOFOX_URL` is set, all browser tools automatically route through Camofox instead of Browserbase or agent-browser.
+
+#### Network boundary and private URLs
+
+Hermes treats Camofox as co-resident only when the `CAMOFOX_URL` control authority is loopback (`localhost`, `127.0.0.0/8`, or `::1`). A Docker service name such as `camofox`, `host.docker.internal`, a LAN address, or a remote hostname is classified as an **external-uncontrolled** browser boundary. External Camofox therefore receives the same private/internal URL preflight as other externally positioned browsers; `browser.allow_private_urls: true` remains the explicit opt-out for ordinary private targets. Cloud metadata endpoints remain blocked in every mode.
+
+Navigate, click, key press, and back responses must contain the final main-frame URL. Hermes validates that returned URL before exposing page content. Unsafe landings are moved to `about:blank` on a best-effort basis and quarantined; later snapshots, images, screenshots, typing, and scrolling remain blocked until a verified navigation succeeds. If the Camofox REST response omits the final URL, Hermes reports `final_url_state: unknown` instead of substituting the requested URL.
+
+Tool results expose `browser_boundary` metadata including execution location, network boundary, control transport, and the current enforcement limits. This is observability, not browser-process isolation: the REST integration cannot police page subresources or WebSockets, pin DNS answers, or enforce Camofox process egress. Deploy external Camofox behind an outbound proxy, firewall, or egress relay when those guarantees are required.
 
 #### Persistent browser sessions
 
@@ -522,7 +530,14 @@ When a CDP supervisor is active for the current session (typical for any session
 
 Raw Chrome DevTools Protocol passthrough — the escape hatch for browser operations not covered by the other tools. Use for native dialog handling, iframe-scoped evaluation, cookie/network control, or any CDP verb the agent needs.
 
-**Only available when a CDP endpoint is reachable at session start** — meaning `/browser connect` has attached to a running Chrome, Brave, Chromium, or Edge browser, or `browser.cdp_url` is set in `config.yaml`. The default local agent-browser mode, Camofox, and cloud providers (Browserbase, Browser Use, Firecrawl) do not currently expose CDP to this tool — cloud providers have per-session CDP URLs but live-session routing is a follow-up.
+**Disabled by default.** Raw CDP can read cookies and storage, evaluate arbitrary JavaScript, change network behavior, and invoke any protocol method. Enable it only for trusted sessions:
+
+```yaml
+browser:
+  allow_raw_cdp: true
+```
+
+The tool is available only when that opt-in is set and a CDP endpoint is reachable at session start — meaning `/browser connect` has attached to a running Chrome, Brave, Chromium, or Edge browser, or `browser.cdp_url` is set in `config.yaml`. The opt-in controls only the generic raw model-facing tool; `/browser connect`, the supervisor, dialog handling, snapshots, and normal high-level browser tools continue to work when it is false. The default local agent-browser mode and Camofox do not expose a raw CDP endpoint.
 
 **CDP method reference:** https://chromedevtools.github.io/devtools-protocol/ — the agent can `web_extract` a specific method's page to look up parameters and return shape.
 

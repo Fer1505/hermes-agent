@@ -1204,7 +1204,9 @@ DEFAULT_CONFIG = {
         # Also settable via AGENT_BROWSER_ENGINE env var.
         "engine": "auto",
         "auto_local_for_private_urls": True,  # When a cloud provider is set, auto-spawn local Chromium for LAN/localhost URLs instead of sending them to the cloud
+        "allow_local_fallback_on_cloud_failure": False,  # Explicit opt-in: if a configured cloud provider fails, allow degraded execution on local Chromium
         "cdp_url": "",  # Optional persistent CDP endpoint for attaching to an existing Chromium/Chrome
+        "allow_raw_cdp": False,  # Expose the unrestricted model-facing browser_cdp escape hatch (trusted sessions only)
         "allow_unsafe_evaluate": False,  # Allow browser_console(expression=...) to use sensitive JS primitives (cookies/storage/clipboard/network/form values)
         # CDP supervisor — dialog + frame detection via a persistent WebSocket.
         # Active only when a CDP-capable backend is attached (Browserbase or
@@ -5641,7 +5643,11 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
             for server_name, entry in raw_mcp_servers.items():
                 if not isinstance(entry, dict):
                     continue
-                issues = _validate_mcp_server_entry(server_name, entry)
+                issues = _validate_mcp_server_entry(
+                    server_name,
+                    entry,
+                    require_attestation=True,
+                )
                 if not issues:
                     continue
                 entry["enabled"] = False
