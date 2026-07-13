@@ -134,6 +134,11 @@ async def test_session_crud_and_message_history(adapter, session_db):
         assert created["object"] == "hermes.session"
         assert created["session"]["title"] == "Mobile chat"
 
+        sessions_dir = session_db.db_path.parent / "sessions"
+        sessions_dir.mkdir()
+        artifact = sessions_dir / f"session_{session_id}.json"
+        artifact.write_text("sensitive transcript")
+
         session_db.append_message(session_id, "user", "hello from phone")
         session_db.append_message(session_id, "assistant", "hello from hermes")
 
@@ -167,6 +172,7 @@ async def test_session_crud_and_message_history(adapter, session_db):
         deleted = await delete_resp.json()
         assert deleted == {"object": "hermes.session.deleted", "id": session_id, "deleted": True}
         assert session_db.get_session(session_id) is None
+        assert not artifact.exists()
 
 
 @pytest.mark.asyncio

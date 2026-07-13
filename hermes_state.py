@@ -27,6 +27,7 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
+from utils import safe_session_filename_component
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -769,6 +770,15 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+CREATE TABLE IF NOT EXISTS session_file_purges (
+    session_id TEXT PRIMARY KEY,
+    safe_component TEXT NOT NULL,
+    enqueued_at REAL NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at REAL,
+    last_error TEXT
+);
+
 CREATE TABLE IF NOT EXISTS compression_locks (
     session_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
@@ -782,6 +792,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_session_file_purges_enqueued
+    ON session_file_purges(enqueued_at);
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -2256,6 +2268,8 @@ class SessionDB:
             """, (cutoff,)).fetchall()
             ids = [r[0] if isinstance(r, (tuple, list)) else r["id"] for r in rows]
             if ids:
+                if sessions_dir is not None:
+                    self._queue_session_file_purges(conn, ids)
                 placeholders = ",".join("?" * len(ids))
                 conn.execute(
                     f"DELETE FROM sessions WHERE id IN ({placeholders})", ids
@@ -2263,10 +2277,8 @@ class SessionDB:
             return ids
 
         removed_ids = self._execute_write(_do) or []
-        # Clean up any on-disk session files (belt-and-suspenders)
         if sessions_dir and removed_ids:
-            for sid in removed_ids:
-                self._remove_session_files(sessions_dir, sid)
+            self.drain_session_file_purges(sessions_dir)
         return len(removed_ids)
 
     def finalize_orphaned_compression_sessions(self) -> int:
@@ -4678,31 +4690,149 @@ class SessionDB:
         self._execute_write(_do)
 
     @staticmethod
-    def _remove_session_files(sessions_dir: Optional[Path], session_id: str) -> None:
-        """Remove on-disk transcript files for a session.
+    def _remove_session_artifacts(
+        sessions_dir: Optional[Path], safe_component: str
+    ) -> List[str]:
+        """Remove every known on-disk artifact for one safe session component.
 
-        Cleans up ``{session_id}.json``, ``{session_id}.jsonl``, and any
-        ``request_dump_{session_id}_*.json`` files left by the gateway.
-        Silently skips files that don't exist and swallows OSError so a
-        filesystem hiccup never blocks a DB operation.
+        Returns bounded non-secret failure descriptions.  Missing paths count
+        as success, which makes this operation safely replayable.  Callers put
+        the component in ``session_file_purges`` *before* deleting primary DB
+        rows, so an I/O failure is retried rather than silently orphaning a
+        transcript or request dump.
         """
         if sessions_dir is None:
-            return
-        for suffix in (".json", ".jsonl"):
-            p = sessions_dir / f"{session_id}{suffix}"
-            try:
-                p.unlink(missing_ok=True)
-            except OSError:
-                pass
-        # request_dump files use session_id as a prefix component
+            return []
+        # Treat even the durable queue as untrusted input.  Re-sanitizing an
+        # already-safe writer component is stable, while a corrupted/manual
+        # queue row cannot turn deletion into path traversal or glob expansion.
+        safe_component = safe_session_filename_component(safe_component)
+        failures: List[str] = []
+        direct_names = (
+            f"{safe_component}.json",
+            f"{safe_component}.jsonl",
+            f"session_{safe_component}.json",
+            f"session_{safe_component}.jsonl",
+        )
+        candidates = [sessions_dir / name for name in direct_names]
         try:
-            for p in sessions_dir.glob(f"request_dump_{session_id}_*.json"):
-                try:
-                    p.unlink(missing_ok=True)
-                except OSError:
-                    pass
-        except OSError:
-            pass
+            candidates.extend(
+                sessions_dir.glob(f"request_dump_{safe_component}_*.json")
+            )
+        except OSError as exc:
+            failures.append(f"glob:{type(exc).__name__}:{str(exc)[:160]}")
+        for path in candidates:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                failures.append(
+                    f"{path.name[:120]}:{type(exc).__name__}:{str(exc)[:160]}"
+                )
+        return failures[:20]
+
+    @staticmethod
+    def _remove_session_files(
+        sessions_dir: Optional[Path], session_id: str
+    ) -> List[str]:
+        """Compatibility wrapper using the shared writer/deleter mapping."""
+        return SessionDB._remove_session_artifacts(
+            sessions_dir, safe_session_filename_component(session_id)
+        )
+
+    @staticmethod
+    def _queue_session_file_purges(
+        conn: sqlite3.Connection, session_ids: List[str]
+    ) -> None:
+        now = time.time()
+        for session_id in dict.fromkeys(sid for sid in session_ids if sid):
+            conn.execute(
+                """
+                INSERT INTO session_file_purges (
+                    session_id, safe_component, enqueued_at, attempts,
+                    last_attempt_at, last_error
+                ) VALUES (?, ?, ?, 0, NULL, NULL)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    safe_component = excluded.safe_component
+                """,
+                (session_id, safe_session_filename_component(session_id), now),
+            )
+
+    def drain_session_file_purges(
+        self, sessions_dir: Optional[Path], *, limit: int = 1000
+    ) -> Dict[str, int]:
+        """Replay durable profile-local filesystem purge work.
+
+        Concurrent drainers are harmless because unlinking a missing path is
+        success and the queue delete is conditional on the same safe component.
+        """
+        result = {"queued": 0, "completed": 0, "pending": 0}
+        if sessions_dir is None:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM session_file_purges"
+                ).fetchone()
+            result["queued"] = int(row[0]) if row else 0
+            result["pending"] = result["queued"]
+            return result
+
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT session_id, safe_component FROM session_file_purges "
+                "ORDER BY enqueued_at, session_id LIMIT ?",
+                (max(1, min(int(limit), 10000)),),
+            ).fetchall()
+        result["queued"] = len(rows)
+        for row in rows:
+            session_id = str(row["session_id"])
+            stored_component = str(row["safe_component"])
+            safe_component = safe_session_filename_component(session_id)
+            failures = self._remove_session_artifacts(
+                sessions_dir, safe_component
+            )
+            if not failures:
+                def _delete(conn, sid=session_id, component=stored_component):
+                    conn.execute(
+                        "DELETE FROM session_file_purges "
+                        "WHERE session_id = ? AND safe_component = ?",
+                        (sid, component),
+                    )
+
+                self._execute_write(_delete)
+                result["completed"] += 1
+                continue
+
+            failure_text = " | ".join(failures)[:1000]
+
+            def _mark_failed(
+                conn,
+                sid=session_id,
+                component=stored_component,
+                error=failure_text,
+            ):
+                conn.execute(
+                    """
+                    UPDATE session_file_purges
+                    SET attempts = attempts + 1,
+                        last_attempt_at = ?,
+                        last_error = ?
+                    WHERE session_id = ? AND safe_component = ?
+                    """,
+                    (time.time(), error, sid, component),
+                )
+
+            self._execute_write(_mark_failed)
+            logger.warning(
+                "session artifact purge remains queued for %s: %s",
+                safe_component,
+                failure_text,
+            )
+
+        with self._lock:
+            pending_row = self._conn.execute(
+                "SELECT COUNT(*) FROM session_file_purges"
+            ).fetchone()
+        result["pending"] = int(pending_row[0]) if pending_row else 0
+        return result
 
     def delete_session(
         self,
@@ -4728,6 +4858,10 @@ class SessionDB:
             if cursor.fetchone()[0] == 0:
                 return False
             removed_delegate_ids.extend(_delete_delegate_children(conn, [session_id]))
+            if sessions_dir is not None:
+                self._queue_session_file_purges(
+                    conn, [session_id, *removed_delegate_ids]
+                )
             # Orphan remaining child sessions (branches, etc.) so FK is satisfied.
             conn.execute(
                 "UPDATE sessions SET parent_session_id = NULL "
@@ -4739,10 +4873,8 @@ class SessionDB:
             return True
 
         deleted = self._execute_write(_do)
-        if deleted:
-            for delegate_id in removed_delegate_ids:
-                self._remove_session_files(sessions_dir, delegate_id)
-            self._remove_session_files(sessions_dir, session_id)
+        if deleted and sessions_dir is not None:
+            self.drain_session_file_purges(sessions_dir)
         return bool(deleted)
 
     def delete_session_if_empty(
@@ -4765,9 +4897,9 @@ class SessionDB:
         flushed. Returns True if the session was deleted.
         """
         def _do(conn):
-            cursor = conn.execute(
+            row = conn.execute(
                 """
-                DELETE FROM sessions
+                SELECT id FROM sessions
                 WHERE id = ?
                   AND title IS NULL
                   AND NOT EXISTS (
@@ -4779,12 +4911,17 @@ class SessionDB:
                   )
                 """,
                 (session_id,),
-            )
-            return cursor.rowcount > 0
+            ).fetchone()
+            if row is None:
+                return False
+            if sessions_dir is not None:
+                self._queue_session_file_purges(conn, [session_id])
+            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            return True
 
         deleted = self._execute_write(_do)
-        if deleted:
-            self._remove_session_files(sessions_dir, session_id)
+        if deleted and sessions_dir is not None:
+            self.drain_session_file_purges(sessions_dir)
         return bool(deleted)
 
     def delete_sessions(
@@ -4825,7 +4962,6 @@ class SessionDB:
         if not unique_ids:
             return 0
 
-        removed_ids: list[str] = []
         removed_delegate_ids: list[str] = []
 
         def _do(conn):
@@ -4842,6 +4978,10 @@ class SessionDB:
 
             existing_placeholders = ",".join("?" * len(existing))
             removed_delegate_ids.extend(_delete_delegate_children(conn, existing))
+            if sessions_dir is not None:
+                self._queue_session_file_purges(
+                    conn, [*existing, *removed_delegate_ids]
+                )
             # Orphan remaining children whose parent is in the kill list so the
             # FK constraint stays satisfied. Pin children whose parent
             # is itself in the kill list rather than NULL-ing parents
@@ -4860,14 +5000,11 @@ class SessionDB:
                 f"DELETE FROM sessions WHERE id IN ({existing_placeholders})",
                 existing,
             )
-            removed_ids.extend(existing)
             return len(existing)
 
         count = self._execute_write(_do)
-        for sid in removed_delegate_ids:
-            self._remove_session_files(sessions_dir, sid)
-        for sid in removed_ids:
-            self._remove_session_files(sessions_dir, sid)
+        if count and sessions_dir is not None:
+            self.drain_session_file_purges(sessions_dir)
         return count
 
     def count_empty_sessions(self) -> int:
@@ -4924,8 +5061,6 @@ class SessionDB:
 
         Returns the number of sessions deleted.
         """
-        removed_ids: list[str] = []
-
         def _do(conn):
             cursor = conn.execute(
                 "SELECT id FROM sessions "
@@ -4937,6 +5072,9 @@ class SessionDB:
 
             if not session_ids:
                 return 0
+
+            if sessions_dir is not None:
+                self._queue_session_file_purges(conn, list(session_ids))
 
             placeholders = ",".join("?" * len(session_ids))
             conn.execute(
@@ -4954,12 +5092,11 @@ class SessionDB:
                     "DELETE FROM messages WHERE session_id = ?", (sid,)
                 )
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
-                removed_ids.append(sid)
             return len(session_ids)
 
         count = self._execute_write(_do)
-        for sid in removed_ids:
-            self._remove_session_files(sessions_dir, sid)
+        if count and sessions_dir is not None:
+            self.drain_session_file_purges(sessions_dir)
         return count
 
     def prune_sessions(
@@ -4968,34 +5105,37 @@ class SessionDB:
         source: str = None,
         sessions_dir: Optional[Path] = None,
     ) -> int:
-        """Delete sessions older than N days. Returns count of deleted sessions.
+        """Delete sessions ended more than N days ago.
 
-        Only prunes ended sessions (not active ones).  Child sessions outside
-        the prune window are orphaned (parent_session_id set to NULL) rather
-        than cascade-deleted.  When *sessions_dir* is provided, also removes
+        Retention is measured from ``ended_at`` rather than ``started_at`` so
+        a long-running session is not deleted immediately after it ends.
+        Child sessions outside the prune window are orphaned
+        (``parent_session_id`` set to NULL) rather than cascade-deleted. When
+        *sessions_dir* is provided, also removes
         on-disk transcript files (``.json`` / ``.jsonl`` /
         ``request_dump_*``) for every pruned session, outside the DB
         transaction.
         """
         cutoff = time.time() - (older_than_days * 86400)
-        removed_ids: list[str] = []
-
         def _do(conn):
             if source:
                 cursor = conn.execute(
                     """SELECT id FROM sessions
-                       WHERE started_at < ? AND ended_at IS NOT NULL AND source = ?""",
+                       WHERE ended_at < ? AND source = ?""",
                     (cutoff, source),
                 )
             else:
                 cursor = conn.execute(
-                    "SELECT id FROM sessions WHERE started_at < ? AND ended_at IS NOT NULL",
+                    "SELECT id FROM sessions WHERE ended_at < ?",
                     (cutoff,),
                 )
             session_ids = {row["id"] for row in cursor.fetchall()}
 
             if not session_ids:
                 return 0
+
+            if sessions_dir is not None:
+                self._queue_session_file_purges(conn, list(session_ids))
 
             # Orphan any sessions whose parent is about to be deleted
             placeholders = ",".join("?" * len(session_ids))
@@ -5008,13 +5148,11 @@ class SessionDB:
             for sid in session_ids:
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
-                removed_ids.append(sid)
             return len(session_ids)
 
         count = self._execute_write(_do)
-        # Clean up on-disk files outside the DB transaction
-        for sid in removed_ids:
-            self._remove_session_files(sessions_dir, sid)
+        if count and sessions_dir is not None:
+            self.drain_session_file_purges(sessions_dir)
         return count
 
     # ── Meta key/value (for scheduler bookkeeping) ──
@@ -5659,10 +5797,25 @@ class SessionDB:
           - ``"skipped"`` (bool) — true if within min_interval_hours of last run
           - ``"pruned"`` (int)   — number of sessions deleted
           - ``"vacuumed"`` (bool) — true if VACUUM ran
+          - ``"file_purges_pending"`` (int) — durable artifact deletes still queued
           - ``"error"`` (str, optional) — present only on failure
         """
-        result: Dict[str, Any] = {"skipped": False, "pruned": 0, "vacuumed": False}
+        result: Dict[str, Any] = {
+            "skipped": False,
+            "pruned": 0,
+            "vacuumed": False,
+            "file_purges_pending": 0,
+        }
         try:
+            if int(retention_days) < 1:
+                raise ValueError("retention_days must be at least 1")
+
+            # Filesystem purge retries are independent of the daily DB sweep.
+            # Drain them before the interval check so a transient I/O failure
+            # does not remain stuck for another full retention cadence.
+            purge_state = self.drain_session_file_purges(sessions_dir)
+            result["file_purges_pending"] = purge_state["pending"]
+
             # Skip if another process/call did maintenance recently.
             last_raw = self.get_meta("last_auto_prune")
             now = time.time()
@@ -5680,6 +5833,8 @@ class SessionDB:
                 sessions_dir=sessions_dir,
             )
             result["pruned"] = pruned
+            purge_state = self.drain_session_file_purges(sessions_dir)
+            result["file_purges_pending"] = purge_state["pending"]
 
             # Only VACUUM if we actually freed rows — VACUUM on a tight DB
             # is wasted I/O. Threshold keeps small DBs from paying the cost.

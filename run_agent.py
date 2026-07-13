@@ -210,7 +210,7 @@ from agent.tool_dispatch_helpers import (
     _extract_error_preview,
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
 )
-from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
+from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens, safe_session_filename_component
 
 
 # Internal flags that mark a message as ephemeral empty-response/prefill
@@ -350,15 +350,7 @@ def _safe_session_filename_component(session_id: str) -> str:
     distinct IDs that sanitize to the same component don't collide.  The
     result is always a single, traversal-free path segment.
     """
-    raw = str(session_id or "").strip()
-    sanitized = re.sub(r"[^\w-]", "_", raw).strip("._")
-    sanitized = sanitized[:96] or "session"
-    if raw and sanitized == raw:
-        return sanitized
-    digest = hashlib.sha256(
-        raw.encode("utf-8", errors="surrogatepass")
-    ).hexdigest()[:12]
-    return f"{sanitized}_{digest}"
+    return safe_session_filename_component(session_id)
 
 
 class _StreamErrorEvent(Exception):

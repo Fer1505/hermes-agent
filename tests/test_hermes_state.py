@@ -1832,10 +1832,11 @@ class TestPruneSessions:
         # Create and end an "old" session
         db.create_session(session_id="old", source="cli")
         db.end_session("old", end_reason="done")
-        # Manually backdate started_at
+        # Manually backdate the ended retention boundary.
+        old_ts = time.time() - 100 * 86400
         db._conn.execute(
-            "UPDATE sessions SET started_at = ? WHERE id = ?",
-            (time.time() - 100 * 86400, "old"),
+            "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+            (old_ts, old_ts, "old"),
         )
         db._conn.commit()
 
@@ -1862,13 +1863,77 @@ class TestPruneSessions:
         assert pruned == 0
         assert db.get_session("active") is not None
 
+    def test_prune_retention_is_measured_from_session_end(self, db):
+        """A long-running session gets the full retention period after end."""
+        db.create_session(session_id="long-running", source="cli")
+        db.end_session("long-running", end_reason="done")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+            (
+                time.time() - 200 * 86400,
+                time.time() - 10 * 86400,
+                "long-running",
+            ),
+        )
+        db._conn.commit()
+
+        assert db.prune_sessions(older_than_days=90) == 0
+        assert db.get_session("long-running") is not None
+
+        db._conn.execute(
+            "UPDATE sessions SET ended_at = ? WHERE id = ?",
+            (time.time() - 100 * 86400, "long-running"),
+        )
+        db._conn.commit()
+        assert db.prune_sessions(older_than_days=90) == 1
+        assert db.get_session("long-running") is None
+
+    def test_prune_removes_sensitive_columns_and_both_fts_rows(self, db):
+        db.create_session(session_id="sensitive", source="cli")
+        message_id = db.append_message(
+            "sensitive",
+            role="assistant",
+            content="RETENTION_CONTENT_SENTINEL",
+            tool_name="RETENTION_TOOL_SENTINEL",
+            tool_calls=[{"name": "exec", "arguments": {"secret": "value"}}],
+            reasoning="RETENTION_REASONING_SENTINEL",
+            reasoning_content="RETENTION_REASONING_CONTENT_SENTINEL",
+            reasoning_details={"trace": "RETENTION_DETAILS_SENTINEL"},
+        )
+        db.end_session("sensitive", end_reason="done")
+        old_ts = time.time() - 100 * 86400
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+            (old_ts, old_ts, "sensitive"),
+        )
+        db._conn.commit()
+
+        assert db._conn.execute(
+            "SELECT 1 FROM messages_fts WHERE rowid = ?", (message_id,)
+        ).fetchone()
+        assert db._conn.execute(
+            "SELECT 1 FROM messages_fts_trigram WHERE rowid = ?", (message_id,)
+        ).fetchone()
+
+        assert db.prune_sessions(older_than_days=90) == 1
+        assert db._conn.execute(
+            "SELECT 1 FROM messages WHERE id = ?", (message_id,)
+        ).fetchone() is None
+        assert db._conn.execute(
+            "SELECT 1 FROM messages_fts WHERE rowid = ?", (message_id,)
+        ).fetchone() is None
+        assert db._conn.execute(
+            "SELECT 1 FROM messages_fts_trigram WHERE rowid = ?", (message_id,)
+        ).fetchone() is None
+
     def test_prune_with_source_filter(self, db):
         for sid, src in [("old_cli", "cli"), ("old_tg", "telegram")]:
             db.create_session(session_id=sid, source=src)
             db.end_session(sid, end_reason="done")
+            old_ts = time.time() - 200 * 86400
             db._conn.execute(
-                "UPDATE sessions SET started_at = ? WHERE id = ?",
-                (time.time() - 200 * 86400, sid),
+                "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+                (old_ts, old_ts, sid),
             )
         db._conn.commit()
 
@@ -1892,10 +1957,11 @@ class TestPruneSessions:
         db.create_session(session_id="D", source="cli", parent_session_id="C")
         db.end_session("D", end_reason="done")
 
-        # Backdate A and B to be old; C and D stay recent
+        # Backdate A and B's completion; C and D stay recent.
         for sid, ts in [("A", old_ts), ("B", old_ts), ("C", recent_ts), ("D", recent_ts)]:
             db._conn.execute(
-                "UPDATE sessions SET started_at = ? WHERE id = ?", (ts, sid)
+                "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+                (ts, ts, sid),
             )
         db._conn.commit()
 
@@ -1925,7 +1991,8 @@ class TestPruneSessions:
 
         for sid in ("X", "Y", "Z"):
             db._conn.execute(
-                "UPDATE sessions SET started_at = ? WHERE id = ?", (old_ts, sid)
+                "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+                (old_ts, old_ts, sid),
             )
         db._conn.commit()
 
@@ -3917,12 +3984,13 @@ class TestOptimizeFts:
 
 class TestAutoMaintenance:
     def _make_old_ended(self, db, sid: str, days_old: int = 100):
-        """Create a session that is ended and was started `days_old` days ago."""
+        """Create a session that ended ``days_old`` days ago."""
         db.create_session(session_id=sid, source="cli")
         db.end_session(sid, end_reason="done")
+        old_ts = time.time() - days_old * 86400
         db._conn.execute(
-            "UPDATE sessions SET started_at = ? WHERE id = ?",
-            (time.time() - days_old * 86400, sid),
+            "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+            (old_ts, old_ts, sid),
         )
         db._conn.commit()
 
@@ -3983,6 +4051,13 @@ class TestAutoMaintenance:
         # But last-run is still recorded so we don't retry immediately.
         assert db.get_meta("last_auto_prune") is not None
 
+    def test_invalid_retention_fails_closed_without_deleting(self, db):
+        self._make_old_ended(db, "old", days_old=100)
+        result = db.maybe_auto_prune_and_vacuum(retention_days=0)
+        assert result["pruned"] == 0
+        assert "retention_days must be at least 1" in result["error"]
+        assert db.get_session("old") is not None
+
     def test_vacuum_disabled_via_flag(self, db):
         self._make_old_ended(db, "old", days_old=100)
         result = db.maybe_auto_prune_and_vacuum(retention_days=90, vacuum=False)
@@ -4018,6 +4093,7 @@ class TestAutoMaintenance:
         # Transcript files mimicking real gateway/CLI layout
         (sessions_dir / "old1.json").write_text("{}")
         (sessions_dir / "old1.jsonl").write_text("{}\n")
+        (sessions_dir / "session_old1.json").write_text("{}")
         (sessions_dir / "old2.jsonl").write_text("{}\n")
         (sessions_dir / "request_dump_old1_001.json").write_text("{}")
         (sessions_dir / "new.jsonl").write_text("{}\n")  # active, must survive
@@ -4030,6 +4106,7 @@ class TestAutoMaintenance:
         # Pruned transcript files are gone
         assert not (sessions_dir / "old1.json").exists()
         assert not (sessions_dir / "old1.jsonl").exists()
+        assert not (sessions_dir / "session_old1.json").exists()
         assert not (sessions_dir / "old2.jsonl").exists()
         assert not (sessions_dir / "request_dump_old1_001.json").exists()
         # Active session's transcript is untouched
@@ -4060,6 +4137,89 @@ class TestAutoMaintenance:
         assert count == 1
         assert not (sessions_dir / "old.jsonl").exists()
         assert (sessions_dir / "active.jsonl").exists()
+
+    def test_file_purge_failure_is_durable_and_retried_even_when_db_sweep_skips(
+        self, db, tmp_path, monkeypatch
+    ):
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        self._make_old_ended(db, "retry-me", days_old=100)
+        artifact = sessions_dir / "session_retry-me.json"
+        artifact.write_text("sensitive")
+
+        original = db._remove_session_artifacts
+        monkeypatch.setattr(
+            db,
+            "_remove_session_artifacts",
+            lambda _root, _component: ["simulated:PermissionError"],
+        )
+        first = db.maybe_auto_prune_and_vacuum(
+            retention_days=90, sessions_dir=sessions_dir
+        )
+        assert first["pruned"] == 1
+        assert first["file_purges_pending"] == 1
+        assert db.get_session("retry-me") is None
+        assert artifact.exists()
+        queued = db._conn.execute(
+            "SELECT attempts, last_error FROM session_file_purges "
+            "WHERE session_id = ?",
+            ("retry-me",),
+        ).fetchone()
+        assert queued is not None
+        assert queued["attempts"] >= 1
+        assert "PermissionError" in queued["last_error"]
+
+        monkeypatch.setattr(db, "_remove_session_artifacts", original)
+        second = db.maybe_auto_prune_and_vacuum(
+            retention_days=90, sessions_dir=sessions_dir
+        )
+        assert second["skipped"] is True
+        assert second["file_purges_pending"] == 0
+        assert not artifact.exists()
+        assert db._conn.execute(
+            "SELECT 1 FROM session_file_purges WHERE session_id = ?",
+            ("retry-me",),
+        ).fetchone() is None
+
+    def test_file_purge_uses_traversal_safe_writer_component(
+        self, db, tmp_path
+    ):
+        from utils import safe_session_filename_component
+
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        unsafe_id = "../../outside"
+        safe_id = safe_session_filename_component(unsafe_id)
+        safe_artifact = sessions_dir / f"session_{safe_id}.json"
+        safe_artifact.write_text("delete me")
+        outside = tmp_path / "outside.json"
+        outside.write_text("preserve me")
+
+        self._make_old_ended(db, unsafe_id, days_old=100)
+        assert db.prune_sessions(
+            older_than_days=90, sessions_dir=sessions_dir
+        ) == 1
+        assert not safe_artifact.exists()
+        assert outside.read_text() == "preserve me"
+
+    def test_drain_rejects_corrupted_queue_component_traversal(
+        self, db, tmp_path
+    ):
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        outside = tmp_path / "outside.json"
+        outside.write_text("preserve me")
+        db._conn.execute(
+            "INSERT INTO session_file_purges "
+            "(session_id, safe_component, enqueued_at) VALUES (?, ?, ?)",
+            ("legitimate", "../../outside", time.time()),
+        )
+        db._conn.commit()
+
+        result = db.drain_session_file_purges(sessions_dir)
+
+        assert result == {"queued": 1, "completed": 1, "pending": 0}
+        assert outside.read_text() == "preserve me"
 
 
 # =========================================================================

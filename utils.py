@@ -1,9 +1,11 @@
 """Shared utility functions for hermes-agent."""
 
 import errno
+import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import stat
 import tempfile
@@ -17,6 +19,25 @@ logger = logging.getLogger(__name__)
 
 
 TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
+
+
+def safe_session_filename_component(session_id: str) -> str:
+    """Return a stable traversal-free artifact component for a session ID.
+
+    Session IDs may originate from remote headers or persisted state.  Every
+    session-derived artifact writer *and deleter* must use the same mapping so
+    cleanup cannot escape the profile sessions directory and still finds files
+    written for IDs that need sanitizing.
+    """
+    raw = str(session_id or "").strip()
+    sanitized = re.sub(r"[^\w-]", "_", raw).strip("._")
+    sanitized = sanitized[:96] or "session"
+    if raw and sanitized == raw:
+        return sanitized
+    digest = hashlib.sha256(
+        raw.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()[:12]
+    return f"{sanitized}_{digest}"
 
 
 def is_truthy_value(value: Any, default: bool = False) -> bool:

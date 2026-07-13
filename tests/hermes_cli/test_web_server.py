@@ -5247,11 +5247,18 @@ class TestDeleteSessionEndpoint:
             db.close()
 
     def test_delete_existing_session(self):
+        from hermes_constants import get_hermes_home
+
         self._seed(["real_one"])
+        sessions_dir = get_hermes_home() / "sessions"
+        sessions_dir.mkdir(exist_ok=True)
+        artifact = sessions_dir / "session_real_one.json"
+        artifact.write_text("sensitive transcript")
         resp = self.auth_client.delete("/api/sessions/real_one")
         assert resp.status_code == 200
         assert resp.json().get("ok") is True
         assert not self._exists("real_one")
+        assert not artifact.exists()
 
     def test_delete_absent_session_is_idempotent(self):
         # PREMISE / regression: deleting a row that no longer exists must NOT
@@ -5321,8 +5328,15 @@ class TestBulkDeleteSessionsEndpoint:
 
     def test_deletes_listed_sessions_only(self):
         from hermes_state import SessionDB
+        from hermes_constants import get_hermes_home
 
         self._seed(["a", "b", "c"])
+        sessions_dir = get_hermes_home() / "sessions"
+        sessions_dir.mkdir(exist_ok=True)
+        deleted_artifact = sessions_dir / "session_a.json"
+        survivor_artifact = sessions_dir / "session_c.json"
+        deleted_artifact.write_text("delete")
+        survivor_artifact.write_text("preserve")
         resp = self.auth_client.post(
             "/api/sessions/bulk-delete", json={"ids": ["a", "b"]}
         )
@@ -5336,6 +5350,8 @@ class TestBulkDeleteSessionsEndpoint:
             assert db.get_session("c") is not None
         finally:
             db.close()
+        assert not deleted_artifact.exists()
+        assert survivor_artifact.exists()
 
     def test_unknown_ids_silently_skipped(self):
         """The endpoint never 404s on a missing ID — it returns the
@@ -5488,8 +5504,15 @@ class TestDeleteEmptySessionsEndpoint:
         empty-ended-unarchived rows — same shape contract as the
         DB-level method's unit tests."""
         from hermes_state import SessionDB
+        from hermes_constants import get_hermes_home
 
         self._seed()
+        sessions_dir = get_hermes_home() / "sessions"
+        sessions_dir.mkdir(exist_ok=True)
+        empty_artifact = sessions_dir / "session_empty1.json"
+        live_artifact = sessions_dir / "session_live.json"
+        empty_artifact.write_text("delete")
+        live_artifact.write_text("preserve")
         resp = self.auth_client.delete("/api/sessions/empty")
         assert resp.status_code == 200
         assert resp.json() == {"ok": True, "deleted": 2}
@@ -5507,6 +5530,8 @@ class TestDeleteEmptySessionsEndpoint:
             assert db.count_empty_sessions() == 0
         finally:
             db.close()
+        assert not empty_artifact.exists()
+        assert live_artifact.exists()
 
     def test_delete_with_no_empties_returns_zero(self):
         """No empty sessions → endpoint returns ``deleted: 0`` (200,

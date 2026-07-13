@@ -394,6 +394,19 @@ class TestListAndCleanup:
         # Removing again returns False
         assert manager.remove_session(state.session_id) is False
 
+    def test_remove_session_deletes_profile_artifact(self, tmp_path):
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(agent_factory=_mock_agent, db=db)
+        state = manager.create_session()
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        artifact = sessions_dir / f"session_{state.session_id}.json"
+        artifact.write_text("sensitive transcript")
+
+        assert manager.remove_session(state.session_id) is True
+        assert not artifact.exists()
+        db.close()
+
 
 # ---------------------------------------------------------------------------
 # persistence — sessions survive process restarts (via SessionDB)

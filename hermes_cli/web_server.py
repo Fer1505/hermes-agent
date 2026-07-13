@@ -8009,9 +8009,9 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
     * Active and archived sessions ARE deleted when explicitly
       selected — unlike ``DELETE /api/sessions/empty``, the user
       hand-picked the rows so we trust the selection.
-    * Like the other session-delete endpoints, this does NOT pass a
-      ``sessions_dir`` through; on-disk transcript / request-dump
-      cleanup runs at the CLI/agent layer on the next prune pass.
+    * Primary rows, search-index rows, transcripts and request dumps are
+      deleted together; filesystem failures remain in the durable purge
+      queue for retry by profile maintenance.
 
     The response carries the actual deleted count, so the dashboard
     can surface it in a toast. The IDs that were removed are not
@@ -8031,7 +8031,9 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
         )
     db = _open_session_db_for_profile(body.profile)
     try:
-        deleted = db.delete_sessions(body.ids)
+        deleted = db.delete_sessions(
+            body.ids, sessions_dir=_sessions_dir_for_profile(body.profile)
+        )
         return {"ok": True, "deleted": deleted}
     finally:
         db.close()
@@ -8065,16 +8067,15 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
       keep those rows.
     * Children of deleted parents are orphaned, not cascade-deleted.
 
-    Like the single-session ``DELETE /api/sessions/{id}`` endpoint
-    below, this doesn't pass a ``sessions_dir`` through — the on-disk
-    transcript / request-dump cleanup is wired at the CLI/agent layer
-    but the web server historically leaves file cleanup to the next
-    prune-on-startup pass. Matching that pre-existing trade-off keeps
-    the two delete endpoints' DB-vs-disk behaviour consistent.
+    Primary rows, search-index rows, transcripts and request dumps are
+    deleted together; filesystem failures remain in the durable purge
+    queue for retry by profile maintenance.
     """
     db = _open_session_db_for_profile(profile)
     try:
-        deleted = db.delete_empty_sessions()
+        deleted = db.delete_empty_sessions(
+            sessions_dir=_sessions_dir_for_profile(profile)
+        )
         return {"ok": True, "deleted": deleted}
     finally:
         db.close()
@@ -8124,6 +8125,13 @@ def _open_session_db_for_profile(profile: Optional[str]):
         return SessionDB()
     _name, home = _cron_profile_home(profile)
     return SessionDB(db_path=Path(home) / "state.db")
+
+
+def _sessions_dir_for_profile(profile: Optional[str]) -> Path:
+    if not profile:
+        return get_hermes_home() / "sessions"
+    _name, home = _cron_profile_home(profile)
+    return Path(home) / "sessions"
 
 
 @app.get("/api/sessions/{session_id}")
@@ -8187,7 +8195,9 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
         sid = db.resolve_session_id(session_id)
         if not sid:
             return {"ok": True, "already_absent": True}
-        db.delete_session(sid)
+        db.delete_session(
+            sid, sessions_dir=_sessions_dir_for_profile(profile)
+        )
         return {"ok": True}
     finally:
         db.close()
@@ -8269,7 +8279,7 @@ async def prune_sessions_endpoint(body: SessionPrune):
         removed = db.prune_sessions(
             older_than_days=body.older_than_days,
             source=(body.source or None),
-            sessions_dir=sessions_dir if sessions_dir.exists() else None,
+            sessions_dir=sessions_dir,
         )
         return {"ok": True, "removed": removed}
     finally:

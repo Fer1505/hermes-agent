@@ -20,6 +20,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
+from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
@@ -381,7 +382,9 @@ class SessionManager:
                 for row in rows:
                     sid = row["id"]
                     _clear_task_cwd(sid)
-                    db.delete_session(sid)
+                    db.delete_session(
+                        sid, sessions_dir=Path(db.db_path).parent / "sessions"
+                    )
             except Exception:
                 logger.debug("Failed to cleanup ACP sessions from DB", exc_info=True)
 
@@ -585,7 +588,10 @@ class SessionManager:
         if db is None:
             return False
         try:
-            return db.delete_session(session_id)
+            return db.delete_session(
+                session_id,
+                sessions_dir=Path(db.db_path).parent / "sessions",
+            )
         except Exception:
             logger.debug("Failed to delete ACP session %s from DB", session_id, exc_info=True)
             return False
