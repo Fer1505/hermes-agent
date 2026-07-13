@@ -434,21 +434,6 @@ class TestCodexOAuthContextLength:
             "leaked outside openai-codex provider"
         )
 
-    def test_gpt56_sol_direct_api_uses_full_context(self):
-        from agent.model_metadata import get_model_context_length
-
-        with patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
-             patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
-             patch("agent.model_metadata.get_cached_context_length", return_value=None), \
-             patch("agent.models_dev.lookup_models_dev_context", return_value=None):
-            ctx = get_model_context_length(
-                model="gpt-5.6-sol",
-                base_url="https://api.openai.com/v1",
-                api_key="",
-                provider="openai-api",
-            )
-        assert ctx == 1_050_000
-
     def test_stale_codex_cache_over_400k_is_invalidated(self, tmp_path, monkeypatch):
         """Pre-PR #14935 builds cached gpt-5.5 at 1.05M (from models.dev)
         before the Codex-aware branch existed. Upgrading users keep that
