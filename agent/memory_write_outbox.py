@@ -47,7 +47,7 @@ class MemoryWriteOutbox:
         max_age_seconds: float = 7 * 24 * 60 * 60,
         retry_base_seconds: float = 1.0,
         retry_max_seconds: float = 300.0,
-        lease_seconds: float = 30.0,
+        lease_seconds: float = 600.0,
     ) -> None:
         self.path = Path(path)
         self.max_entries = max(1, int(max_entries))

@@ -1277,16 +1277,20 @@ class MemoryManager:
                 event = events[0]
                 try:
                     if self._deliver_memory_write_event(provider, event):
-                        outbox.complete(
+                        completed = outbox.complete(
                             event.event_id,
                             lease_owner=self._write_outbox_lease_owner,
                         )
+                        if not completed:
+                            raise RuntimeError("delivery lease was lost before completion")
                     else:
-                        outbox.fail(
+                        failed = outbox.fail(
                             event.event_id,
                             lease_owner=self._write_outbox_lease_owner,
                             error="provider callback failed",
                         )
+                        if not failed:
+                            raise RuntimeError("delivery lease was lost before retry update")
                         retry_delay = min(
                             self._write_outbox_retry_max_seconds,
                             self._write_outbox_retry_base_seconds
