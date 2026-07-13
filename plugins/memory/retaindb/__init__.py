@@ -744,13 +744,27 @@ class RetainDBMemoryProvider(MemoryProvider):
 
     # ── Optional hooks ─────────────────────────────────────────────────────
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
+    def on_memory_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Mirror built-in memory writes to RetainDB."""
         if action != "add" or not content or not self._client:
             return
-        try:
-            memory_type = "preference" if target == "user" else "factual"
+        memory_type = "preference" if target == "user" else "factual"
+        if (metadata or {}).get("outbox_event_id"):
             self._client.add_memory(self._user_id, self._session_id, content, memory_type=memory_type)
+            return
+        try:
+            self._client.add_memory(
+                self._user_id,
+                self._session_id,
+                content,
+                memory_type=memory_type,
+            )
         except Exception as exc:
             logger.debug("RetainDB memory mirror failed: %s", exc)
 

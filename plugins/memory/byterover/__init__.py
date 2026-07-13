@@ -321,7 +321,13 @@ class ByteRoverMemoryProvider(MemoryProvider):
         )
         self._sync_thread.start()
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
+    def on_memory_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Mirror built-in memory writes to ByteRover."""
         if not self._auto_extract:
             logger.debug("ByteRover memory mirror skipped (auto_extract disabled)")
@@ -338,6 +344,12 @@ class ByteRoverMemoryProvider(MemoryProvider):
                 )
             except Exception as e:
                 logger.debug("ByteRover memory mirror failed: %s", e)
+                if (metadata or {}).get("outbox_event_id"):
+                    raise
+
+        if (metadata or {}).get("outbox_event_id"):
+            _write()
+            return
 
         t = threading.Thread(target=_write, daemon=True, name="brv-memwrite")
         t.start()

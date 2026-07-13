@@ -26,6 +26,7 @@ Capabilities:
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import logging
 import mimetypes
@@ -3232,9 +3233,13 @@ class OpenVikingMemoryProvider(MemoryProvider):
             old_session_id, new_id, parent_session_id, reset,
         )
 
-    def _build_memory_uri(self, subdir: str) -> str:
+    def _build_memory_uri(self, subdir: str, event_id: str = "") -> str:
         """Build a viking:// memory URI under the configured peer namespace."""
-        slug = uuid.uuid4().hex[:12]
+        slug = (
+            hashlib.sha256(event_id.encode("utf-8")).hexdigest()[:24]
+            if event_id
+            else uuid.uuid4().hex[:12]
+        )
         return f"viking://user/peers/{self._agent}/memories/{subdir}/mem_{slug}.md"
 
     def on_memory_write(
@@ -3249,7 +3254,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return
 
         subdir = _MEMORY_WRITE_TARGET_SUBDIR_MAP.get(target, _DEFAULT_MEMORY_SUBDIR)
-        uri = self._build_memory_uri(subdir)
+        outbox_event_id = str((metadata or {}).get("outbox_event_id") or "")
+        uri = self._build_memory_uri(subdir, outbox_event_id)
 
         def _write():
             try:
@@ -3264,9 +3270,15 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 })
             except Exception as e:
                 logger.debug("OpenViking memory mirror failed: %s", e)
+                if outbox_event_id:
+                    raise
             finally:
                 with self._memory_write_lock:
                     self._memory_write_threads.discard(threading.current_thread())
+
+        if outbox_event_id:
+            _write()
+            return
 
         t = threading.Thread(target=_write, daemon=True, name="openviking-memwrite")
         with self._memory_write_lock:

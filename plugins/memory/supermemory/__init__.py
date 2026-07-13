@@ -795,7 +795,13 @@ class SupermemoryMemoryProvider(MemoryProvider):
         self._session_turns = []
         self._turn_count = 0
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
+    def on_memory_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
         if not self._active or not self._write_enabled or not self._client:
             return
         if action != "add" or not (content or "").strip():
@@ -805,11 +811,25 @@ class SupermemoryMemoryProvider(MemoryProvider):
             try:
                 self._client.add_memory(
                     content.strip(),
-                    metadata={"target": target, "type": "explicit_memory"},
+                    metadata={
+                        "target": target,
+                        "type": "explicit_memory",
+                        **dict(metadata or {}),
+                    },
                     entity_context=self._entity_context,
+                    custom_id=str((metadata or {}).get("outbox_event_id") or "") or None,
                 )
             except Exception:
                 logger.debug("Supermemory on_memory_write failed", exc_info=True)
+                if (metadata or {}).get("outbox_event_id"):
+                    raise
+
+        # MemoryManager already runs durable outbox delivery off-thread. It
+        # needs a real success/failure acknowledgement before deleting the
+        # event, so do not detach or swallow that path a second time.
+        if (metadata or {}).get("outbox_event_id"):
+            _run()
+            return
 
         if self._write_thread and self._write_thread.is_alive():
             self._write_thread.join(timeout=2.0)

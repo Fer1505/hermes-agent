@@ -1256,10 +1256,9 @@ class HonchoMemoryProvider(MemoryProvider):
     ) -> None:
         """Mirror built-in user profile writes as Honcho conclusions.
 
-        ``metadata`` is accepted for compatibility with the write-origin
-        work landed in main (commit 6a957a74); it's not yet threaded into
-        the Honcho conclusion payload.  Left as a follow-up so this PR
-        stays focused on the 7-PR consolidation and its review follow-ups.
+        Durable outbox delivery is already off-thread at the manager layer.
+        That path returns only after Honcho acknowledges success so the local
+        event is not deleted while a detached provider thread is still running.
         """
         if action != "add" or target != "user" or not content:
             return
@@ -1273,9 +1272,16 @@ class HonchoMemoryProvider(MemoryProvider):
 
         def _write():
             try:
-                self._manager.create_conclusion(self._session_key, content)
+                if not self._manager.create_conclusion(self._session_key, content):
+                    raise RuntimeError("Honcho conclusion was not accepted")
             except Exception as e:
                 logger.debug("Honcho memory mirror failed: %s", e)
+                if (metadata or {}).get("outbox_event_id"):
+                    raise
+
+        if (metadata or {}).get("outbox_event_id"):
+            _write()
+            return
 
         t = threading.Thread(target=_write, daemon=True, name="honcho-memwrite")
         t.start()
