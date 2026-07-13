@@ -51,6 +51,7 @@ def _make_args(**kwargs):
         "auth": None,
         "preset": None,
         "env": None,
+        "authorize_stdio": False,
         "mcp_action": None,
     }
     defaults.update(kwargs)
@@ -236,8 +237,9 @@ class TestMcpAdd:
 
         cmd_mcp_add(_make_args(
             name="github",
-            mcp_command="npx",
-            args=["@mcp/github"],
+            mcp_command="/bin/echo",
+            args=["serve"],
+            authorize_stdio=True,
         ))
         out = capsys.readouterr().out
         assert "Saved" in out
@@ -246,8 +248,9 @@ class TestMcpAdd:
 
         config = load_config()
         srv = config["mcp_servers"]["github"]
-        assert srv["command"] == "npx"
-        assert srv["args"] == ["@mcp/github"]
+        assert srv["command"] == str(Path("/bin/echo").resolve())
+        assert srv["args"] == ["serve"]
+        assert srv["_hermes_stdio_authorization"]["authorization"] == "operator_cli"
 
     def test_add_connection_failure_save_disabled(
         self, tmp_path, capsys, monkeypatch
@@ -294,9 +297,10 @@ class TestMcpAdd:
 
         cmd_mcp_add(_make_args(
             name="github",
-            mcp_command="npx",
-            args=["@mcp/github"],
+            mcp_command="/bin/echo",
+            args=["serve"],
             env=["MY_API_KEY=secret123", "DEBUG=true"],
+            authorize_stdio=True,
         ))
         out = capsys.readouterr().out
         assert "Saved" in out
@@ -358,15 +362,14 @@ class TestMcpAdd:
         from hermes_cli.mcp_config import cmd_mcp_add
         from hermes_cli.config import read_raw_config
 
-        cmd_mcp_add(_make_args(name="myserver", preset="testmcp"))
+        cmd_mcp_add(_make_args(
+            name="myserver",
+            preset="testmcp",
+            authorize_stdio=True,
+        ))
         out = capsys.readouterr().out
-        assert "Saved" in out
-
-        config = read_raw_config()
-        srv = config["mcp_servers"]["myserver"]
-        assert srv["command"] == "npx"
-        assert srv["args"] == ["-y", "test-mcp-server"]
-        assert "env" not in srv
+        assert "not operator-authorizable" in out
+        assert "myserver" not in read_raw_config().get("mcp_servers", {})
 
     def test_preset_does_not_override_explicit_command(self, tmp_path, capsys, monkeypatch):
         """Explicit transports win over presets."""
@@ -395,15 +398,11 @@ class TestMcpAdd:
             preset="testmcp",
             mcp_command="uvx",
             args=["custom-server"],
+            authorize_stdio=True,
         ))
         out = capsys.readouterr().out
-        assert "Saved" in out
-
-        config = read_raw_config()
-        srv = config["mcp_servers"]["custom"]
-        assert srv["command"] == "uvx"
-        assert srv["args"] == ["custom-server"]
-        assert "env" not in srv
+        assert "not operator-authorizable" in out
+        assert "custom" not in read_raw_config().get("mcp_servers", {})
 
     def test_unknown_preset_rejected(self, capsys):
         """An unknown preset name is rejected with a clear error."""
@@ -607,8 +606,8 @@ class TestConfigHelpers:
             _get_mcp_servers,
         )
 
-        _save_mcp_server("s1", {"command": "test"})
-        _save_mcp_server("s2", {"command": "test2"})
+        _save_mcp_server("s1", {"url": "https://example.com/one"})
+        _save_mcp_server("s2", {"url": "https://example.com/two"})
         result = _remove_mcp_server("s1")
         assert result is True
         assert "s1" not in _get_mcp_servers()

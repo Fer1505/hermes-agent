@@ -46,22 +46,23 @@ cd ~/.hermes/hermes-agent
 uv pip install -e ".[mcp]"
 ```
 
-For npm-based servers, make sure Node.js and `npx` are available.
-
-For many Python MCP servers, `uvx` is a nice default.
+For npm- or Python-based stdio servers, use a reviewed catalog entry. Hermes
+does not persist ad-hoc `npx`, `uvx`, Node, Python, or shell launchers because
+they can resolve or execute different software at each startup.
 
 ## Step 2: add one server first
 
 Start with a single, safe server.
 
-Example: filesystem access to one project directory only.
+Start with a reviewed catalog entry:
 
-```yaml
-mcp_servers:
-  project_fs:
-    command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/my-project"]
+```bash
+hermes mcp catalog
+hermes mcp install <name>
 ```
+
+For a remote server, use `hermes mcp add <name> --url https://.../mcp`;
+OAuth and header authentication continue to use the normal setup flow.
 
 Then start Hermes:
 
@@ -96,15 +97,8 @@ Do not wait until later if the server exposes a lot of tools.
 
 ### Example: whitelist only what you want
 
-```yaml
-mcp_servers:
-  github:
-    command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-github"]
-    env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: "***"
-    tools:
-      include: [list_issues, create_issue, search_code]
+```bash
+hermes mcp configure github
 ```
 
 This is usually the best default for sensitive systems.
@@ -136,15 +130,13 @@ Hermes (WSL) -> MCP stdio bridge -> Windows Chrome
 - Hermes stays in its supported Unix environment (WSL2)
 - browser control is exposed as MCP tools instead of relying on Hermes core browser transport
 
-### Recommended server
+### Security boundary
 
-Use `chrome-devtools-mcp`.
-
-If your Windows Chrome already has live remote debugging enabled from `chrome://inspect/#remote-debugging`, add it like this from WSL:
-
-```bash
-hermes mcp add chrome-devtools-win --command cmd.exe --args /c npx -y chrome-devtools-mcp@latest --autoConnect --no-usage-statistics
-```
+Hermes no longer persists a `cmd.exe`/PowerShell → `npx` bridge. That shape is
+an indirect shell launcher and is quarantined before startup. Use a reviewed
+catalog entry that pins and hashes the bridge, or expose the bridge as an HTTP
+MCP endpoint and add its URL. Existing hand-edited shell entries remain visible
+for review but do not execute.
 
 After saving the server:
 
@@ -243,16 +235,8 @@ So Hermes will not pretend a server has resources/prompts if it does not.
 
 Use MCP for a repo-local filesystem or git server when you want Hermes to reason over a bounded workspace.
 
-```yaml
-mcp_servers:
-  fs:
-    command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/project"]
-
-  git:
-    command: "uvx"
-    args: ["mcp-server-git", "--repository", "/home/user/project"]
-```
+Install these through reviewed catalog manifests that pin their launchers and
+project-root arguments. Ad-hoc `npx`/`uvx` config is quarantined.
 
 Good prompts:
 
@@ -270,18 +254,16 @@ Use [Open Scaffold](https://github.com/graphanov/open-scaffold) when you want He
 
 Add the server for one scaffolded repository:
 
-```bash
-hermes mcp add open_scaffold --command npx --args -y open-scaffold@latest mcp serve --repo /absolute/path/to/repo
-hermes mcp test open_scaffold
-```
+Run Open Scaffold behind a local HTTP MCP endpoint, then add that endpoint with
+`hermes mcp add open_scaffold --url http://127.0.0.1:<port>/mcp`. For persisted
+stdio use, first add a pinned Open Scaffold manifest to the reviewed catalog.
 
 Then keep the exposed surface read-oriented. Choose `select` in the `hermes mcp add` prompt, or edit `config.yaml` afterward:
 
 ```yaml
 mcp_servers:
   open_scaffold:
-    command: "npx"
-    args: ["-y", "open-scaffold@latest", "mcp", "serve", "--repo", "/absolute/path/to/repo"]
+    url: "http://127.0.0.1:<port>/mcp"
     tools:
       include:
         - list_plans
@@ -320,10 +302,9 @@ Boundary notes:
 ```yaml
 mcp_servers:
   github:
-    command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-github"]
-    env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: "***"
+    url: "https://mcp.github.example.com"
+    headers:
+      Authorization: "Bearer ***"
     tools:
       include: [list_issues, create_issue, update_issue, search_code]
       prompts: false
@@ -394,10 +375,9 @@ Here is a practical progression.
 ```yaml
 mcp_servers:
   github:
-    command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-github"]
-    env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: "***"
+    url: "https://mcp.github.example.com"
+    headers:
+      Authorization: "Bearer ***"
     tools:
       include: [list_issues, create_issue, search_code]
       prompts: false
@@ -430,18 +410,16 @@ Then reload:
 ```yaml
 mcp_servers:
   github:
-    command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-github"]
-    env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: "***"
+    url: "https://mcp.github.example.com"
+    headers:
+      Authorization: "Bearer ***"
     tools:
       include: [list_issues, create_issue, update_issue, search_code]
       prompts: false
       resources: false
 
-  filesystem:
-    command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/project"]
+  project_service:
+    url: "http://127.0.0.1:<port>/mcp"
 ```
 
 Now Hermes can combine them:

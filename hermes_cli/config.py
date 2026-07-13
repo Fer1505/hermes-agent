@@ -5635,14 +5635,29 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
     raw_mcp_servers = config.get("mcp_servers")
     if isinstance(raw_mcp_servers, dict):
         try:
-            from hermes_cli.mcp_security import validate_mcp_server_entry as _validate_mcp_server_entry
+            from hermes_cli.mcp_security import (
+                upgrade_matching_catalog_stdio_entry as _upgrade_catalog_stdio,
+                validate_mcp_server_entry as _validate_mcp_server_entry,
+            )
         except Exception:
             _validate_mcp_server_entry = None
+            _upgrade_catalog_stdio = None
         if _validate_mcp_server_entry:
             mcp_touched = False
             for server_name, entry in raw_mcp_servers.items():
                 if not isinstance(entry, dict):
                     continue
+                upgraded = (
+                    _upgrade_catalog_stdio(server_name, entry)
+                    if _upgrade_catalog_stdio is not None else None
+                )
+                if upgraded is not None:
+                    entry = upgraded
+                    raw_mcp_servers[server_name] = entry
+                    mcp_touched = True
+                    results["warnings"].append(
+                        f"Pinned legacy catalog MCP server '{server_name}' to its current manifest and installed bytes"
+                    )
                 issues = _validate_mcp_server_entry(
                     server_name,
                     entry,

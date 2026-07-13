@@ -37,6 +37,11 @@ from agent.profile_memory_contract import (
     USER_PROFILE_RELATIVE_PATH,
 )
 from agent.skill_utils import is_excluded_skill_path
+from agent.file_safety import (
+    ProtectedFileCapability,
+    ProtectedFileOperation,
+    require_protected_control_file_capability,
+)
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -1327,6 +1332,12 @@ def delete_profile(name: str, yes: bool = False) -> Path:
             print("Cancelled.")
             return profile_dir
 
+    require_protected_control_file_capability(
+        ProtectedFileOperation.DELETE,
+        profile_dir,
+        capability=ProtectedFileCapability.PROFILE_LIFECYCLE,
+    )
+
     # 1. Disable service (prevents auto-restart)
     _cleanup_gateway_service(canon, profile_dir)
     # 1b. Phase 4: unregister the s6 service slot (container path).
@@ -1696,6 +1707,11 @@ def export_profile(name: str, output_path: str) -> Path:
         raise FileNotFoundError(f"Profile '{canon}' does not exist.")
 
     output = Path(output_path)
+    require_protected_control_file_capability(
+        ProtectedFileOperation.ARCHIVE,
+        (profile_dir, output),
+        capability=ProtectedFileCapability.PROFILE_LIFECYCLE,
+    )
     # shutil.make_archive wants the base name without extension
     base = str(output).removesuffix(".tar.gz").removesuffix(".tgz")
 
@@ -1843,6 +1859,12 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
     if profile_dir.exists():
         raise FileExistsError(f"Profile '{canon}' already exists at {profile_dir}")
 
+    require_protected_control_file_capability(
+        ProtectedFileOperation.IMPORT,
+        (archive, profile_dir),
+        capability=ProtectedFileCapability.PROFILE_LIFECYCLE,
+    )
+
     profiles_root = _get_profiles_root()
     profiles_root.mkdir(parents=True, exist_ok=True)
 
@@ -1952,6 +1974,12 @@ def rename_profile(old_name: str, new_name: str) -> Path:
         raise FileNotFoundError(f"Profile '{old_canon}' does not exist.")
     if new_dir.exists():
         raise FileExistsError(f"Profile '{new_canon}' already exists.")
+
+    require_protected_control_file_capability(
+        ProtectedFileOperation.RENAME,
+        (old_dir, new_dir),
+        capability=ProtectedFileCapability.PROFILE_LIFECYCLE,
+    )
 
     # 1. Stop gateway if running
     if _check_gateway_running(old_dir):

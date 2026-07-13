@@ -120,9 +120,9 @@ class TestWriteAllowed:
     def test_project_file(self):
         assert _is_write_denied("/home/user/project/main.py") is False
 
-    def test_hermes_control_files_requested_writable(self):
+    def test_hermes_control_files_are_not_model_writable(self):
         from hermes_constants import get_hermes_home
 
         home = get_hermes_home()
         for name in ["auth.json", "config.yaml", "webhook_subscriptions.json"]:
-            assert _is_write_denied(str(home / name)) is False, f"{name} should be writable"
+            assert _is_write_denied(str(home / name)) is True, f"{name} should be protected"

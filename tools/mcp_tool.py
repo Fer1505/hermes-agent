@@ -2952,6 +2952,15 @@ _parallel_safe_servers: set = set()
 # guessing.
 _mcp_tool_server_names: Dict[str, str] = {}
 
+# Persisted startup entries refused before spawn. Kept in memory so doctor,
+# dashboards, and tests can surface the exact quarantine reason without
+# re-running or normalizing the executable configuration.
+_mcp_quarantine: Dict[str, List[str]] = {}
+
+
+def get_mcp_quarantine() -> Dict[str, List[str]]:
+    return {name: list(reasons) for name, reasons in _mcp_quarantine.items()}
+
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
 _mcp_thread: Optional[threading.Thread] = None
@@ -3227,24 +3236,35 @@ def _interpolate_env_vars(value):
 
 
 def _filter_suspicious_mcp_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
-    """Drop exfiltration-shaped MCP configs before any stdio spawn path."""
+    """Quarantine unauthorized executable configs before any stdio spawn."""
     try:
         from hermes_cli.mcp_security import validate_mcp_server_entry as _validate_mcp_server_entry
     except Exception:
         _validate_mcp_server_entry: Callable[[str, dict[str, Any]], list[str]] | None = None
 
-    if _validate_mcp_server_entry is None:
-        return servers
-
+    _mcp_quarantine.clear()
     safe_servers = {}
     for name, cfg in servers.items():
         if not isinstance(cfg, dict):
-            safe_servers[name] = cfg
+            issues = ["MCP server configuration must be a mapping"]
+            _mcp_quarantine[name] = issues
+            logger.warning("Quarantined MCP server '%s': %s", name, "; ".join(issues))
             continue
-        issues = _validate_mcp_server_entry(name, cfg)
+        if _validate_mcp_server_entry is None:
+            issues = (
+                ["MCP executable authorization validator is unavailable"]
+                if "command" in cfg else []
+            )
+        else:
+            issues = _validate_mcp_server_entry(
+                name,
+                cfg,
+                require_attestation=True,
+            )
         if issues:
+            _mcp_quarantine[name] = list(issues)
             logger.warning(
-                "Skipping suspicious MCP server '%s': %s",
+                "Quarantined MCP server '%s': %s",
                 name,
                 "; ".join(issues),
             )

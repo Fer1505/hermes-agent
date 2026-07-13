@@ -377,14 +377,12 @@ def test_non_secret_auth_subtree_file_not_blocked(fake_home):
     assert get_read_block_error(str(note)) is None
 
 
-def test_config_yaml_not_blocked(fake_home):
-    """config.yaml is NOT a credential file — agent should still be
-    able to read it for debugging.  (Writes are denied separately by
-    is_write_denied; reads stay allowed.)"""
+def test_config_yaml_is_protected_control_file(fake_home):
+    """Model-facing reads must not expose mutable runtime configuration."""
     from agent.file_safety import get_read_block_error
 
     cfg = _create(fake_home, "config.yaml")
-    assert get_read_block_error(str(cfg)) is None
+    assert "protected Hermes control path" in (get_read_block_error(str(cfg)) or "")
 
 
 def test_profile_mode_blocks_root_credentials(tmp_path, monkeypatch):

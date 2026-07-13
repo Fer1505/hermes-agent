@@ -861,11 +861,15 @@ See [Checkpoints and `/rollback`](../user-guide/checkpoints-and-rollback.md) for
 hermes import <zipfile> [options]
 ```
 
-Restore a previously created Hermes backup into your Hermes home directory. All files in the archive overwrite existing files in your Hermes home; `--force` only skips the confirmation prompt that fires when the target already has a Hermes installation.
+Restore a previously created Hermes backup into an absent or empty Hermes home directory. Overlay restore into a nonempty home is disabled: `--force` is retained for CLI compatibility, but it does not bypass the empty-target requirement.
+
+Before activation, Hermes validates the archive layout, extraction quotas, manifest sizes/hashes/modes, and SQLite integrity. It stages files with descriptor-relative, no-follow filesystem operations anchored to the selected parent, revalidates staged identities and content, then atomically exchanges the staged root with the pinned empty target. A symlinked or identity-changed ancestor/target, an unavailable required kernel primitive, or a detected race causes the import to fail closed.
+
+If a failure occurs after atomic exchange but before the parent directory is confirmed durable, Hermes reports one of two explicit outcomes: either the original empty-target state was restored, or rollback could not be confirmed. If parent-directory `fsync` fails after activation, the restored root remains active and Hermes reports that durability is unknown rather than claiming rollback.
 
 | Option | Description |
 |--------|-------------|
-| `-f`, `--force` | Skip the existing-installation confirmation prompt. |
+| `-f`, `--force` | Compatibility flag; does not allow import into a nonempty target. |
 
 :::warning
 Stop the gateway before importing to avoid conflicts with running processes.
@@ -873,9 +877,13 @@ Stop the gateway before importing to avoid conflicts with running processes.
 
 ### Examples
 ```bash
-hermes import ~/hermes-backup-20260423.zip           # Prompts before overwriting existing config
-hermes import ~/hermes-backup-20260423.zip --force   # Overwrite without prompting
+hermes import ~/hermes-backup-20260423.zip           # Restore into an absent/empty Hermes home
+hermes import ~/hermes-backup-20260423.zip --force   # Same safety contract; no overlay restore
 ```
+
+:::note Platform and crash boundary
+Secure import currently requires POSIX descriptor-relative no-follow operations and native atomic directory exchange support. Filesystem/kernel rename and `fsync` semantics remain the durability boundary: a crash after exchange but before parent-directory `fsync` can leave either the old or new directory entry durable, so Hermes reports durability as unknown if that confirmation fails.
+:::
 
 ## `hermes logs`
 
@@ -1248,7 +1256,7 @@ Manage MCP (Model Context Protocol) server configurations and run Hermes as an M
 | `catalog` | List Nous-approved MCPs (plain text, scriptable). |
 | `install <name>` | Install a catalog entry (e.g. `hermes mcp install n8n`). |
 | `serve [-v\|--verbose]` | Run Hermes as an MCP server — expose conversations to other agents. |
-| `add <name> [--url URL] [--command CMD] [--auth oauth\|header] [--args ...]` | Add a custom MCP server with automatic tool discovery. `--args` passes the remaining argv to the stdio command, so put it last. |
+| `add <name> [--url URL] [--command CMD --authorize-stdio] [--auth oauth\|header] [--args ...]` | Add an HTTP server, or explicitly authorize one direct native stdio executable. Shells, scripts, interpreters, and package runners are refused; use the reviewed catalog for those. `--args` must be last. |
 | `remove <name>` (alias: `rm`) | Remove an MCP server from config. |
 | `list` (alias: `ls`) | List configured MCP servers. |
 | `test <name>` | Test connection to an MCP server. |

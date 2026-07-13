@@ -22,13 +22,11 @@ If you have ever wanted Hermes to use a tool that already exists somewhere else,
 
 1. MCP support ships with the standard install — no extra step needed.
 
-2. Add an MCP server to `~/.hermes/config.yaml`:
+2. Install a reviewed MCP server:
 
-```yaml
-mcp_servers:
-  filesystem:
-    command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/projects"]
+```bash
+hermes mcp catalog
+hermes mcp install <name>
 ```
 
 3. Start Hermes:
@@ -46,6 +44,13 @@ List the files in /home/user/projects and summarize the repo structure.
 ```
 
 Hermes will discover the MCP server's tools and use them like any other tool.
+
+Stdio entries are executable software. Hermes binds catalog entries to their
+manifest provenance, exact command/args, and installed-file hashes. A custom
+direct native executable can instead be added with `--authorize-stdio` after
+operator review. Hand-edited/unpinned entries and shell, Python, Node, `npx`,
+`uvx`, encoded, or indirect launchers are quarantined before process creation.
+Remote HTTP and OAuth MCP configuration is unchanged.
 
 ## Catalog: one-click install for Nous-approved MCPs
 
@@ -178,14 +183,8 @@ To add an MCP to the catalog, open a PR against
 
 Stdio servers run as local subprocesses and talk over stdin/stdout.
 
-```yaml
-mcp_servers:
-  github:
-    command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-github"]
-    env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: "***"
-```
+Install stdio servers from the reviewed catalog. Hermes writes the generated,
+hash-bound config and its authorization receipt during installation.
 
 Use stdio servers when:
 - the server is installed locally
@@ -301,14 +300,17 @@ Hermes reads MCP config from `~/.hermes/config.yaml` under `mcp_servers`.
 | `supports_parallel_tool_calls` | bool | If `true`, tools from this server may run concurrently |
 | `tools` | mapping | Per-server tool filtering and utility policy |
 
-### Minimal stdio example
+### Minimal custom stdio example
 
-```yaml
-mcp_servers:
-  filesystem:
-    command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+```bash
+hermes mcp add local-tools \
+  --command /opt/local-tools/bin/mcp-server \
+  --authorize-stdio \
+  --args --root /tmp
 ```
+
+The command must be a direct native executable. Hermes generates the internal
+attestation fields; do not hand-edit or copy them between servers.
 
 ### Minimal HTTP example
 
@@ -404,10 +406,9 @@ If `enabled: false`, Hermes skips the server completely and does not even attemp
 ```yaml
 mcp_servers:
   github:
-    command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-github"]
-    env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: "***"
+    url: "https://mcp.github.example.com"
+    headers:
+      Authorization: "Bearer ***"
     tools:
       include: [create_issue, list_issues]
 ```
@@ -460,10 +461,9 @@ That means:
 ```yaml
 mcp_servers:
   github:
-    command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-github"]
-    env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: "***"
+    url: "https://mcp.github.example.com"
+    headers:
+      Authorization: "Bearer ***"
     tools:
       include: [create_issue, list_issues, search_code]
       prompts: false
@@ -543,10 +543,9 @@ The new filtering support is also a security control:
 ```yaml
 mcp_servers:
   github:
-    command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-github"]
-    env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: "***"
+    url: "https://mcp.github.example.com"
+    headers:
+      Authorization: "Bearer ***"
     tools:
       include: [list_issues, create_issue, update_issue]
       prompts: false
@@ -579,12 +578,9 @@ Look up the last 10 failed payments and summarize common failure reasons.
 
 ### Filesystem server for a single project root
 
-```yaml
-mcp_servers:
-  project_fs:
-    command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/my-project"]
-```
+Install a reviewed filesystem catalog entry whose manifest pins the server and
+its allowed project root. An ad-hoc package runner is not accepted as persisted
+stdio software.
 
 Use it like:
 

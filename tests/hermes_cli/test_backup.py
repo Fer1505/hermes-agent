@@ -2816,10 +2816,14 @@ class TestFullBackupContainment:
 
         import hermes_cli.backup as backup_mod
 
-        def interrupt_activation(_source, _target):
+        def interrupt_activation(
+            _source_parent_fd, _source_name, _target_parent_fd, _target_name
+        ):
             raise KeyboardInterrupt
 
-        monkeypatch.setattr(backup_mod.os, "replace", interrupt_activation)
+        monkeypatch.setattr(
+            backup_mod, "_exchange_directories_at", interrupt_activation
+        )
         with pytest.raises(KeyboardInterrupt):
             backup_mod.run_import(Namespace(zipfile=str(archive), force=True))
 
@@ -2837,14 +2841,12 @@ class TestFullBackupContainment:
         _write_manifest_zip(archive, {"config.yaml": "model: test\n"})
 
         import hermes_cli.backup as backup_mod
-        real_fsync_directory = backup_mod._fsync_directory
+        def fail_after_activation(_parent_fd):
+            raise OSError("injected parent fsync failure")
 
-        def fail_after_activation(path):
-            if Path(path) == hermes_home.parent and (hermes_home / "config.yaml").exists():
-                raise OSError("injected parent fsync failure")
-            return real_fsync_directory(path)
-
-        monkeypatch.setattr(backup_mod, "_fsync_directory", fail_after_activation)
+        monkeypatch.setattr(
+            backup_mod, "_fsync_restore_parent", fail_after_activation
+        )
         with pytest.raises(SystemExit):
             backup_mod.run_import(Namespace(zipfile=str(archive), force=True))
 

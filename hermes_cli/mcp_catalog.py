@@ -458,7 +458,10 @@ def _prompt_env_vars(specs: List[EnvVarSpec]) -> Dict[str, str]:
 
 
 def _build_server_config(
-    entry: CatalogEntry, install_dir: Optional[Path]
+    entry: CatalogEntry,
+    install_dir: Optional[Path],
+    *,
+    include_attestation: bool = False,
 ) -> dict:
     """Translate a manifest into the ``mcp_servers.<name>`` block format used
     by hermes_cli/mcp_config.py."""
@@ -468,6 +471,9 @@ def _build_server_config(
         cfg["command"] = _expand_install_dir(t.command or "", install_dir)
         if t.args:
             cfg["args"] = [_expand_install_dir(a, install_dir) for a in t.args]
+        if include_attestation:
+            from hermes_cli.mcp_security import build_catalog_stdio_attestation
+            cfg = build_catalog_stdio_attestation(entry, cfg, install_dir)
     elif t.type == "http":
         cfg["url"] = t.url
         if entry.auth.type == "oauth":
@@ -519,6 +525,8 @@ def _probe_tools(name: str) -> Optional[List[tuple]]:
 
 def _write_tools_include(name: str, include: Optional[List[str]]) -> None:
     """Persist or clear ``mcp_servers.<name>.tools.include``."""
+    from hermes_cli.mcp_config import _authorize_mcp_config_write
+    _authorize_mcp_config_write()
     cfg = load_config()
     servers = cfg.setdefault("mcp_servers", {})
     server_entry = servers.get(name) or {}
@@ -727,7 +735,7 @@ def install_entry(entry: CatalogEntry, *, enable: bool = True) -> None:
 
     # Build and write the mcp_servers entry (without tools filter yet;
     # _apply_tool_selection() finalizes it below).
-    server_cfg = _build_server_config(entry, install_dir)
+    server_cfg = _build_server_config(entry, install_dir, include_attestation=True)
     server_cfg["enabled"] = enable
 
     from hermes_cli.mcp_config import _save_mcp_server

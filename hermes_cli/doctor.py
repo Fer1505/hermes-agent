@@ -614,7 +614,11 @@ def run_doctor(args):
             for name, entry in sorted(servers.items()):
                 if not isinstance(entry, dict):
                     continue
-                issues_found = validate_mcp_server_entry(name, entry)
+                issues_found = validate_mcp_server_entry(
+                    name,
+                    entry,
+                    require_attestation=True,
+                )
                 if not issues_found:
                     continue
                 suspicious += 1

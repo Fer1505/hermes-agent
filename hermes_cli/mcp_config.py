@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.config import (
@@ -25,7 +26,16 @@ from hermes_cli.config import (
 )
 from hermes_cli.colors import Colors, color
 from hermes_constants import display_hermes_home
-from hermes_cli.mcp_security import validate_mcp_server_entry
+from hermes_cli.mcp_security import (
+    authorize_operator_stdio_entry,
+    revoke_operator_stdio_entry,
+    validate_mcp_server_entry,
+)
+from agent.file_safety import (
+    ProtectedFileCapability,
+    ProtectedFileOperation,
+    require_protected_control_file_capability,
+)
 from tools.mcp_tool import _ENV_VAR_PATTERN
 
 logger = logging.getLogger(__name__)
@@ -85,6 +95,14 @@ def _get_mcp_servers(config: Optional[dict] = None) -> Dict[str, dict]:
     return servers
 
 
+def _authorize_mcp_config_write() -> None:
+    require_protected_control_file_capability(
+        ProtectedFileOperation.WRITE,
+        Path(get_hermes_home()) / "config.yaml",
+        capability=ProtectedFileCapability.MCP_REGISTRATION,
+    )
+
+
 def _save_mcp_server(name: str, server_config: dict) -> bool:
     """Add or update a server entry in config.yaml.
 
@@ -92,12 +110,17 @@ def _save_mcp_server(name: str, server_config: dict) -> bool:
     rejected. MCP stdio servers are user-chosen local commands, so this blocks
     shell+egress payloads rather than whitelisting command families.
     """
-    issues = validate_mcp_server_entry(name, server_config)
+    issues = validate_mcp_server_entry(
+        name,
+        server_config,
+        require_attestation=True,
+    )
     if issues:
         for issue in issues:
             _warning(issue)
         _warning(f"Server '{name}' was NOT saved due to suspicious configuration.")
         return False
+    _authorize_mcp_config_write()
     config = load_config()
     config.setdefault("mcp_servers", {})[name] = server_config
     save_config(config)
@@ -110,10 +133,12 @@ def _remove_mcp_server(name: str) -> bool:
     servers = config.get("mcp_servers", {})
     if name not in servers:
         return False
+    _authorize_mcp_config_write()
     del servers[name]
     if not servers:
         config.pop("mcp_servers", None)
     save_config(config)
+    revoke_operator_stdio_entry(name)
     return True
 
 
@@ -221,7 +246,7 @@ def _probe_single_server(
     Returns list of ``(tool_name, description)`` tuples.
     Raises on connection failure.
     """
-    issues = validate_mcp_server_entry(name, config)
+    issues = validate_mcp_server_entry(name, config, require_attestation=True)
     if issues:
         raise ValueError("; ".join(issues))
 
@@ -310,6 +335,7 @@ def cmd_mcp_add(args):
     auth_type = getattr(args, "auth", None)
     preset_name = getattr(args, "preset", None)
     raw_env = getattr(args, "env", None)
+    authorize_stdio = bool(getattr(args, "authorize_stdio", False))
 
     server_config: Dict[str, Any] = {}
     try:
@@ -356,7 +382,23 @@ def cmd_mcp_add(args):
         if explicit_env:
             server_config["env"] = explicit_env
 
-    issues = validate_mcp_server_entry(name, server_config)
+        if not authorize_stdio:
+            _error(
+                "Persisted stdio MCP servers are executable software. "
+                "Re-run with --authorize-stdio after reviewing the exact executable and args."
+            )
+            return
+        try:
+            server_config = authorize_operator_stdio_entry(name, server_config)
+        except ValueError as exc:
+            _error(str(exc))
+            return
+
+    issues = validate_mcp_server_entry(
+        name,
+        server_config,
+        require_attestation=True,
+    )
     if issues:
         for issue in issues:
             _warning(issue)

@@ -53,6 +53,14 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
         "--command", dest="mcp_command", help="Stdio command (e.g. npx)"
     )
     mcp_add_p.add_argument(
+        "--authorize-stdio",
+        action="store_true",
+        help=(
+            "Explicitly authorize one direct, hash-pinned stdio executable; "
+            "shells, interpreters, and package runners are refused"
+        ),
+    )
+    mcp_add_p.add_argument(
         "--args",
         nargs=argparse.REMAINDER,
         default=[],

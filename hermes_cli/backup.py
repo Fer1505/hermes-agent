@@ -8,10 +8,12 @@ Backup and import commands for hermes CLI.
 root. Overlay imports are contained until a transactional merge design exists.
 """
 
+import ctypes
 import hashlib
 import json
 import logging
 import os
+import secrets
 import shutil
 import sqlite3
 import stat
@@ -25,6 +27,11 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional
 
 from hermes_constants import get_default_hermes_root, get_hermes_home, display_hermes_home
+from agent.file_safety import (
+    ProtectedFileCapability,
+    ProtectedFileOperation,
+    require_protected_control_file_capability,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +174,18 @@ class RestoreActivatedDurabilityError(BackupError):
     """Restored root is active but its directory entry durability is unknown."""
 
 
+class RestoreActivatedCleanupError(BackupError):
+    """Restored root is active but displaced-target cleanup was not confirmed."""
+
+
+class RestoreRolledBackError(BackupError):
+    """Restore activation failed and the original empty-target state was restored."""
+
+
+class RestoreRollbackError(BackupError):
+    """Restore activation failed and rollback could not be confirmed."""
+
+
 @dataclass(frozen=True)
 class _RestoreMember:
     info: zipfile.ZipInfo
@@ -175,6 +194,7 @@ class _RestoreMember:
     external: bool
     skip_runtime: bool
     expected_sha256: Optional[str]
+    verified_sha256: str
     expected_mode: Optional[int]
 
 
@@ -183,6 +203,7 @@ class _PrevalidatedMember:
     info: zipfile.ZipInfo
     effective_path: str
     expected_sha256: Optional[str]
+    verified_sha256: str
     expected_mode: Optional[int]
 
 
@@ -691,6 +712,12 @@ def run_backup(args) -> None:
     if out_path.suffix.lower() != ".zip":
         out_path = out_path.with_suffix(out_path.suffix + ".zip")
 
+    require_protected_control_file_capability(
+        ProtectedFileOperation.ARCHIVE,
+        (hermes_root, out_path),
+        capability=ProtectedFileCapability.BACKUP_RESTORE,
+    )
+
     # Ensure parent directory exists
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1100,6 +1127,7 @@ def _prevalidate_archive_contents(
                 info=info,
                 effective_path=effective,
                 expected_sha256=expected_sha256,
+                verified_sha256=actual_sha256,
                 expected_mode=expected_mode,
             )
         )
@@ -1172,22 +1200,304 @@ def _build_restore_plan(
                 external=False,
                 skip_runtime=skip_runtime,
                 expected_sha256=member.expected_sha256,
+                verified_sha256=member.verified_sha256,
                 expected_mode=member.expected_mode,
             )
         )
     return plan, manifest, prefix
 
 
-def _copy_validated_member(
+@dataclass
+class _AnchoredDirectory:
+    """An absolute directory chain pinned by descriptor and (device, inode)."""
+
+    path: Path
+    fd: int
+    identities: tuple[tuple[int, int], ...]
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+
+def _identity(info: os.stat_result) -> tuple[int, int]:
+    return (info.st_dev, info.st_ino)
+
+
+def _directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _require_secure_restore_primitives() -> None:
+    """Fail closed unless descriptor-relative, no-follow restore is available."""
+    required_flags = ("O_DIRECTORY", "O_NOFOLLOW")
+    missing_flags = [name for name in required_flags if not getattr(os, name, 0)]
+    required_dir_fd = (os.open, os.mkdir, os.rename, os.stat, os.unlink, os.rmdir)
+    missing_dir_fd = [
+        function.__name__
+        for function in required_dir_fd
+        if function not in os.supports_dir_fd
+    ]
+    if (
+        os.name != "posix"
+        or missing_flags
+        or missing_dir_fd
+        or os.stat not in os.supports_follow_symlinks
+        or not hasattr(os, "fchmod")
+    ):
+        details = ", ".join(missing_flags + missing_dir_fd) or "POSIX no-follow support"
+        raise BackupError(
+            "secure restore is unavailable on this platform; missing required "
+            f"descriptor-relative primitive(s): {details}"
+        )
+    _load_atomic_exchange()
+
+
+def _load_atomic_exchange():
+    """Return the native atomic directory-exchange function or fail closed."""
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        function = getattr(library, "renameatx_np", None)
+    elif sys.platform.startswith("linux"):
+        function = getattr(library, "renameat2", None)
+    else:
+        function = None
+    if function is None:
+        raise BackupError(
+            "secure restore is unavailable: atomic directory exchange is unsupported"
+        )
+    function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    function.restype = ctypes.c_int
+    return function
+
+
+def _exchange_directories_at(
+    source_parent_fd: int,
+    source_name: str,
+    target_parent_fd: int,
+    target_name: str,
+) -> None:
+    """Atomically swap two directory entries relative to pinned parents."""
+    function = _load_atomic_exchange()
+    result = function(
+        source_parent_fd,
+        os.fsencode(source_name),
+        target_parent_fd,
+        os.fsencode(target_name),
+        0x00000002,  # RENAME_SWAP (Darwin) / RENAME_EXCHANGE (Linux)
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _open_anchored_directory(path: Path, *, create: bool) -> _AnchoredDirectory:
+    absolute = Path(os.path.abspath(path))
+    descriptor = os.open("/", _directory_open_flags())
+    identities = [_identity(os.fstat(descriptor))]
+    try:
+        for component in absolute.parts[1:]:
+            try:
+                child = os.open(component, _directory_open_flags(), dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                child = os.open(component, _directory_open_flags(), dir_fd=descriptor)
+            except OSError as exc:
+                raise BackupError(
+                    f"restore ancestor is not a stable real directory: {absolute}"
+                ) from exc
+            identities.append(_identity(os.fstat(child)))
+            os.close(descriptor)
+            descriptor = child
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return _AnchoredDirectory(absolute, descriptor, tuple(identities))
+
+
+def _revalidate_restore_anchor(anchor: _AnchoredDirectory) -> None:
+    """Confirm the lexical path still names the exact pinned directory chain."""
+    try:
+        current = _open_anchored_directory(anchor.path, create=False)
+    except (FileNotFoundError, BackupError, OSError) as exc:
+        raise BackupError("restore ancestor identity changed during import") from exc
+    try:
+        if (
+            current.identities != anchor.identities
+            or _identity(os.fstat(anchor.fd)) != anchor.identities[-1]
+        ):
+            raise BackupError("restore ancestor identity changed during import")
+    finally:
+        current.close()
+
+
+def _open_child_directory(parent_fd: int, name: str) -> int:
+    try:
+        return os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+    except OSError as exc:
+        raise BackupError(f"restore path component is not a real directory: {name}") from exc
+
+
+def _prepare_empty_restore_target(
+    parent_fd: int,
+    name: str,
+) -> tuple[int, tuple[int, int], bool]:
+    created = False
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        created = True
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(before.st_mode):
+        raise BackupError("import target is not a real directory")
+    target_fd = -1
+    identity = _identity(before)
+    try:
+        target_fd = _open_child_directory(parent_fd, name)
+        identity = _identity(os.fstat(target_fd))
+        if identity != _identity(before) or os.listdir(target_fd):
+            raise BackupError("import target is not the selected empty directory")
+    except BaseException:
+        if target_fd >= 0:
+            os.close(target_fd)
+        if created:
+            try:
+                _remove_directory_if_identity(parent_fd, name, identity)
+            except OSError:
+                pass
+        raise
+    return target_fd, identity, created
+
+
+def _revalidate_empty_restore_target(
+    parent_fd: int,
+    name: str,
+    target_fd: int,
+    target_identity: tuple[int, int],
+) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise BackupError("import target identity changed during staging") from exc
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or _identity(current) != target_identity
+        or _identity(os.fstat(target_fd)) != target_identity
+        or os.listdir(target_fd)
+    ):
+        raise BackupError("import target identity changed or is no longer empty")
+
+
+def _create_staging_directory(parent_fd: int) -> tuple[str, int, int]:
+    for _attempt in range(20):
+        name = f".hermes-import-{secrets.token_hex(8)}"
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        temp_identity = _identity(
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        )
+        temp_fd = -1
+        staged_fd = -1
+        try:
+            temp_fd = _open_child_directory(parent_fd, name)
+            os.mkdir("hermes-home", mode=0o700, dir_fd=temp_fd)
+            staged_fd = _open_child_directory(temp_fd, "hermes-home")
+            return name, temp_fd, staged_fd
+        except BaseException:
+            if staged_fd >= 0:
+                os.close(staged_fd)
+            if temp_fd >= 0:
+                os.close(temp_fd)
+            try:
+                _remove_directory_if_identity(parent_fd, name, temp_identity)
+            except OSError:
+                pass
+            raise
+    raise BackupError("could not allocate a private restore staging directory")
+
+
+def _open_relative_directory_at(
+    root_fd: int,
+    parts: tuple[str, ...],
+    *,
+    create: bool,
+    expected_identities: dict[str, tuple[int, int]],
+) -> int:
+    descriptor = os.dup(root_fd)
+    try:
+        for index, component in enumerate(parts):
+            try:
+                child = os.open(component, _directory_open_flags(), dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise BackupError(
+                        f"staged directory disappeared: {'/'.join(parts[:index + 1])}"
+                    )
+                os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                child = os.open(component, _directory_open_flags(), dir_fd=descriptor)
+            relative = "/".join(parts[:index + 1])
+            child_identity = _identity(os.fstat(child))
+            expected = expected_identities.get(relative)
+            if expected is None:
+                if not create:
+                    os.close(child)
+                    raise BackupError(f"unexpected staged directory: {relative}")
+                expected_identities[relative] = child_identity
+            elif child_identity != expected:
+                os.close(child)
+                raise BackupError(f"staged directory identity changed: {relative}")
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _copy_validated_member_at(
     zf: zipfile.ZipFile,
     member: _RestoreMember,
-    destination: Path,
+    staged_fd: int,
+    directory_identities: dict[str, tuple[int, int]],
+    file_identities: dict[str, tuple[int, int]],
 ) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    parts = tuple(PurePosixPath(member.relative_path).parts)
+    parent_fd = _open_relative_directory_at(
+        staged_fd,
+        parts[:-1],
+        create=True,
+        expected_identities=directory_identities,
+    )
+    file_fd = -1
     digest = hashlib.sha256()
     total = 0
     try:
-        with zf.open(member.info, "r") as src, destination.open("xb") as dst:
+        file_fd = os.open(
+            parts[-1],
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        initial_identity = _identity(os.fstat(file_fd))
+        with zf.open(member.info, "r") as src, os.fdopen(file_fd, "wb") as dst:
+            file_fd = -1
             while True:
                 chunk = src.read(_COPY_CHUNK_BYTES)
                 if not chunk:
@@ -1199,51 +1509,143 @@ def _copy_validated_member(
                     )
                 digest.update(chunk)
                 dst.write(chunk)
-            # Current archives bind this value in their manifest. Older v1
-            # and legacy archives restore non-executable rather than allowing
-            # unsigned ZIP metadata to grant execute permission.
-            restored_mode = member.expected_mode or 0o600
-            if hasattr(os, "fchmod"):
-                os.fchmod(dst.fileno(), restored_mode)
-            else:
-                os.chmod(destination, restored_mode)
+            os.fchmod(dst.fileno(), member.expected_mode or 0o600)
             dst.flush()
             os.fsync(dst.fileno())
+            final = os.fstat(dst.fileno())
+            if (
+                not stat.S_ISREG(final.st_mode)
+                or final.st_nlink != 1
+                or _identity(final) != initial_identity
+            ):
+                raise BackupError(f"staged member identity changed: {member.relative_path}")
+            file_identities[member.relative_path] = initial_identity
+        os.fsync(parent_fd)
     except BackupError:
         raise
     except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
         raise BackupError(f"could not stage {member.relative_path}: {exc}") from exc
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        os.close(parent_fd)
     if total != member.info.file_size:
         raise BackupError(f"archive member size changed during staging: {member.relative_path}")
-    if member.expected_sha256 and digest.hexdigest() != member.expected_sha256:
+    if digest.hexdigest() != member.verified_sha256:
         raise BackupError(f"archive member hash changed during staging: {member.relative_path}")
 
 
-def _validate_staged_databases(staged_home: Path) -> None:
-    """Reject corrupt SQLite members before the staged root is activated."""
-    for database_path in staged_home.rglob("*"):
-        if not database_path.is_file():
+def _open_staged_regular_file(
+    staged_fd: int,
+    relative_path: str,
+    directory_identities: dict[str, tuple[int, int]],
+    file_identities: dict[str, tuple[int, int]],
+) -> int:
+    parts = tuple(PurePosixPath(relative_path).parts)
+    parent_fd = _open_relative_directory_at(
+        staged_fd,
+        parts[:-1],
+        create=False,
+        expected_identities=directory_identities,
+    )
+    try:
+        descriptor = os.open(
+            parts[-1],
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+    except BaseException:
+        os.close(parent_fd)
+        raise
+    os.close(parent_fd)
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or _identity(info) != file_identities.get(relative_path)
+    ):
+        os.close(descriptor)
+        raise BackupError(f"staged member is not a private regular file: {relative_path}")
+    return descriptor
+
+
+def _verify_staged_members(
+    staged_fd: int,
+    plan: list[_RestoreMember],
+    directory_identities: dict[str, tuple[int, int]],
+    file_identities: dict[str, tuple[int, int]],
+) -> None:
+    for member in plan:
+        if member.skip_runtime:
             continue
-        if database_path.suffix.casefold() != ".db":
-            continue
-        if database_path.is_symlink():
-            raise BackupError(f"staged database is not a regular file: {database_path}")
-        connection = None
+        descriptor = _open_staged_regular_file(
+            staged_fd,
+            member.relative_path,
+            directory_identities,
+            file_identities,
+        )
+        digest = hashlib.sha256()
+        total = 0
         try:
-            uri = f"{database_path.resolve().as_uri()}?mode=ro&immutable=1"
+            before = os.fstat(descriptor)
+            while True:
+                chunk = os.read(descriptor, _COPY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if (
+            _identity(before) != _identity(after)
+            or after.st_nlink != 1
+            or total != member.info.file_size
+            or digest.hexdigest() != member.verified_sha256
+            or stat.S_IMODE(after.st_mode) != (member.expected_mode or 0o600)
+        ):
+            raise BackupError(f"staged member changed before promotion: {member.relative_path}")
+
+
+def _validate_staged_databases_at(
+    staged_fd: int,
+    plan: list[_RestoreMember],
+    directory_identities: dict[str, tuple[int, int]],
+    file_identities: dict[str, tuple[int, int]],
+) -> None:
+    """Reject corrupt SQLite members through an already-open, no-follow fd."""
+    descriptor_prefix = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
+    if not os.path.isdir(descriptor_prefix):
+        raise BackupError("secure SQLite validation requires a descriptor filesystem")
+    for member in plan:
+        if member.skip_runtime or PurePosixPath(member.relative_path).suffix.casefold() != ".db":
+            continue
+        descriptor = _open_staged_regular_file(
+            staged_fd,
+            member.relative_path,
+            directory_identities,
+            file_identities,
+        )
+        connection = None
+        before = os.fstat(descriptor)
+        try:
+            uri = f"file:{descriptor_prefix}/{descriptor}?mode=ro&immutable=1"
             connection = sqlite3.connect(uri, uri=True)
             rows = connection.execute("PRAGMA quick_check").fetchall()
         except sqlite3.Error as exc:
+            database_name = PurePosixPath(member.relative_path).name
             raise BackupError(
-                f"restored SQLite integrity check failed for {database_path.name}: {exc}"
+                f"restored SQLite integrity check failed for {database_name}: {exc}"
             ) from exc
         finally:
             if connection is not None:
                 connection.close()
-        if rows != [("ok",)]:
+            after = os.fstat(descriptor)
+            os.close(descriptor)
+        if _identity(before) != _identity(after) or rows != [("ok",)]:
             raise BackupError(
-                f"restored SQLite integrity check failed for {database_path.name}: "
-                f"{rows[:3]}"
+                "restored SQLite integrity check failed for "
+                f"{PurePosixPath(member.relative_path).name}: {rows[:3]}"
             )
 
 
@@ -1260,15 +1662,144 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _fsync_staged_tree(staged_home: Path) -> None:
-    if os.name != "posix":
-        return
-    directories = [
-        Path(dirpath)
-        for dirpath, _dirnames, _filenames in os.walk(staged_home)
-    ]
-    for directory in reversed(directories):
-        _fsync_directory(directory)
+def _verify_tree_shape_at(
+    directory_fd: int,
+    directory_identities: dict[str, tuple[int, int]],
+    file_identities: dict[str, tuple[int, int]],
+    prefix: str = "",
+) -> None:
+    for name in os.listdir(directory_fd):
+        relative = f"{prefix}/{name}" if prefix else name
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            if _identity(info) != directory_identities.get(relative):
+                raise BackupError(
+                    f"unexpected or identity-changed staged directory: {relative}"
+                )
+            child_fd = _open_child_directory(directory_fd, name)
+            try:
+                _verify_tree_shape_at(
+                    child_fd,
+                    directory_identities,
+                    file_identities,
+                    relative,
+                )
+            finally:
+                os.close(child_fd)
+        elif (
+            not stat.S_ISREG(info.st_mode)
+            or _identity(info) != file_identities.get(relative)
+        ):
+            raise BackupError(
+                f"unexpected or identity-changed staged filesystem object: {relative}"
+            )
+
+
+def _fsync_tree_at(
+    directory_fd: int,
+    directory_identities: dict[str, tuple[int, int]],
+    file_identities: dict[str, tuple[int, int]],
+    prefix: str = "",
+) -> None:
+    for name in os.listdir(directory_fd):
+        relative = f"{prefix}/{name}" if prefix else name
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            if _identity(info) != directory_identities.get(relative):
+                raise BackupError(
+                    f"unexpected or identity-changed staged directory: {relative}"
+                )
+            child_fd = _open_child_directory(directory_fd, name)
+            try:
+                _fsync_tree_at(
+                    child_fd,
+                    directory_identities,
+                    file_identities,
+                    relative,
+                )
+            finally:
+                os.close(child_fd)
+        elif (
+            not stat.S_ISREG(info.st_mode)
+            or _identity(info) != file_identities.get(relative)
+        ):
+            raise BackupError(
+                f"unexpected or identity-changed staged filesystem object: {relative}"
+            )
+    os.fsync(directory_fd)
+
+
+def _empty_directory_at(directory_fd: int) -> None:
+    """Remove descendants without following any staged or attacker link."""
+    for name in os.listdir(directory_fd):
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            child_fd = _open_child_directory(directory_fd, name)
+            try:
+                _empty_directory_at(child_fd)
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=directory_fd)
+        else:
+            os.unlink(name, dir_fd=directory_fd)
+
+
+def _remove_directory_if_identity(
+    parent_fd: int,
+    name: str,
+    expected_identity: tuple[int, int],
+) -> bool:
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(info.st_mode) or _identity(info) != expected_identity:
+        return False
+    directory_fd = _open_child_directory(parent_fd, name)
+    try:
+        if _identity(os.fstat(directory_fd)) != expected_identity:
+            return False
+        _empty_directory_at(directory_fd)
+    finally:
+        os.close(directory_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+    return True
+
+
+def _cleanup_staging_directory(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+) -> None:
+    _empty_directory_at(directory_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def _verify_promoted_target(
+    parent_fd: int,
+    target_name: str,
+    staged_identity: tuple[int, int],
+    staging_parent_fd: int,
+    original_target_identity: tuple[int, int],
+) -> None:
+    promoted = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(promoted.st_mode) or _identity(promoted) != staged_identity:
+        raise BackupError("promoted restore target identity could not be confirmed")
+    displaced = os.stat(
+        "hermes-home", dir_fd=staging_parent_fd, follow_symlinks=False
+    )
+    if not stat.S_ISDIR(displaced.st_mode) or _identity(displaced) != original_target_identity:
+        raise BackupError("import target was substituted during atomic promotion")
+    promoted_fd = _open_child_directory(parent_fd, target_name)
+    try:
+        if _identity(os.fstat(promoted_fd)) != staged_identity:
+            raise BackupError("promoted restore target identity changed")
+    finally:
+        os.close(promoted_fd)
+
+
+def _fsync_restore_parent(parent_fd: int) -> None:
+    os.fsync(parent_fd)
 
 
 def _stage_and_activate_restore(
@@ -1276,69 +1807,188 @@ def _stage_and_activate_restore(
     plan: list[_RestoreMember],
     hermes_root: Path,
 ) -> tuple[int, int, list[str]]:
-    """Stage every member, then atomically activate an empty Hermes root."""
-    hermes_parent = hermes_root.parent
-    hermes_parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with tempfile.TemporaryDirectory(
-        prefix=".hermes-import-",
-        dir=str(hermes_parent),
-    ) as temp_dir_text:
-        temp_dir = Path(temp_dir_text)
-        staged_home = temp_dir / "hermes-home"
-        staged_home.mkdir(mode=0o700)
-        os.chmod(staged_home, 0o700)
+    """Stage and atomically activate using only pinned, no-follow descriptors."""
+    _require_secure_restore_primitives()
+    hermes_root = Path(os.path.abspath(hermes_root))
+    parent = _open_anchored_directory(hermes_root.parent, create=True)
+    target_name = hermes_root.name
+    target_fd = -1
+    temp_fd = -1
+    staged_fd = -1
+    temp_name = ""
+    target_created = False
+    promoted = False
+    staged_identity: Optional[tuple[int, int]] = None
+    target_identity: Optional[tuple[int, int]] = None
+    promotion_attempted = False
+    directory_identities: dict[str, tuple[int, int]] = {}
+    file_identities: dict[str, tuple[int, int]] = {}
+    try:
+        (
+            target_fd,
+            target_identity,
+            target_created,
+        ) = _prepare_empty_restore_target(parent.fd, target_name)
+        temp_name, temp_fd, staged_fd = _create_staging_directory(parent.fd)
+        staged_identity = _identity(os.fstat(staged_fd))
+        directory_identities[""] = staged_identity
 
         skipped_runtime: list[str] = []
         for member in plan:
             if member.skip_runtime:
                 skipped_runtime.append(member.relative_path)
                 continue
-            destination = staged_home / Path(
-                *PurePosixPath(member.relative_path).parts
+            _copy_validated_member_at(
+                zf,
+                member,
+                staged_fd,
+                directory_identities,
+                file_identities,
             )
-            _copy_validated_member(zf, member, destination)
 
-        _validate_staged_databases(staged_home)
-        _fsync_staged_tree(staged_home)
-        committed = False
-        try:
-            if hermes_root.is_symlink():
-                raise BackupError(f"import target became a symlink: {hermes_root}")
-            if hermes_root.exists() and (
-                not hermes_root.is_dir() or any(hermes_root.iterdir())
-            ):
-                raise BackupError(
-                    "import target changed and is no longer an empty directory"
-                )
-            # POSIX rename replaces an existing empty directory atomically. On
-            # a platform/filesystem that cannot do so, fail without deleting
-            # the target; the operator can retry with an absent root.
-            os.replace(staged_home, hermes_root)
-            committed = True
-        except BaseException as exc:
-            if not staged_home.exists() and hermes_root.exists():
-                committed = True
-            if committed:
-                raise RestoreActivatedDurabilityError(
-                    "restore root was activated, but commit completion could not "
-                    f"be confirmed: {exc}"
-                ) from exc
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                raise
-            if isinstance(exc, BackupError):
-                raise
-            raise BackupError(f"could not activate staged import: {exc}") from exc
+        _verify_staged_members(
+            staged_fd, plan, directory_identities, file_identities
+        )
+        _validate_staged_databases_at(
+            staged_fd, plan, directory_identities, file_identities
+        )
+        _fsync_tree_at(
+            staged_fd, directory_identities, file_identities
+        )
+        os.fsync(temp_fd)
+        _revalidate_restore_anchor(parent)
+        _revalidate_empty_restore_target(
+            parent.fd, target_name, target_fd, target_identity
+        )
 
+        promotion_attempted = True
+        _exchange_directories_at(temp_fd, "hermes-home", parent.fd, target_name)
+        promoted = True
+        _verify_promoted_target(
+            parent.fd,
+            target_name,
+            staged_identity,
+            temp_fd,
+            target_identity,
+        )
+        promoted_fd = _open_child_directory(parent.fd, target_name)
         try:
-            _fsync_directory(hermes_parent)
+            _verify_staged_members(
+                promoted_fd, plan, directory_identities, file_identities
+            )
+            _verify_tree_shape_at(
+                promoted_fd, directory_identities, file_identities
+            )
+        finally:
+            os.close(promoted_fd)
+        _revalidate_restore_anchor(parent)
+        try:
+            _fsync_restore_parent(parent.fd)
         except BaseException as exc:
             raise RestoreActivatedDurabilityError(
                 "restore root was activated, but parent-directory durability "
                 f"could not be confirmed: {exc}"
             ) from exc
 
+        try:
+            _cleanup_staging_directory(parent.fd, temp_name, temp_fd)
+            temp_name = ""
+            _fsync_restore_parent(parent.fd)
+        except BaseException as exc:
+            raise RestoreActivatedCleanupError(
+                "restore root is active, but displaced empty-target cleanup "
+                f"could not be confirmed: {exc}"
+            ) from exc
+
         restored = sum(1 for member in plan if not member.skip_runtime)
         return restored, 0, skipped_runtime
+    except (RestoreActivatedDurabilityError, RestoreActivatedCleanupError):
+        raise
+    except BaseException as exc:
+        if promotion_attempted and staged_identity is not None:
+            try:
+                current = os.stat(
+                    target_name, dir_fd=parent.fd, follow_symlinks=False
+                )
+                promoted = stat.S_ISDIR(current.st_mode) and _identity(current) == staged_identity
+            except OSError:
+                promoted = False
+        if promoted:
+            rollback_error: Optional[BaseException] = None
+            try:
+                _exchange_directories_at(temp_fd, "hermes-home", parent.fd, target_name)
+                promoted = False
+                restored_target = os.stat(
+                    target_name, dir_fd=parent.fd, follow_symlinks=False
+                )
+                if _identity(restored_target) != target_identity:
+                    raise BackupError("original empty target identity was not restored")
+                if target_created and not _remove_directory_if_identity(
+                    parent.fd, target_name, target_identity
+                ):
+                    raise BackupError("temporary empty target could not be removed")
+                target_created = False
+                _cleanup_staging_directory(parent.fd, temp_name, temp_fd)
+                temp_name = ""
+                _fsync_restore_parent(parent.fd)
+            except BaseException as rollback_exc:
+                rollback_error = rollback_exc
+            if rollback_error is not None:
+                raise RestoreRollbackError(
+                    "restore activation failed and rollback could not be confirmed: "
+                    f"{rollback_error}"
+                ) from exc
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise RestoreRolledBackError(
+                f"restore activation failed; empty-target state was restored: {exc}"
+            ) from exc
+        cleanup_error: Optional[BaseException] = None
+        try:
+            if temp_name:
+                _cleanup_staging_directory(parent.fd, temp_name, temp_fd)
+                temp_name = ""
+            if target_created and target_identity is not None:
+                if not _remove_directory_if_identity(
+                    parent.fd, target_name, target_identity
+                ):
+                    raise BackupError("temporary empty target could not be removed")
+                target_created = False
+            _fsync_restore_parent(parent.fd)
+        except BaseException as cleanup_exc:
+            cleanup_error = cleanup_exc
+        if cleanup_error is not None:
+            raise RestoreRollbackError(
+                "restore failed before activation and cleanup could not be confirmed: "
+                f"{cleanup_error}"
+            ) from exc
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        if isinstance(exc, BackupError):
+            raise
+        raise BackupError(f"could not stage or activate import: {exc}") from exc
+    finally:
+        if staged_fd >= 0:
+            os.close(staged_fd)
+        if temp_fd >= 0:
+            try:
+                _empty_directory_at(temp_fd)
+            except OSError:
+                pass
+            os.close(temp_fd)
+        if temp_name:
+            try:
+                os.rmdir(temp_name, dir_fd=parent.fd)
+            except OSError:
+                pass
+        if not promoted and target_created and target_identity is not None:
+            try:
+                _remove_directory_if_identity(parent.fd, target_name, target_identity)
+            except OSError:
+                pass
+        if target_fd >= 0:
+            os.close(target_fd)
+        parent.close()
 
 
 def run_import(args) -> None:
@@ -1354,6 +2004,11 @@ def run_import(args) -> None:
         sys.exit(1)
 
     hermes_root = Path(os.path.abspath(get_default_hermes_root()))
+    require_protected_control_file_capability(
+        ProtectedFileOperation.IMPORT,
+        (zip_path, hermes_root),
+        capability=ProtectedFileCapability.BACKUP_RESTORE,
+    )
     if hermes_root.is_symlink():
         print(f"Error: Import target cannot be a symlink: {hermes_root}")
         raise SystemExit(1)
@@ -1396,6 +2051,9 @@ def run_import(args) -> None:
             elapsed = time.monotonic() - t0
     except RestoreActivatedDurabilityError as exc:
         print(f"Error: Restore activated with durability unknown: {exc}")
+        raise SystemExit(1) from exc
+    except RestoreActivatedCleanupError as exc:
+        print(f"Error: Restore activated but cleanup is incomplete: {exc}")
         raise SystemExit(1) from exc
     except (BackupError, OSError, RuntimeError, ValueError, zipfile.BadZipFile) as exc:
         print(f"Error: Import failed: {exc}")
@@ -1860,6 +2518,11 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
     directory durability could not be confirmed, the distinct
     :class:`BackupPromotedDurabilityError` receipt is preserved for the caller.
     """
+    require_protected_control_file_capability(
+        ProtectedFileOperation.ARCHIVE,
+        (hermes_root, out_path),
+        capability=ProtectedFileCapability.BACKUP_RESTORE,
+    )
     sources: list[tuple[Path, str, str]] = []
     walk_errors: list[OSError] = []
     try:

@@ -4,8 +4,245 @@ from __future__ import annotations
 
 import os
 import json
+import unicodedata
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
+
+
+class ProtectedFileOperation(str, Enum):
+    READ = "read"
+    WRITE = "write"
+    RENAME = "rename"
+    DELETE = "delete"
+    ARCHIVE = "archive"
+    IMPORT = "import"
+
+
+class ProtectedFileCapability(str, Enum):
+    """Typed internal authority for Hermes control-file operations.
+
+    These values are deliberately not accepted by model-facing file tools.
+    Only narrow operator/config lifecycle call sites may pass them.
+    """
+
+    INTERNAL_CONFIG = "internal_config"
+    MCP_REGISTRATION = "mcp_registration"
+    PROFILE_LIFECYCLE = "profile_lifecycle"
+    BACKUP_RESTORE = "backup_restore"
+
+
+@dataclass(frozen=True)
+class ProtectedFileDecision:
+    allowed: bool
+    operation: ProtectedFileOperation
+    protected: bool
+    capability: Optional[ProtectedFileCapability]
+    matched_path: Optional[str] = None
+    reason: Optional[str] = None
+
+
+_CONTROL_FILE_NAMES = frozenset({
+    "auth.json",
+    "auth.lock",
+    "config.yaml",
+    "webhook_subscriptions.json",
+    ".env",
+    ".anthropic_oauth.json",
+    "mcp-authorizations.json",
+})
+_CONTROL_RELATIVE_FILES = frozenset({
+    ("auth", "google_oauth.json"),
+    ("cache", "bws_cache.json"),
+})
+_CONTROL_DIRECTORY_NAMES = frozenset({"mcp-installs", "mcp-tokens", "pairing"})
+_MUTATING_CONTROL_OPERATIONS = frozenset({
+    ProtectedFileOperation.WRITE,
+    ProtectedFileOperation.RENAME,
+    ProtectedFileOperation.DELETE,
+    ProtectedFileOperation.ARCHIVE,
+    ProtectedFileOperation.IMPORT,
+})
+
+
+def _normalized_component(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).casefold()
+
+
+def _absolute_path(path: str | os.PathLike[str], cwd: str | None = None) -> Path:
+    raw = os.path.expandvars(os.path.expanduser(os.fspath(path)))
+    if cwd and not os.path.isabs(raw):
+        raw = os.path.join(cwd, raw)
+    return Path(os.path.abspath(os.path.normpath(raw)))
+
+
+def _control_bases() -> list[Path]:
+    bases: list[Path] = []
+    for base in (_hermes_home_path(), _hermes_root_path()):
+        try:
+            absolute = _absolute_path(base)
+        except Exception:
+            continue
+        if absolute not in bases:
+            bases.append(absolute)
+    return bases
+
+
+def _relative_parts_casefold(path: Path, base: Path) -> Optional[tuple[str, ...]]:
+    try:
+        relative = path.relative_to(base)
+    except ValueError:
+        return None
+    return tuple(_normalized_component(part) for part in relative.parts)
+
+
+def _is_control_relative_path(parts: Sequence[str]) -> bool:
+    if not parts:
+        return False
+    if len(parts) == 1 and parts[0] in _CONTROL_FILE_NAMES:
+        return True
+    if tuple(parts) in _CONTROL_RELATIVE_FILES:
+        return True
+    if parts[0] in _CONTROL_DIRECTORY_NAMES:
+        return True
+    return False
+
+
+def _is_control_ancestor(parts: Sequence[str]) -> bool:
+    """Return true for directories whose mutation removes protected children."""
+    return tuple(parts) in {("auth",), ("cache",)}
+
+
+def _classify_control_path(candidate: Path, operation: ProtectedFileOperation) -> bool:
+    bases = _control_bases()
+    root = _absolute_path(_hermes_root_path())
+    for base in bases:
+        parts = _relative_parts_casefold(candidate, base)
+        if parts is not None and _is_control_relative_path(parts):
+            return True
+        if (
+            parts is not None
+            and operation in _MUTATING_CONTROL_OPERATIONS
+            and _is_control_ancestor(parts)
+        ):
+            return True
+
+    # Every named profile is an alternate Hermes root. Protect its control
+    # files even when it is not the active HERMES_HOME.
+    root_parts = _relative_parts_casefold(candidate, root)
+    if root_parts and len(root_parts) >= 3 and root_parts[0] == "profiles":
+        if _is_control_relative_path(root_parts[2:]):
+            return True
+
+    # Mutating a Hermes/profile root itself can rename/delete/archive every
+    # control file below it, so it is a protected target too.
+    if operation in _MUTATING_CONTROL_OPERATIONS:
+        if any(candidate == base for base in bases):
+            return True
+        if root_parts and len(root_parts) == 2 and root_parts[0] == "profiles":
+            return True
+        if root_parts == ("profiles",):
+            return True
+    return False
+
+
+def decide_protected_control_file(
+    operation: ProtectedFileOperation | str,
+    paths: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
+    *,
+    capability: ProtectedFileCapability | str | None = None,
+    cwd: str | None = None,
+) -> ProtectedFileDecision:
+    """Make one typed decision for aliases, resolved sources, and destinations."""
+    try:
+        typed_operation = ProtectedFileOperation(operation)
+    except ValueError:
+        raise ValueError(f"Unsupported protected-file operation: {operation!r}") from None
+    try:
+        typed_capability = ProtectedFileCapability(capability) if capability is not None else None
+    except ValueError:
+        raise ValueError(f"Unsupported protected-file capability: {capability!r}") from None
+
+    raw_paths = [paths] if isinstance(paths, (str, os.PathLike)) else list(paths)
+    for raw_path in raw_paths:
+        try:
+            lexical = _absolute_path(raw_path, cwd=cwd)
+            resolved = Path(os.path.realpath(lexical))
+        except (OSError, TypeError, ValueError) as exc:
+            return ProtectedFileDecision(
+                allowed=False,
+                operation=typed_operation,
+                protected=True,
+                capability=typed_capability,
+                matched_path=os.fspath(raw_path),
+                reason=f"protected-file path could not be normalized: {exc}",
+            )
+        if not (
+            _classify_control_path(lexical, typed_operation)
+            or _classify_control_path(resolved, typed_operation)
+        ):
+            continue
+
+        allowed_capabilities = {
+            ProtectedFileOperation.READ: {
+                ProtectedFileCapability.BACKUP_RESTORE,
+                ProtectedFileCapability.INTERNAL_CONFIG,
+                ProtectedFileCapability.MCP_REGISTRATION,
+                ProtectedFileCapability.PROFILE_LIFECYCLE,
+            },
+            ProtectedFileOperation.WRITE: {
+                ProtectedFileCapability.INTERNAL_CONFIG,
+                ProtectedFileCapability.MCP_REGISTRATION,
+            },
+            ProtectedFileOperation.RENAME: {ProtectedFileCapability.PROFILE_LIFECYCLE},
+            ProtectedFileOperation.DELETE: {ProtectedFileCapability.PROFILE_LIFECYCLE},
+            ProtectedFileOperation.ARCHIVE: {
+                ProtectedFileCapability.BACKUP_RESTORE,
+                ProtectedFileCapability.PROFILE_LIFECYCLE,
+            },
+            ProtectedFileOperation.IMPORT: {
+                ProtectedFileCapability.BACKUP_RESTORE,
+                ProtectedFileCapability.PROFILE_LIFECYCLE,
+            },
+        }[typed_operation]
+        if typed_capability in allowed_capabilities:
+            continue
+        return ProtectedFileDecision(
+            allowed=False,
+            operation=typed_operation,
+            protected=True,
+            capability=typed_capability,
+            matched_path=str(resolved),
+            reason=(
+                f"{typed_operation.value} denied for protected Hermes control path; "
+                "use an operator-authorized typed configuration/profile API"
+            ),
+        )
+
+    return ProtectedFileDecision(
+        allowed=True,
+        operation=typed_operation,
+        protected=False,
+        capability=typed_capability,
+    )
+
+
+def require_protected_control_file_capability(
+    operation: ProtectedFileOperation | str,
+    paths: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
+    *,
+    capability: ProtectedFileCapability | str | None = None,
+    cwd: str | None = None,
+) -> None:
+    decision = decide_protected_control_file(
+        operation,
+        paths,
+        capability=capability,
+        cwd=cwd,
+    )
+    if not decision.allowed:
+        raise PermissionError(decision.reason or "Protected Hermes control-file operation denied")
 
 
 def _hermes_home_path() -> Path:
@@ -301,6 +538,9 @@ def get_path_boundary_error(
 
 def is_write_denied(path: str) -> bool:
     """Return True if path is blocked by the write denylist or safe root."""
+    if not decide_protected_control_file(ProtectedFileOperation.WRITE, path).allowed:
+        return True
+
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
 
@@ -319,37 +559,6 @@ def is_write_denied(path: str) -> bool:
         for root in safe_roots
     ):
         return True
-
-    # Hermes control-plane files: block both the ACTIVE profile's view
-    # (hermes_home) AND the global root view. Without the root pass, a
-    # profile-mode session leaves <root>/auth.json + <root>/config.yaml
-    # writable — letting a prompt-injected write_file overwrite the global
-    # files that every profile inherits from (same shape as #15981).
-    control_file_names = ("auth.json", "config.yaml", "webhook_subscriptions.json")
-    mcp_tokens_dir_name = "mcp-tokens"
-
-    hermes_dirs = []
-    for base in (_hermes_home_path(), _hermes_root_path()):
-        try:
-            real = os.path.realpath(base)
-            if real not in hermes_dirs:
-                hermes_dirs.append(real)
-        except Exception:
-            continue
-
-    for base_real in hermes_dirs:
-        try:
-            mcp_real = os.path.realpath(os.path.join(base_real, mcp_tokens_dir_name))
-            if resolved == mcp_real or resolved.startswith(mcp_real + os.sep):
-                return True
-        except Exception:
-            pass
-        try:
-            pairing_real = os.path.realpath(os.path.join(base_real, "pairing"))
-            if resolved == pairing_real or resolved.startswith(pairing_real + os.sep):
-                return True
-        except Exception:
-            pass
 
     safe_roots = get_safe_write_roots()
     if safe_roots:
@@ -423,6 +632,18 @@ def get_read_block_error(path: str) -> Optional[str]:
     ``"auth.json"`` would otherwise miss the denylist when the task's
     terminal cwd differs from the process cwd.
     """
+    control_decision = decide_protected_control_file(ProtectedFileOperation.READ, path)
+    if not control_decision.allowed:
+        kind = (
+            "MCP token store"
+            if "mcp-tokens" in _normalized_component(str(control_decision.matched_path or path))
+            else "credential store or protected Hermes control path"
+        )
+        return (
+            f"Access denied: {path} is a Hermes {kind} and "
+            "cannot be read by model-facing file tools."
+        )
+
     resolved = Path(path).expanduser().resolve()
 
     # Resolve BOTH the active HERMES_HOME (profile-aware) AND the global

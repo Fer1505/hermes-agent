@@ -163,11 +163,12 @@ def test_mcp_add_rejects_dangerous_entry_before_probe(monkeypatch, capsys):
         auth=None,
         preset=None,
         env=None,
+        authorize_stdio=True,
     ))
 
     out = capsys.readouterr().out
     assert probed is False
-    assert "NOT saved" in out
+    assert "not operator-authorizable" in out
 
 
 def test_probe_rejects_dangerous_entry_before_connect(monkeypatch):
@@ -188,8 +189,8 @@ def test_probe_rejects_dangerous_entry_before_connect(monkeypatch):
     assert connected is False
 
 
-def test_runtime_loader_skips_dangerous_entry(monkeypatch):
-    from tools.mcp_tool import _load_mcp_config
+def test_runtime_loader_quarantines_dangerous_and_unpinned_entries(monkeypatch):
+    from tools.mcp_tool import _load_mcp_config, get_mcp_quarantine
 
     servers = {
         "evil": _dangerous_entry(),
@@ -200,7 +201,10 @@ def test_runtime_loader_skips_dangerous_entry(monkeypatch):
     loaded = _load_mcp_config()
 
     assert "evil" not in loaded
-    assert loaded["clean"]["command"] == "npx"
+    assert "clean" not in loaded
+    quarantine = get_mcp_quarantine()
+    assert "network egress" in " ".join(quarantine["evil"])
+    assert "unpinned/provenance-free" in " ".join(quarantine["clean"])
 
 
 def test_explicit_registration_skips_dangerous_entry_before_connect(monkeypatch):
@@ -247,7 +251,7 @@ def test_explicit_registration_skips_dangerous_entry_before_connect(monkeypatch)
             mcp_tool._server_connect_errors.clear()
             mcp_tool._server_connect_errors.update(saved_errors)
 
-    assert connected == ["clean"]
+    assert connected == []
 
 
 def test_migration_disables_existing_dangerous_entry(tmp_path):
@@ -297,11 +301,88 @@ def test_profile_mcp_write_skips_dangerous_entry(tmp_path):
 
     written = _write_profile_mcp_servers(profile_dir, servers)
 
-    assert written == 1
+    assert written == 0
     token = set_hermes_home_override(str(profile_dir))
     try:
         config = load_config()
     finally:
         reset_hermes_home_override(token)
     assert "evil" not in config.get("mcp_servers", {})
-    assert "clean" in config.get("mcp_servers", {})
+    assert "clean" not in config.get("mcp_servers", {})
+
+
+def test_operator_authorization_pins_direct_executable_and_args(tmp_path):
+    import shutil
+
+    from hermes_cli.mcp_security import (
+        authorize_operator_stdio_entry,
+        validate_mcp_server_entry,
+    )
+
+    executable = tmp_path / "approved-mcp"
+    shutil.copyfile("/bin/echo", executable)
+    executable.chmod(0o755)
+    entry = authorize_operator_stdio_entry(
+        "approved",
+        {"command": str(executable), "args": ["serve"]},
+    )
+
+    assert validate_mcp_server_entry(
+        "approved", entry, require_attestation=True
+    ) == []
+
+    changed_args = dict(entry)
+    changed_args["args"] = ["different"]
+    issues = validate_mcp_server_entry(
+        "approved", changed_args, require_attestation=True
+    )
+    assert "changed after authorization" in " ".join(issues)
+
+
+def test_operator_authorization_detects_changed_executable(tmp_path):
+    import shutil
+
+    from hermes_cli.mcp_security import (
+        authorize_operator_stdio_entry,
+        validate_mcp_server_entry,
+    )
+
+    executable = tmp_path / "approved-mcp"
+    shutil.copyfile("/bin/echo", executable)
+    executable.chmod(0o755)
+    entry = authorize_operator_stdio_entry("approved", {"command": str(executable)})
+    executable.write_bytes(executable.read_bytes() + b"changed")
+
+    issues = validate_mcp_server_entry(
+        "approved", entry, require_attestation=True
+    )
+    assert "changed since authorization" in " ".join(issues)
+
+
+def test_operator_attestation_without_matching_receipt_fails_closed(tmp_path):
+    import shutil
+
+    from hermes_cli.mcp_security import (
+        authorize_operator_stdio_entry,
+        revoke_operator_stdio_entry,
+        validate_mcp_server_entry,
+    )
+
+    executable = tmp_path / "approved-mcp"
+    shutil.copyfile("/bin/echo", executable)
+    executable.chmod(0o755)
+    entry = authorize_operator_stdio_entry("approved", {"command": str(executable)})
+    revoke_operator_stdio_entry("approved")
+
+    issues = validate_mcp_server_entry(
+        "approved", entry, require_attestation=True
+    )
+    assert "no matching operator authorization receipt" in " ".join(issues)
+
+
+@pytest.mark.parametrize("command", ["bash", "python3", "node", "npx"])
+def test_operator_authorization_refuses_indirect_launchers(command):
+    from hermes_cli.mcp_security import authorize_operator_stdio_entry
+
+    with pytest.raises(ValueError, match="indirect stdio launcher"):
+        authorize_operator_stdio_entry("indirect", {"command": command})

@@ -35,8 +35,10 @@ from pathlib import Path
 from tools.binary_extensions import BINARY_EXTENSIONS
 
 from agent.file_safety import (
+    ProtectedFileOperation,
     build_write_denied_paths,
     build_write_denied_prefixes,
+    decide_protected_control_file,
     is_write_denied as _shared_is_write_denied,
 )
 
@@ -143,8 +145,13 @@ def _has_bom(text: Optional[str]) -> bool:
     return bool(text) and text.startswith(_UTF8_BOM)
 
 
-def _is_write_denied(path: str) -> bool:
+def _is_write_denied(
+    path: str,
+    operation: ProtectedFileOperation = ProtectedFileOperation.WRITE,
+) -> bool:
     """Return True if path is on the write deny list."""
+    if not decide_protected_control_file(operation, path).allowed:
+        return True
     return _shared_is_write_denied(path)
 
 
@@ -1249,7 +1256,7 @@ class ShellFileOperations(FileOperations):
 
     def _python_delete(self, path: str, recursive: bool) -> WriteResult:
         path = self._expand_path(path)
-        if _is_write_denied(path):
+        if _is_write_denied(path, ProtectedFileOperation.DELETE):
             return WriteResult(error=f"Delete denied: {path} is a protected path")
 
         # We can't shell out to ``rm`` here — it doesn't exist on Windows
@@ -1295,7 +1302,7 @@ class ShellFileOperations(FileOperations):
         src = self._expand_path(src)
         dst = self._expand_path(dst)
         for p in (src, dst):
-            if _is_write_denied(p):
+            if _is_write_denied(p, ProtectedFileOperation.RENAME):
                 return WriteResult(error=f"Move denied: {p} is a protected path")
         result = self._exec(
             f"mv {self._escape_shell_arg(src)} {self._escape_shell_arg(dst)}"

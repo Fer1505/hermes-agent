@@ -103,16 +103,14 @@ class TestLoadMCPConfig:
         """Valid mcp_servers config is returned as-is."""
         servers = {
             "filesystem": {
-                "command": "npx",
-                "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
-                "env": {},
+                "url": "https://example.com/mcp",
             }
         }
         with patch("hermes_cli.config.load_config", return_value={"mcp_servers": servers}):
             from tools.mcp_tool import _load_mcp_config
             result = _load_mcp_config()
             assert "filesystem" in result
-            assert result["filesystem"]["command"] == "npx"
+            assert result["filesystem"]["url"] == "https://example.com/mcp"
 
     def test_mcp_servers_not_dict_returns_empty(self):
         """mcp_servers set to non-dict value -> empty dict."""
@@ -1172,7 +1170,7 @@ class TestToolsetInjection:
             server._tools = mock_tools
             return server
 
-        fake_config = {"fs": {"command": "npx", "args": []}}
+        fake_config = {"fs": {"url": "https://example.com/fs"}}
 
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
              patch("tools.mcp_tool._servers", fresh_servers), \
@@ -1210,7 +1208,7 @@ class TestToolsetInjection:
             # Built-in toolset named "terminal" — must not be overwritten
             "terminal": {"tools": ["terminal"], "description": "Terminal tools", "includes": []},
         }
-        fake_config = {"terminal": {"command": "npx", "args": []}}
+        fake_config = {"terminal": {"url": "https://example.com/terminal"}}
 
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
              patch("tools.mcp_tool._servers", fresh_servers), \
@@ -1247,8 +1245,8 @@ class TestToolsetInjection:
             return server
 
         fake_config = {
-            "broken": {"command": "bad"},
-            "good": {"command": "npx", "args": []},
+            "broken": {"url": "https://example.com/broken"},
+            "good": {"url": "https://example.com/good"},
         }
         fake_toolsets = {
             "hermes-cli": {"tools": [], "description": "CLI", "includes": []},
@@ -1289,8 +1287,8 @@ class TestToolsetInjection:
             return server
 
         fake_config = {
-            "broken": {"command": "bad"},
-            "good": {"command": "npx", "args": []},
+            "broken": {"url": "https://example.com/broken"},
+            "good": {"url": "https://example.com/good"},
         }
         fake_toolsets = {
             "hermes-cli": {"tools": [], "description": "CLI", "includes": []},
@@ -3394,8 +3392,8 @@ class TestDiscoveryFailedCount:
         from tools.mcp_tool import discover_mcp_tools, _servers, _ensure_mcp_loop
 
         fake_config = {
-            "good_server": {"command": "npx", "args": ["good"]},
-            "bad_server": {"command": "npx", "args": ["bad"]},
+            "good_server": {"url": "https://example.com/good"},
+            "bad_server": {"url": "https://example.com/bad"},
         }
 
         async def fake_register(name, cfg):
@@ -3468,9 +3466,9 @@ class TestDiscoveryFailedCount:
         from tools.mcp_tool import discover_mcp_tools, _servers, _ensure_mcp_loop
 
         fake_config = {
-            "ok1": {"command": "npx", "args": ["ok1"]},
-            "ok2": {"command": "npx", "args": ["ok2"]},
-            "fail1": {"command": "npx", "args": ["fail"]},
+            "ok1": {"url": "https://example.com/ok1"},
+            "ok2": {"url": "https://example.com/ok2"},
+            "fail1": {"url": "https://example.com/fail"},
         }
 
         async def selective_register(name, cfg):
@@ -3993,7 +3991,7 @@ class TestRegisterMcpServers:
         try:
             with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
                  patch("tools.mcp_tool._existing_tool_names", return_value=["mcp_existing_tool"]):
-                result = register_mcp_servers({"existing": {"command": "test"}})
+                result = register_mcp_servers({"existing": {"url": "https://example.com/mcp"}})
             assert result == ["mcp_existing_tool"]
         finally:
             _servers.pop("existing", None)
@@ -4012,7 +4010,7 @@ class TestRegisterMcpServers:
     def test_connects_new_servers(self):
         from tools.mcp_tool import register_mcp_servers, _servers, _ensure_mcp_loop
 
-        fake_config = {"my_server": {"command": "npx", "args": ["test"]}}
+        fake_config = {"my_server": {"url": "https://example.com/mcp"}}
 
         async def fake_register(name, cfg):
             server = _make_mock_server(name)
@@ -4032,7 +4030,7 @@ class TestRegisterMcpServers:
     def test_logs_summary_on_success(self):
         from tools.mcp_tool import register_mcp_servers, _servers, _ensure_mcp_loop
 
-        fake_config = {"srv": {"command": "npx", "args": ["test"]}}
+        fake_config = {"srv": {"url": "https://example.com/mcp"}}
 
         async def fake_register(name, cfg):
             server = _make_mock_server(name)
@@ -4198,15 +4196,15 @@ class TestMcpParallelToolCalls:
         )
         fake_config = {
             "parallel_srv": {
-                "command": "echo",
+                "url": "https://example.com/parallel",
                 "supports_parallel_tool_calls": True,
             },
             "serial_srv": {
-                "command": "echo",
+                "url": "https://example.com/serial",
                 "supports_parallel_tool_calls": False,
             },
             "default_srv": {
-                "command": "echo",
+                "url": "https://example.com/default",
                 # no supports_parallel_tool_calls key
             },
         }
@@ -4233,7 +4231,7 @@ class TestMcpParallelToolCalls:
         # First registration: parallel enabled
         config_on = {
             "toggle_srv": {
-                "command": "echo",
+                "url": "https://example.com/toggle",
                 "supports_parallel_tool_calls": True,
             },
         }
@@ -4248,7 +4246,7 @@ class TestMcpParallelToolCalls:
         # Second registration: parallel disabled
         config_off = {
             "toggle_srv": {
-                "command": "echo",
+                "url": "https://example.com/toggle",
                 "supports_parallel_tool_calls": False,
             },
         }

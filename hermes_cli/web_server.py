@@ -9125,6 +9125,8 @@ async def set_mcp_server_enabled(
     can be re-enabled without re-entering their settings.
     """
     with _profile_scope(body.profile or profile):
+        from hermes_cli.mcp_config import _authorize_mcp_config_write
+        _authorize_mcp_config_write()
         cfg = load_config()
         servers = cfg.get("mcp_servers")
         if not isinstance(servers, dict) or name not in servers:
@@ -10803,6 +10805,7 @@ def _write_profile_mcp_servers(profile_dir: Path, servers: List["MCPServerCreate
     Returns the number of servers written.
     """
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from hermes_cli.mcp_config import _authorize_mcp_config_write
     from hermes_cli.mcp_security import validate_mcp_server_entry
 
     written = 0
@@ -10829,18 +10832,24 @@ def _write_profile_mcp_servers(profile_dir: Path, servers: List["MCPServerCreate
                 # Nothing usable to write (neither url nor command) — skip
                 # rather than persist an empty, unusable server stanza.
                 continue
-            issues = validate_mcp_server_entry(name, entry)
+            issues = validate_mcp_server_entry(
+                name,
+                entry,
+                require_attestation=True,
+            )
             if issues:
                 _log.warning("Profile-create: skipping MCP server '%s': %s", name, "; ".join(issues))
                 continue
             mcp[name] = entry
             written += 1
         if written:
+            _authorize_mcp_config_write()
             save_config(cfg)
         elif not mcp:
             # We created an empty mcp_servers dict but wrote nothing — don't
             # leave a stray empty key in the new profile's config.
             cfg.pop("mcp_servers", None)
+            _authorize_mcp_config_write()
             save_config(cfg)
     finally:
         reset_hermes_home_override(token)

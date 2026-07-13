@@ -204,6 +204,36 @@ class TestManifestParsing:
 
 
 class TestInstall:
+    def test_legacy_exact_catalog_entry_can_be_attested_during_migration(
+        self, catalog_dir
+    ):
+        _write_manifest(catalog_dir, "demo", _basic_manifest())
+        from hermes_cli.mcp_security import (
+            upgrade_matching_catalog_stdio_entry,
+            validate_mcp_server_entry,
+        )
+
+        upgraded = upgrade_matching_catalog_stdio_entry(
+            "demo",
+            {"command": "npx", "args": ["-y", "demo-mcp"], "enabled": True},
+        )
+
+        assert upgraded is not None
+        assert upgraded["enabled"] is True
+        assert upgraded["_hermes_stdio_authorization"]["authorization"] == "catalog"
+        assert validate_mcp_server_entry(
+            "demo", upgraded, require_attestation=True
+        ) == []
+
+    def test_legacy_custom_entry_is_not_catalog_attested(self, catalog_dir):
+        _write_manifest(catalog_dir, "demo", _basic_manifest())
+        from hermes_cli.mcp_security import upgrade_matching_catalog_stdio_entry
+
+        assert upgrade_matching_catalog_stdio_entry(
+            "demo",
+            {"command": "npx", "args": ["-y", "different-package"]},
+        ) is None
+
     def test_install_simple_stdio_writes_config(self, catalog_dir):
         _write_manifest(catalog_dir, "demo", _basic_manifest())
         from hermes_cli.mcp_catalog import install_entry
@@ -214,7 +244,8 @@ class TestInstall:
         cfg = load_config()
         servers = cfg["mcp_servers"]
         assert "demo" in servers
-        assert servers["demo"]["command"] == "npx"
+        assert Path(servers["demo"]["command"]).name in {"npx", "npx-cli.js"}
+        assert servers["demo"]["_hermes_stdio_authorization"]["authorization"] == "catalog"
         assert servers["demo"]["args"] == ["-y", "demo-mcp"]
         assert servers["demo"]["enabled"] is True
 
@@ -258,6 +289,10 @@ class TestInstall:
         # Mock the git clone — return a known directory
         fake_clone = tmp_path / "fake-clone"
         fake_clone.mkdir()
+        import shutil
+        shutil.copyfile("/bin/echo", fake_clone / "run.sh")
+        (fake_clone / "run.sh").chmod(0o755)
+        (fake_clone / "cfg.json").write_text("{}\n", encoding="utf-8")
 
         from hermes_cli import mcp_catalog
         from hermes_cli.mcp_catalog import install_entry
