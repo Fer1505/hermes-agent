@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-06-16T18:04:33Z",
+  "updated_at": "2026-07-13T01:44:24Z",
   "metadata": {
     "source": "hermes-agent repo",
     "docs": "https://hermes-agent.nousresearch.com/docs/reference/model-catalog"
@@ -26,6 +26,10 @@
         },
         {
           "id": "anthropic/claude-haiku-4.5",
+          "description": ""
+        },
+        {
+          "id": "openai/gpt-5.6-sol",
           "description": ""
         },
         {
@@ -160,6 +164,9 @@
         },
         {
           "id": "anthropic/claude-haiku-4.5"
+        },
+        {
+          "id": "openai/gpt-5.6-sol"
         },
         {
           "id": "openai/gpt-5.5"
