@@ -12,6 +12,7 @@ import os
 logger = logging.getLogger(__name__)
 
 DEFAULT_CODEX_MODELS: List[str] = [
+    "gpt-5.6-sol",
     "gpt-5.5",
     "gpt-5.4-mini",
     "gpt-5.4",

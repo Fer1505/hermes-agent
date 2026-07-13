@@ -324,6 +324,7 @@ class TestCodexOAuthContextLength:
         from agent.model_metadata import get_model_context_length
 
         expected = {
+            "gpt-5.6-sol": 372_000,
             "gpt-5.5": 272_000,
             "gpt-5.4": 272_000,
             "gpt-5.4-mini": 272_000,
@@ -357,6 +358,7 @@ class TestCodexOAuthContextLength:
         fake_response.status_code = 200
         fake_response.json.return_value = {
             "models": [
+                {"slug": "gpt-5.6-sol", "context_window": 372_000},
                 {"slug": "gpt-5.5", "context_window": 300_000},
                 {"slug": "gpt-5.4", "context_window": 400_000},
             ]
@@ -365,6 +367,12 @@ class TestCodexOAuthContextLength:
         with patch("agent.model_metadata.requests.get", return_value=fake_response), \
              patch("agent.model_metadata.get_cached_context_length", return_value=None), \
              patch("agent.model_metadata.save_context_length"):
+            ctx_56 = get_model_context_length(
+                model="gpt-5.6-sol",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_key="fake-token",
+                provider="openai-codex",
+            )
             ctx_55 = get_model_context_length(
                 model="gpt-5.5",
                 base_url="https://chatgpt.com/backend-api/codex",
@@ -377,6 +385,7 @@ class TestCodexOAuthContextLength:
                 api_key="fake-token",
                 provider="openai-codex",
             )
+        assert ctx_56 == 372_000
         assert ctx_55 == 300_000
         assert ctx_54 == 400_000
 
@@ -424,6 +433,21 @@ class TestCodexOAuthContextLength:
             f"Non-Codex gpt-5.5 resolved to {ctx}; Codex 272k override "
             "leaked outside openai-codex provider"
         )
+
+    def test_gpt56_sol_direct_api_uses_full_context(self):
+        from agent.model_metadata import get_model_context_length
+
+        with patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.models_dev.lookup_models_dev_context", return_value=None):
+            ctx = get_model_context_length(
+                model="gpt-5.6-sol",
+                base_url="https://api.openai.com/v1",
+                api_key="",
+                provider="openai-api",
+            )
+        assert ctx == 1_050_000
 
     def test_stale_codex_cache_over_400k_is_invalidated(self, tmp_path, monkeypatch):
         """Pre-PR #14935 builds cached gpt-5.5 at 1.05M (from models.dev)

@@ -53,6 +53,7 @@ def test_get_codex_model_ids_falls_back_to_curated_defaults(tmp_path, monkeypatc
     models = get_codex_model_ids()
 
     assert models[: len(DEFAULT_CODEX_MODELS)] == DEFAULT_CODEX_MODELS
+    assert "gpt-5.6-sol" in models
     assert "gpt-5.4" in models
     assert "gpt-5.3-codex-spark" in models
 

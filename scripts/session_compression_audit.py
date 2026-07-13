@@ -31,6 +31,7 @@ if str(REPO_ROOT) not in sys.path:
 
 _MINIMUM_CONTEXT_LENGTH = 64_000
 _CODEX_OAUTH_CONTEXT_FALLBACK = {
+    "gpt-5.6-sol": 372_000,
     "gpt-5.1-codex-max": 272_000,
     "gpt-5.1-codex-mini": 272_000,
     "gpt-5.3-codex-spark": 128_000,
@@ -50,6 +51,7 @@ _DEFAULT_CONTEXT_LENGTHS = {
     "claude-opus-4.6": 1_000_000,
     "claude-sonnet-4.6": 1_000_000,
     "claude": 200_000,
+    "gpt-5.6": 1_050_000,
     "gpt-5.5": 1_050_000,
     "gpt-5.4-nano": 400_000,
     "gpt-5.4-mini": 400_000,
