@@ -1823,6 +1823,14 @@ class OpenVikingMemoryProvider(MemoryProvider):
     def name(self) -> str:
         return "openviking"
 
+    def memory_write_delivery_contract(self) -> Dict[str, str]:
+        return {
+            "delivery_semantics": "idempotent-at-least-once",
+            "acknowledgement": "provider-write-response",
+            "idempotency": "deterministic-uri-create-or-replace",
+            "readback": "exact-content-readback",
+        }
+
     def is_available(self) -> bool:
         """Check if OpenViking endpoint is configured. No network calls."""
         if os.environ.get("OPENVIKING_ENDPOINT"):
@@ -3263,11 +3271,33 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     self._endpoint, self._api_key,
                     account=self._account, user=self._user, agent=self._agent,
                 )
-                client.post("/api/v1/content/write", {
+                payload = {
                     "uri": uri,
                     "content": content,
                     "mode": "create",
-                })
+                }
+                try:
+                    client.post("/api/v1/content/write", payload)
+                except _OpenVikingHTTPError as exc:
+                    if not outbox_event_id or exc.status_code != 409:
+                        raise
+                    # The deterministic URI may already exist when the
+                    # provider accepted a prior attempt but the process died
+                    # before the local outbox receipt committed. Replacing the
+                    # same event's exact content makes that replay idempotent.
+                    client.post(
+                        "/api/v1/content/write",
+                        {**payload, "mode": "replace"},
+                    )
+                if outbox_event_id:
+                    readback = client.get(
+                        "/api/v1/content/read",
+                        params={"uri": uri},
+                    )
+                    if not isinstance(readback, dict) or readback.get("result") != content:
+                        raise RuntimeError(
+                            "OpenViking content readback did not match the write"
+                        )
             except Exception as e:
                 logger.debug("OpenViking memory mirror failed: %s", e)
                 if outbox_event_id:

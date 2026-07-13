@@ -125,6 +125,14 @@ class HolographicMemoryProvider(MemoryProvider):
     def name(self) -> str:
         return "holographic"
 
+    def memory_write_delivery_contract(self) -> Dict[str, str]:
+        return {
+            "delivery_semantics": "idempotent-at-least-once",
+            "acknowledgement": "sqlite-commit-fact-id",
+            "idempotency": "unique-content",
+            "readback": "local-transaction-result",
+        }
+
     def is_available(self) -> bool:
         return True  # SQLite is always available, numpy is optional
 
@@ -252,7 +260,11 @@ class HolographicMemoryProvider(MemoryProvider):
         if action == "add" and self._store and content:
             category = "user_pref" if target == "user" else "general"
             if (metadata or {}).get("outbox_event_id"):
-                self._store.add_fact(content, category=category)
+                fact_id = self._store.add_fact(content, category=category)
+                if not isinstance(fact_id, int) or fact_id <= 0:
+                    raise RuntimeError(
+                        "Holographic store did not return a committed fact id"
+                    )
                 return
             try:
                 self._store.add_fact(content, category=category)

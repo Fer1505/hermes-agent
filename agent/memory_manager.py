@@ -732,6 +732,10 @@ class MemoryManager:
                     "consecutive_failures": state.consecutive_failures,
                     "circuit_open": now < state.circuit_open_until,
                 }
+            if provider.name != "builtin":
+                provider_health["memory_write_delivery"] = (
+                    self._provider_memory_write_delivery_contract(provider)
+                )
             if self._write_outbox is not None and provider.name != "builtin":
                 try:
                     outbox_stats = self._write_outbox.stats(provider.name)
@@ -1118,6 +1122,35 @@ class MemoryManager:
             return "positional"
         return "legacy"
 
+    @staticmethod
+    def _provider_memory_write_delivery_contract(
+        provider: MemoryProvider,
+    ) -> Dict[str, str]:
+        """Return a bounded, complete, non-secret provider capability record."""
+        fallback = {
+            "delivery_semantics": "at-least-once",
+            "acknowledgement": "provider-hook-return",
+            "idempotency": "none",
+            "readback": "none",
+        }
+        try:
+            declared = provider.memory_write_delivery_contract()
+        except Exception as e:
+            logger.debug(
+                "Memory provider '%s' delivery contract failed: %s",
+                provider.name,
+                e,
+            )
+            return fallback
+        if not isinstance(declared, dict):
+            return fallback
+
+        normalized: Dict[str, str] = {}
+        for key, default in fallback.items():
+            value = str(declared.get(key) or default).strip()
+            normalized[key] = value[:96] or default
+        return normalized
+
     def on_memory_write(
         self,
         action: str,
@@ -1152,6 +1185,7 @@ class MemoryManager:
         queued = False
         for provider in providers:
             event_metadata = dict(metadata or {})
+            delivery_contract = self._provider_memory_write_delivery_contract(provider)
             event_id = self._memory_write_event_id(
                 provider.name,
                 action,
@@ -1161,7 +1195,12 @@ class MemoryManager:
             )
             event_metadata.pop("_outbox_operation_index", None)
             event_metadata["outbox_event_id"] = event_id
-            event_metadata["delivery_semantics"] = "at-least-once"
+            event_metadata["delivery_semantics"] = delivery_contract[
+                "delivery_semantics"
+            ]
+            event_metadata["delivery_idempotency"] = delivery_contract[
+                "idempotency"
+            ]
             try:
                 result = self._write_outbox.enqueue(
                     event_id=event_id,
@@ -1334,8 +1373,10 @@ class MemoryManager:
         event: MemoryWriteEvent,
     ) -> bool:
         metadata = dict(event.metadata)
+        delivery_contract = self._provider_memory_write_delivery_contract(provider)
         metadata["outbox_event_id"] = event.event_id
-        metadata["delivery_semantics"] = "at-least-once"
+        metadata["delivery_semantics"] = delivery_contract["delivery_semantics"]
+        metadata["delivery_idempotency"] = delivery_contract["idempotency"]
         metadata["delivery_attempt"] = event.attempts + 1
         return self._deliver_memory_write(
             provider,

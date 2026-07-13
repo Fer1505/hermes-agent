@@ -232,6 +232,14 @@ class ByteRoverMemoryProvider(MemoryProvider):
     def name(self) -> str:
         return "byterover"
 
+    def memory_write_delivery_contract(self) -> Dict[str, str]:
+        return {
+            "delivery_semantics": "at-least-once",
+            "acknowledgement": "cli-exit-zero",
+            "idempotency": "none",
+            "readback": "none",
+        }
+
     def is_available(self) -> bool:
         """Check if brv CLI is installed. No network calls."""
         return _resolve_brv_path() is not None
@@ -338,10 +346,19 @@ class ByteRoverMemoryProvider(MemoryProvider):
         def _write():
             try:
                 label = "User profile" if target == "user" else "Agent memory"
-                _run_brv(
+                result = _run_brv(
                     ["curate", "--", f"[{label}] {content}"],
                     timeout=_CURATE_TIMEOUT, cwd=self._cwd,
                 )
+                if not isinstance(result, dict) or result.get("success") is not True:
+                    error = (
+                        str(result.get("error") or "")
+                        if isinstance(result, dict)
+                        else ""
+                    )
+                    raise RuntimeError(
+                        error or "ByteRover curate did not acknowledge success"
+                    )
             except Exception as e:
                 logger.debug("ByteRover memory mirror failed: %s", e)
                 if (metadata or {}).get("outbox_event_id"):

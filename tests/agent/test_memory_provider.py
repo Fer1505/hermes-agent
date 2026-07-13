@@ -461,6 +461,12 @@ class TestMemoryManager:
                 "prefetch_inflight": False,
                 "consecutive_failures": 0,
                 "circuit_open": False,
+                "memory_write_delivery": {
+                    "delivery_semantics": "at-least-once",
+                    "acknowledgement": "provider-hook-return",
+                    "idempotency": "none",
+                    "readback": "none",
+                },
             },
         }
         assert mgr.initialize_all(session_id="test-123", platform="cli") == 2
@@ -500,6 +506,12 @@ class TestMemoryManager:
             "prefetch_inflight": False,
             "consecutive_failures": 0,
             "circuit_open": False,
+            "memory_write_delivery": {
+                "delivery_semantics": "at-least-once",
+                "acknowledgement": "provider-hook-return",
+                "idempotency": "none",
+                "readback": "none",
+            },
         }
 
     # -- Error resilience ---------------------------------------------------

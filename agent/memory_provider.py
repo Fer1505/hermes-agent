@@ -297,6 +297,26 @@ class MemoryProvider(ABC):
         Use to mirror built-in memory writes to your backend.
         """
 
+    def memory_write_delivery_contract(self) -> Dict[str, str]:
+        """Describe the provider's explicit-memory delivery guarantees.
+
+        The manager exposes this non-secret declaration in provider health and
+        stamps its delivery semantics onto durable outbox events.  The default
+        is deliberately conservative for existing third-party plugins: a
+        successful callback acknowledges one attempt, but replay can duplicate
+        the remote effect and no readback is performed.
+
+        Providers should only advertise stronger semantics when the adapter
+        actually supplies a stable provider key or deterministic target and
+        validates the documented acknowledgement/readback boundary.
+        """
+        return {
+            "delivery_semantics": "at-least-once",
+            "acknowledgement": "provider-hook-return",
+            "idempotency": "none",
+            "readback": "none",
+        }
+
     def backup_paths(self) -> List[str]:
         """Return extra on-disk paths this provider stores OUTSIDE HERMES_HOME.
 

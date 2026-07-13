@@ -474,6 +474,29 @@ class RetainDBMemoryProvider(MemoryProvider):
     def name(self) -> str:
         return "retaindb"
 
+    def memory_write_delivery_contract(self) -> Dict[str, str]:
+        return {
+            "delivery_semantics": "at-least-once",
+            "acknowledgement": "synchronous-success-response",
+            "idempotency": "none",
+            "readback": "available-by-memory-id-not-performed",
+        }
+
+    @staticmethod
+    def _memory_write_accepted(receipt: Any) -> bool:
+        """Validate current sync responses and the documented legacy ID shape."""
+        if not isinstance(receipt, dict):
+            return False
+        if receipt.get("success") is True:
+            mode = str(receipt.get("mode") or "").strip().lower()
+            return mode in {"", "sync", "synchronous"}
+        if str(receipt.get("id") or receipt.get("memory_id") or "").strip():
+            return True
+        memory = receipt.get("memory")
+        return isinstance(memory, dict) and bool(
+            str(memory.get("id") or "").strip()
+        )
+
     def is_available(self) -> bool:
         return bool(os.environ.get("RETAINDB_API_KEY"))
 
@@ -756,15 +779,28 @@ class RetainDBMemoryProvider(MemoryProvider):
             return
         memory_type = "preference" if target == "user" else "factual"
         if (metadata or {}).get("outbox_event_id"):
-            self._client.add_memory(self._user_id, self._session_id, content, memory_type=memory_type)
-            return
-        try:
-            self._client.add_memory(
+            receipt = self._client.add_memory(
                 self._user_id,
                 self._session_id,
                 content,
                 memory_type=memory_type,
             )
+            if not self._memory_write_accepted(receipt):
+                raise RuntimeError(
+                    "RetainDB did not return a synchronous success acknowledgement"
+                )
+            return
+        try:
+            receipt = self._client.add_memory(
+                self._user_id,
+                self._session_id,
+                content,
+                memory_type=memory_type,
+            )
+            if not self._memory_write_accepted(receipt):
+                raise RuntimeError(
+                    "RetainDB did not return a synchronous success acknowledgement"
+                )
         except Exception as exc:
             logger.debug("RetainDB memory mirror failed: %s", exc)
 

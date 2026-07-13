@@ -545,6 +545,14 @@ class SupermemoryMemoryProvider(MemoryProvider):
     def name(self) -> str:
         return "supermemory"
 
+    def memory_write_delivery_contract(self) -> Dict[str, str]:
+        return {
+            "delivery_semantics": "idempotent-at-least-once",
+            "acknowledgement": "provider-accepted-document-id",
+            "idempotency": "provider-custom-id",
+            "readback": "document-status-available-not-required",
+        }
+
     def is_available(self) -> bool:
         # Key presence only — no SDK import check. The supermemory SDK is
         # lazy-installed when the client is first constructed in initialize()
@@ -809,7 +817,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
 
         def _run():
             try:
-                self._client.add_memory(
+                receipt = self._client.add_memory(
                     content.strip(),
                     metadata={
                         "target": target,
@@ -819,6 +827,17 @@ class SupermemoryMemoryProvider(MemoryProvider):
                     entity_context=self._entity_context,
                     custom_id=str((metadata or {}).get("outbox_event_id") or "") or None,
                 )
+                if (metadata or {}).get("outbox_event_id") and not str(
+                    (
+                        (receipt or {}).get("id")
+                        if isinstance(receipt, dict)
+                        else ""
+                    )
+                    or ""
+                ).strip():
+                    raise RuntimeError(
+                        "Supermemory did not return the required document id"
+                    )
             except Exception:
                 logger.debug("Supermemory on_memory_write failed", exc_info=True)
                 if (metadata or {}).get("outbox_event_id"):

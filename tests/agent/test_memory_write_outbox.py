@@ -190,9 +190,41 @@ def test_manager_enqueues_then_delivers_with_event_metadata(tmp_path):
     metadata = provider.calls[0][3]
     assert metadata["outbox_event_id"].startswith("mw_")
     assert metadata["delivery_semantics"] == "at-least-once"
+    assert metadata["delivery_idempotency"] == "none"
     assert metadata["delivery_attempt"] == 1
     assert "_outbox_operation_index" not in metadata
     assert manager.provider_health()["external"]["write_outbox_pending"] == 0
+
+
+def test_manager_stamps_declared_idempotency_and_health(tmp_path):
+    class _IdempotentWriteProvider(_WriteProvider):
+        def memory_write_delivery_contract(self):
+            return {
+                "delivery_semantics": "idempotent-at-least-once",
+                "acknowledgement": "provider-reference",
+                "idempotency": "stable-event-id",
+                "readback": "exact-value",
+            }
+
+    provider = _IdempotentWriteProvider()
+    manager = _initialized_manager(tmp_path, provider)
+    manager.on_memory_write(
+        "add",
+        "memory",
+        "durable fact",
+        metadata={"tool_call_id": "declared-contract"},
+    )
+    assert manager.flush_pending(timeout=5.0)
+
+    metadata = provider.calls[0][3]
+    assert metadata["delivery_semantics"] == "idempotent-at-least-once"
+    assert metadata["delivery_idempotency"] == "stable-event-id"
+    assert manager.provider_health()["external"]["memory_write_delivery"] == {
+        "delivery_semantics": "idempotent-at-least-once",
+        "acknowledgement": "provider-reference",
+        "idempotency": "stable-event-id",
+        "readback": "exact-value",
+    }
 
 
 def test_manager_replays_failed_write_after_restart(tmp_path):

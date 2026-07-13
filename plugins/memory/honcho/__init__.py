@@ -252,6 +252,14 @@ class HonchoMemoryProvider(MemoryProvider):
     def name(self) -> str:
         return "honcho"
 
+    def memory_write_delivery_contract(self) -> Dict[str, str]:
+        return {
+            "delivery_semantics": "at-least-once",
+            "acknowledgement": "positive-sdk-result",
+            "idempotency": "none",
+            "readback": "none",
+        }
+
     def is_available(self) -> bool:
         """Check if Honcho is configured. No network calls."""
         try:
