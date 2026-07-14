@@ -52,8 +52,15 @@ class TestMcpEndpoints:
         assert self.client.delete("/api/mcp/servers/srv1").status_code == 200
         assert self.client.get("/api/mcp/servers").json()["servers"] == []
 
-    def test_stdio_env_is_redacted_on_read(self):
-        self.client.post(
+    def test_stdio_env_is_redacted_on_read(self, monkeypatch):
+        # Unpinned stdio software is rejected by the provenance policy (covered
+        # in test_mcp_security). This test asserts env redaction on read, so
+        # let the save through the gate without weakening the policy tests.
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config.validate_mcp_server_entry",
+            lambda name, entry, **kwargs: [],
+        )
+        r = self.client.post(
             "/api/mcp/servers",
             json={
                 "name": "srv2",
@@ -62,6 +69,7 @@ class TestMcpEndpoints:
                 "env": {"API_KEY": "sk-secret-1234567890"},
             },
         )
+        assert r.status_code == 200
         srv = self.client.get("/api/mcp/servers").json()["servers"][0]
         assert srv["env"]["API_KEY"] != "sk-secret-1234567890"
 
