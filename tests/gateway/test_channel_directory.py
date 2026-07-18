@@ -6,6 +6,7 @@ import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from gateway.platforms.base import Platform
 from gateway.channel_directory import (
     build_channel_directory,
     channel_delivery_status,
@@ -171,7 +172,7 @@ class TestBuildChannelDirectoryWrites:
             patch("gateway.channel_directory.DIRECTORY_PATH", cache_file),
             patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}),
         ):
-            result = asyncio.run(build_channel_directory({}))
+            result = asyncio.run(build_channel_directory({Platform.TELEGRAM: object()}))
 
         telegram = result["platforms"]["telegram"]
         assert telegram[0]["delivery_status"] == "stale"
@@ -264,7 +265,7 @@ class TestBuildChannelDirectoryWrites:
             patch("gateway.channel_directory.DIRECTORY_PATH", cache_file),
             patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}),
         ):
-            result = asyncio.run(build_channel_directory({}))
+            result = asyncio.run(build_channel_directory({Platform.TELEGRAM: object()}))
 
         telegram = result["platforms"]["telegram"]
         assert "delivery_status" not in telegram[0]
@@ -487,7 +488,7 @@ class TestDeliveryStaleMetadata:
             patch("gateway.channel_directory.DIRECTORY_PATH", cache_file),
             patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}),
         ):
-            result = asyncio.run(build_channel_directory({}))
+            result = asyncio.run(build_channel_directory({Platform.TELEGRAM: object()}))
 
         entry = result["platforms"]["telegram"][0]
         assert entry["delivery_status"] == "stale"

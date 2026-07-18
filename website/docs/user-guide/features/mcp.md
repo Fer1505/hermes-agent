@@ -22,11 +22,13 @@ If you have ever wanted Hermes to use a tool that already exists somewhere else,
 
 1. MCP support ships with the standard install — no extra step needed.
 
-2. Install a reviewed MCP server:
+2. Add an MCP server to `~/.hermes/config.yaml`:
 
-```bash
-hermes mcp catalog
-hermes mcp install <name>
+```yaml
+mcp_servers:
+  filesystem:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/projects"]
 ```
 
 3. Start Hermes:
@@ -44,13 +46,6 @@ List the files in /home/user/projects and summarize the repo structure.
 ```
 
 Hermes will discover the MCP server's tools and use them like any other tool.
-
-Stdio entries are executable software. Hermes binds catalog entries to their
-manifest provenance, exact command/args, and installed-file hashes. A custom
-direct native executable can instead be added with `--authorize-stdio` after
-operator review. Hand-edited/unpinned entries and shell, Python, Node, `npx`,
-`uvx`, encoded, or indirect launchers are quarantined before process creation.
-Remote HTTP and OAuth MCP configuration is unchanged.
 
 ## Catalog: one-click install for Nous-approved MCPs
 
@@ -183,8 +178,14 @@ To add an MCP to the catalog, open a PR against
 
 Stdio servers run as local subprocesses and talk over stdin/stdout.
 
-Install stdio servers from the reviewed catalog. Hermes writes the generated,
-hash-bound config and its authorization receipt during installation.
+```yaml
+mcp_servers:
+  github:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: "***"
+```
 
 Use stdio servers when:
 - the server is installed locally
@@ -295,22 +296,38 @@ Hermes reads MCP config from `~/.hermes/config.yaml` under `mcp_servers`.
 | `client_cert` | string \| list | Client certificate for mTLS — a combined PEM path, or `[cert, key]` / `[cert, key, password]` |
 | `client_key` | string | Client private-key PEM path (when separate from `client_cert`) |
 | `timeout` | number | Tool call timeout |
-| `connect_timeout` | number | Initial connection timeout |
+| `connect_timeout` | number | Initial connection timeout (also bounds the MCP `initialize` handshake) |
+| `idle_timeout_seconds` | number | Recycle a stdio server after this many seconds without a tool call (`0` = never, default). The server restarts transparently on the next tool call. |
+| `max_lifetime_seconds` | number | Recycle a stdio server after this total age (`0` = never, default). Restarts transparently on next use. |
 | `enabled` | bool | If `false`, Hermes skips the server entirely |
 | `supports_parallel_tool_calls` | bool | If `true`, tools from this server may run concurrently |
 | `tools` | mapping | Per-server tool filtering and utility policy |
 
-### Minimal custom stdio example
+### Minimal stdio example
 
-```bash
-hermes mcp add local-tools \
-  --command /opt/local-tools/bin/mcp-server \
-  --authorize-stdio \
-  --args --root /tmp
+```yaml
+mcp_servers:
+  filesystem:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 ```
 
-The command must be a direct native executable. Hermes generates the internal
-attestation fields; do not hand-edit or copy them between servers.
+### Recycling memory-heavy stdio servers
+
+Browser-based MCP servers (e.g. `@playwright/mcp`) keep a full Chromium
+resident after their first tool call — hundreds of MB that never get
+released. Opt in to automatic recycling and the server is torn down after
+the idle/lifetime limit, then restarted transparently the next time one of
+its tools is called (its tools stay registered the whole time):
+
+```yaml
+mcp_servers:
+  playwright:
+    command: "npx"
+    args: ["-y", "@playwright/mcp@latest", "--headless"]
+    idle_timeout_seconds: 900     # recycle after 15 min without a tool call
+    max_lifetime_seconds: 86400   # and at least once a day regardless
+```
 
 ### Minimal HTTP example
 
@@ -406,9 +423,10 @@ If `enabled: false`, Hermes skips the server completely and does not even attemp
 ```yaml
 mcp_servers:
   github:
-    url: "https://mcp.github.example.com"
-    headers:
-      Authorization: "Bearer ***"
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: "***"
     tools:
       include: [create_issue, list_issues]
 ```
@@ -461,9 +479,10 @@ That means:
 ```yaml
 mcp_servers:
   github:
-    url: "https://mcp.github.example.com"
-    headers:
-      Authorization: "Bearer ***"
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: "***"
     tools:
       include: [create_issue, list_issues, search_code]
       prompts: false
@@ -543,9 +562,10 @@ The new filtering support is also a security control:
 ```yaml
 mcp_servers:
   github:
-    url: "https://mcp.github.example.com"
-    headers:
-      Authorization: "Bearer ***"
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: "***"
     tools:
       include: [list_issues, create_issue, update_issue]
       prompts: false
@@ -578,9 +598,12 @@ Look up the last 10 failed payments and summarize common failure reasons.
 
 ### Filesystem server for a single project root
 
-Install a reviewed filesystem catalog entry whose manifest pins the server and
-its allowed project root. An ad-hoc package runner is not accepted as persisted
-stdio software.
+```yaml
+mcp_servers:
+  project_fs:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/home/user/my-project"]
+```
 
 Use it like:
 

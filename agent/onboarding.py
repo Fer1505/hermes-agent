@@ -200,7 +200,7 @@ def mark_seen(config_path: Path, flag: str) -> bool:
     """
     try:
         import yaml
-        from utils import atomic_yaml_write
+        from hermes_cli.config import atomic_config_write
     except Exception as e:  # pragma: no cover — dependency issue
         logger.debug("onboarding: failed to import yaml/utils: %s", e)
         return False
@@ -219,7 +219,7 @@ def mark_seen(config_path: Path, flag: str) -> bool:
         if seen.get(flag) is True:
             return True  # already marked — nothing to do
         seen[flag] = True
-        atomic_yaml_write(config_path, cfg)
+        atomic_config_write(config_path, cfg)
         return True
     except Exception as e:
         logger.debug("onboarding: failed to mark flag %s: %s", flag, e)

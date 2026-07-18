@@ -850,7 +850,7 @@ def run_backup(args) -> None:
             print(f"    {p}")
 
     if skipped_dirs:
-        print(f"\n  Excluded directories:")
+        print("\n  Excluded directories:")
         for d in sorted(skipped_dirs):
             print(f"    {d}/")
 
