@@ -766,6 +766,64 @@ class TestUrlUserinfoPassthrough:
         assert "dbpass" not in result
 
 
+class TestStrictUrlCredentialRedaction:
+    @pytest.mark.parametrize(
+        ("text", "secret", "expected"),
+        [
+            (
+                "https://x.test/#access_token=FRAG_SECRET&view=public",
+                "FRAG_SECRET",
+                "https://x.test/#access_token=***&view=public",
+            ),
+            (
+                "/resume?token=REL_SECRET&view=public",
+                "REL_SECRET",
+                "/resume?token=***&view=public",
+            ),
+            (
+                "https://x.test/cb?client%5Fsecret=ENC_SECRET&view=public",
+                "ENC_SECRET",
+                "https://x.test/cb?client%5Fsecret=***&view=public",
+            ),
+            (
+                "https://x.test/cb?client%255Fsecret=DOUBLE_SECRET&view=public",
+                "DOUBLE_SECRET",
+                "https://x.test/cb?client%255Fsecret=***&view=public",
+            ),
+            (
+                "/resume?token=SEMICOLON_SECRET;view=public",
+                "SEMICOLON_SECRET",
+                "/resume?token=***;view=public",
+            ),
+            (
+                "//user:NET_SECRET@x.test/path",
+                "NET_SECRET",
+                "//user:***@x.test/path",
+            ),
+        ],
+    )
+    def test_masks_all_url_reference_forms_only_when_opted_in(
+        self, text, secret, expected
+    ):
+        # Olympus keeps conservative redaction for path-only request targets at
+        # ordinary egress boundaries. Full navigable URLs and network-path
+        # references retain upstream's explicit opt-in behavior so OAuth and
+        # signed-link workflows are not broken.
+        if text.startswith("/resume?"):
+            assert redact_sensitive_text(text) == expected
+        else:
+            assert redact_sensitive_text(text) == text
+
+        result = redact_sensitive_text(text, redact_url_credentials=True)
+
+        assert secret not in result
+        assert result == expected
+
+    def test_similarly_named_public_params_remain_unchanged(self):
+        text = "/metrics?token_count=17&session_id=public"
+        assert redact_sensitive_text(text, redact_url_credentials=True) == text
+
+
 class TestBareTokenUserinfoRedaction:
     """Regression tests for #6396 — a bare credential in URL userinfo
     (``scheme://TOKEN@host``, no ``user:pass`` colon) is redacted. This is the

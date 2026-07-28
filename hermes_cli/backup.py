@@ -354,8 +354,8 @@ def _safe_copy_db(src: Path, dst: Path) -> bool:
     """Copy a SQLite database safely using the backup() API.
 
     Handles WAL mode — produces a consistent snapshot even while the DB is
-    being written to. A failed SQLite snapshot is never replaced with a raw
-    file copy because that can archive a torn database plus omit WAL state.
+    being written to. Fail closed if a consistent snapshot cannot be created:
+    copying only the live main file can omit committed WAL data.
     """
     conn = None
     backup_conn = None
@@ -372,10 +372,12 @@ def _safe_copy_db(src: Path, dst: Path) -> bool:
             pass
         return False
     finally:
-        if backup_conn is not None:
-            backup_conn.close()
-        if conn is not None:
-            conn.close()
+        for connection in (backup_conn, conn):
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -2122,10 +2124,12 @@ _QUICK_STATE_FILES = (
     ".env",
     "auth.json",
     "cron/jobs.json",
+    "cron/executions.db",
     "gateway_state.json",
     "channel_directory.json",
     "channel_aliases.json",
     "processes.json",
+    "gateway/discord_message_recovery.db",  # Discord reconnect replay ledger
     # Per-profile user-created stores that live outside the git checkout and
     # are therefore destroyed if the update flow removes/replaces the file and
     # the post-update schema-init re-creates an empty one (issue #52889). All
@@ -2158,17 +2162,50 @@ def create_quick_snapshot(
     label: Optional[str] = None,
     hermes_home: Optional[Path] = None,
     keep: Optional[int] = None,
+    max_file_size: Optional[int] = None,
 ) -> Optional[str]:
     """Create a quick state snapshot of critical files.
 
     Copies STATE_FILES to a timestamped directory under state-snapshots/.
     Auto-prunes old snapshots beyond the keep limit.
 
+    Args:
+        max_file_size: When set, individual files larger than this many bytes
+            are skipped (with a printed warning) instead of copied. Used by
+            the pre-update safety snapshot so a multi-GB ``state.db`` can
+            never stall ``hermes update`` or silently eat disk — the small
+            pairing/cron/config files the snapshot exists to protect are
+            always captured. ``None`` (default) copies everything, which
+            preserves manual ``/snapshot`` and ``hermes backup --quick``
+            behavior.
+
     Returns:
         Snapshot ID (timestamp-based), or None if no files found.
     """
     home = hermes_home or get_hermes_home()
     root = _quick_snapshot_root(home)
+
+    def _too_large(path: Path, rel_name: str) -> bool:
+        """True (and warn) when ``path`` exceeds the max_file_size cap."""
+        if max_file_size is None:
+            return False
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return False
+        if size <= max_file_size:
+            return False
+        print(
+            f"  ⚠ Snapshot: skipping {rel_name} "
+            f"({_format_size(size)} exceeds {_format_size(max_file_size)} limit)"
+        )
+        logger.warning(
+            "Quick snapshot skipped %s: %d bytes exceeds %d byte limit",
+            rel_name,
+            size,
+            max_file_size,
+        )
+        return True
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     snap_id = f"{ts}-{label}" if label else ts
@@ -2195,6 +2232,8 @@ def create_quick_snapshot(
                 # the board databases + their metadata to restore a board.
                 if "/workspaces/" in f"/{sub_rel}/" or "/attachments/" in f"/{sub_rel}/":
                     continue
+                if _too_large(sub, sub_rel):
+                    continue
                 dst = snap_dir / sub_rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 try:
@@ -2212,6 +2251,9 @@ def create_quick_snapshot(
             continue
 
         if not src.is_file():
+            continue
+
+        if _too_large(src, rel):
             continue
 
         dst = snap_dir / rel
@@ -2374,7 +2416,11 @@ def _count_cron_jobs(path: Path) -> Optional[int]:
     if not path.is_file():
         return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        # utf-8-sig: same dialect as cron/jobs.load_jobs — Windows editors
+        # may leave a UTF-8 BOM that plain utf-8 json.load rejects. Without
+        # it a BOM'd jobs.json counts as "unreadable" (None) and the
+        # post-update cron-loss auto-restore safety net silently disables.
+        with open(path, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
@@ -2602,7 +2648,7 @@ def _prune_pre_update_backups(backup_dir: Path, keep: int) -> int:
     than no backup at all (and the wrapper in ``main.py`` would still print
     a misleading ``Saved: <path>`` line for a file that no longer exists).
     Operators who genuinely don't want a backup should set
-    ``updates.pre_update_backup: false`` in config — that gates creation.
+    ``updates.pre_update_backup: off`` in config — that gates creation.
     """
     keep = max(keep, 1)
     if not backup_dir.exists():
