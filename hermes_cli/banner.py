@@ -426,7 +426,16 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
             pass
         return None
 
-    upstream = _git_short_hash(repo_dir, "origin/main")
+    # Fork-based installations commonly keep the official repository as
+    # ``upstream`` and the operator fork as ``origin``.  Report currency
+    # against the official branch when it exists, otherwise retain the
+    # single-remote fallback.
+    upstream_ref = (
+        "upstream/main"
+        if _git_short_hash(repo_dir, "upstream/main")
+        else "origin/main"
+    )
+    upstream = _git_short_hash(repo_dir, upstream_ref)
     local = _git_short_hash(repo_dir, "HEAD")
     if not upstream or not local:
         # Live-git lookup failed (e.g. shallow clone without origin/main).
@@ -443,7 +452,7 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     ahead = 0
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "origin/main..HEAD"],
+            ["git", "rev-list", "--count", f"{upstream_ref}..HEAD"],
             capture_output=True,
             text=True,
             timeout=5,
