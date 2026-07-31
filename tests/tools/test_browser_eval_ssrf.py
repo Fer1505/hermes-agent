@@ -166,27 +166,23 @@ class TestCamofoxEvalGuard:
         assert "private or internal address" in result["error"]
         assert PRIVATE_URL in result["error"]
 
-    def test_camofox_blocks_when_current_page_is_private(self, monkeypatch):
+    def test_external_camofox_eval_is_blocked_before_page_content(self, monkeypatch):
         self._guard_on(monkeypatch)
-        monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: False)
-        monkeypatch.setattr(browser_tool, "_is_always_blocked_url", lambda url: False)
+        monkeypatch.setenv("CAMOFOX_URL", "http://camofox:9377")
 
         import tools.browser_camofox as camofox
 
         monkeypatch.setattr(camofox, "_ensure_tab", lambda task_id: {"tab_id": "tab-1", "user_id": "user-1"})
 
-        def fake_post(path, body=None, **_kwargs):
-            if body and body.get("expression") == "window.location.href":
-                return {"result": PRIVATE_URL}
-            return {"result": "secret DOM text"}
+        def fail_post(*_args, **_kwargs):
+            raise AssertionError("external Camofox must not receive evaluate")
 
-        monkeypatch.setattr(camofox, "_post", fake_post)
+        monkeypatch.setattr(camofox, "_post", fail_post)
 
         result = _eval("document.body.innerText")
 
         assert result["success"] is False
-        assert "private or internal address" in result["error"]
-        assert PRIVATE_URL in result["error"]
+        assert "external Camofox boundary" in result["error"]
         assert "secret DOM text" not in json.dumps(result)
 
     def test_camofox_uses_raw_task_id_not_resolved_session_key(self, monkeypatch):
@@ -195,6 +191,7 @@ class TestCamofoxEvalGuard:
         # _last_session_key-resolved key, or it can hit a different/new tab and
         # skip the pre-scan via a mismatched _is_local_sidecar_key check.
         self._guard_on(monkeypatch)
+        monkeypatch.setenv("CAMOFOX_URL", "http://127.0.0.1:9377")
         monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: True)
         monkeypatch.setattr(browser_tool, "_is_always_blocked_url", lambda url: False)
         monkeypatch.setattr(

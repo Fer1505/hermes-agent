@@ -75,9 +75,10 @@ def test_bulk_delete_sessiondb_work_runs_off_event_loop(monkeypatch):
     db_threads: list[int] = []
 
     class _DB:
-        def delete_sessions(self, ids):
+        def delete_sessions(self, ids, *, sessions_dir=None):
             db_threads.append(threading.get_ident())
             assert ids == ["one", "two"]
+            assert sessions_dir == web_server._sessions_dir_for_profile(None)
             return 2
 
         def close(self):

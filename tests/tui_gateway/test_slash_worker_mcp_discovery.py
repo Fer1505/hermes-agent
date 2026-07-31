@@ -6,10 +6,12 @@ import json
 import os
 from pathlib import Path
 import queue
+import socket
 import subprocess
 import sys
 import textwrap
 import threading
+import time
 
 import pytest
 import yaml
@@ -22,19 +24,22 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     profile_home.mkdir()
     marker = "profile-local-61922"
     server = tmp_path / "fastmcp_probe.py"
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
     server.write_text(
         textwrap.dedent(
             f"""
             from mcp.server.fastmcp import FastMCP
 
-            mcp = FastMCP("profileprobe")
+            mcp = FastMCP("profileprobe", host="127.0.0.1", port={port})
 
             @mcp.tool()
             def hermes_61922_profile_probe() -> str:
                 return {marker!r}
 
             if __name__ == "__main__":
-                mcp.run(transport="stdio")
+                mcp.run(transport="streamable-http")
             """
         ),
         encoding="utf-8",
@@ -45,14 +50,31 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
                 "mcp_servers": {
                     "profileprobe": {
                         "enabled": True,
-                        "command": sys.executable,
-                        "args": [str(server)],
-                    }
+                        "url": f"http://127.0.0.1:{port}/mcp",
+                    },
                 }
             }
         ),
         encoding="utf-8",
     )
+
+    mcp_proc = subprocess.Popen(
+        [sys.executable, str(server)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        cwd=tmp_path,
+    )
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                break
+        except OSError:
+            if mcp_proc.poll() is not None:
+                pytest.fail("profile-local MCP probe server exited during startup")
+            if time.monotonic() >= deadline:
+                pytest.fail("profile-local MCP probe server did not start")
+            time.sleep(0.05)
 
     env = os.environ.copy()
     for key in list(env):
@@ -62,44 +84,52 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
     env["HERMES_SLASH_WATCHDOG_GRACE_S"] = "0"
     env["HERMES_SLASH_WATCHDOG_POLL_S"] = "0.05"
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-u",
-            "-m",
-            "tui_gateway.slash_worker",
-            "--session-key",
-            "agent:main:tui:dm:mcp-profile-test",
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-        cwd=tmp_path,
-    )
-    output: queue.Queue[str] = queue.Queue()
     try:
-        assert proc.stdin is not None
-        assert proc.stdout is not None
-        stdout = proc.stdout
-        threading.Thread(
-            target=lambda: output.put(stdout.readline()),
-            daemon=True,
-        ).start()
-        proc.stdin.write(json.dumps({"id": 1, "command": "/tools"}) + "\n")
-        proc.stdin.flush()
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-u",
+                "-m",
+                "tui_gateway.slash_worker",
+                "--session-key",
+                "agent:main:tui:dm:mcp-profile-test",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            cwd=tmp_path,
+        )
+        output: queue.Queue[str] = queue.Queue()
         try:
-            line = output.get(timeout=10)
-        except queue.Empty:
-            pytest.fail("slash worker produced no /tools response within 10 seconds")
-        response = json.loads(line)
-        assert response["ok"] is True
-        assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
+            assert proc.stdin is not None
+            assert proc.stdout is not None
+            stdout = proc.stdout
+            threading.Thread(
+                target=lambda: output.put(stdout.readline()),
+                daemon=True,
+            ).start()
+            proc.stdin.write(json.dumps({"id": 1, "command": "/tools"}) + "\n")
+            proc.stdin.flush()
+            try:
+                line = output.get(timeout=10)
+            except queue.Empty:
+                pytest.fail("slash worker produced no /tools response within 10 seconds")
+            response = json.loads(line)
+            assert response["ok"] is True
+            assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
     finally:
-        proc.terminate()
+        mcp_proc.terminate()
         try:
-            proc.wait(timeout=5)
+            mcp_proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
+            mcp_proc.kill()
+            mcp_proc.wait(timeout=5)

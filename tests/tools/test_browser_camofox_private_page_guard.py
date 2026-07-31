@@ -128,6 +128,7 @@ def test_snapshot_still_runs_when_page_is_public(monkeypatch, _session):
 
 def test_camofox_click_still_runs_when_page_is_public(monkeypatch, _session):
     _public_page(monkeypatch)
+    monkeypatch.setattr(browser_camofox, "is_safe_url", lambda _url: True)
     calls = []
 
     def fake_post(path, body=None, timeout=None):

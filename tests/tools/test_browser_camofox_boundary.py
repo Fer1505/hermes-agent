@@ -211,9 +211,11 @@ def test_unsafe_landed_url_is_quarantined_before_content_can_be_read(
 
     def fake_post(path, body, timeout=None):
         posts.append((path, body, timeout))
-        if len(posts) == 1:
-            return {"ok": True, "url": "http://10.0.0.5/internal"}
-        return {"ok": True, "url": "about:blank"}
+        if path.endswith("/evaluate"):
+            return {"result": "https://example.com/"}
+        if body and body.get("url") == "about:blank":
+            return {"ok": True, "url": "about:blank"}
+        return {"ok": True, "url": "http://10.0.0.5/internal"}
 
     monkeypatch.setattr(camofox, "_post", fake_post)
 
@@ -286,12 +288,14 @@ def test_content_remains_blocked_when_blank_quarantine_fails(monkeypatch):
     _session(monkeypatch, "http://camofox:9377", task_id="failed-quarantine")
     monkeypatch.setattr(camofox, "is_always_blocked_url", lambda _url: False)
     monkeypatch.setattr(camofox, "is_safe_url", lambda _url: False)
-    calls = 0
+    action_calls = 0
 
-    def fake_post(*_args, **_kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
+    def fake_post(path, body=None, **_kwargs):
+        nonlocal action_calls
+        if path.endswith("/evaluate"):
+            return {"result": "https://example.com/"}
+        action_calls += 1
+        if action_calls == 1:
             return {"ok": True, "url": "http://10.0.0.5/internal"}
         raise RuntimeError("blank navigation failed")
 

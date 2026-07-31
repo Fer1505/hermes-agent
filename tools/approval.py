@@ -3457,6 +3457,11 @@ def check_all_command_guards(command: str, env_type: str,
 
     if _is_safe_read_only_fetch_to_local_python(command, tirith_result):
         tirith_result = {"action": "allow", "findings": [], "summary": ""}
+        # The pattern guard independently classifies every heredoc as script
+        # execution. The narrow helper above has already established that this
+        # one is only a local parser for a read-only, credential-free fetch.
+        if pattern_key == "script execution via heredoc":
+            is_dangerous, pattern_key, description = False, None, None
 
     # --- Phase 2: Decide ---
 

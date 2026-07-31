@@ -5304,7 +5304,7 @@ class TestNewEndpoints:
         )
 
         assert resp.status_code == 200
-        assert resp.json()["mcp_written"] == 3
+        assert resp.json()["mcp_written"] == 2
 
         root = get_hermes_home()
         profile_dir = root / "profiles" / "builder-auth"
@@ -5314,7 +5314,6 @@ class TestNewEndpoints:
 
         assert sorted(servers) == [
             "Bearer Server",
-            "local-server",
             "oauth-server",
         ]
         assert servers["Bearer Server"] == {
@@ -5327,13 +5326,10 @@ class TestNewEndpoints:
             "url": "https://example.com/oauth-mcp",
             "auth": "oauth",
         }
-        assert servers["local-server"] == {
-            "command": "uvx",
-            "args": ["mcp-server", "--debug"],
-            "env": {"API_KEY": "stdio-secret"},
-        }
+        assert "local-server" not in servers
 
         assert secret not in config_text
+        assert "stdio-secret" not in config_text
         profile_env = (profile_dir / ".env").read_text(encoding="utf-8")
         assert f"MCP_BEARER_SERVER_API_KEY={secret}" in profile_env
         assert "Bearer Bearer" not in profile_env

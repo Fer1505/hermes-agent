@@ -901,7 +901,7 @@ def test_run_codex_stream_multiple_commentary_items_are_not_reemitted(monkeypatc
     assert delivered == ["First update.", "Second update."]
 
 
-def test_run_codex_stream_retry_deduplicates_multiple_commentary_items(monkeypatch):
+def test_run_codex_stream_salvages_multiple_commentary_items(monkeypatch):
     import httpx
 
     agent = _build_agent(monkeypatch)
@@ -960,7 +960,7 @@ def test_run_codex_stream_retry_deduplicates_multiple_commentary_items(monkeypat
     response = agent._run_codex_stream(_codex_request_kwargs())
 
     assert response.status == "completed"
-    assert calls["count"] == 2
+    assert calls["count"] == 1
     assert delivered == ["First update.", "Second update."]
 
 
