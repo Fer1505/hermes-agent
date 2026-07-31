@@ -19,7 +19,7 @@ Bug scenario (pre-fix):
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 
@@ -221,7 +221,13 @@ class TestFlushAfterCompression:
                 for i in range(12)
             ]
 
-            with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
+            summary_response = MagicMock()
+            summary_response.choices = [MagicMock()]
+            summary_response.choices[0].message.content = "durable compressed summary"
+            with patch(
+                "agent.context_compressor.call_llm",
+                return_value=summary_response,
+            ):
                 compressed, _ = compress_context(
                     agent, messages, approx_tokens=100_000, system_message="sys"
                 )

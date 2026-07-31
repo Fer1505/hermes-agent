@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import shlex
+from urllib.parse import unquote_plus
 
 logger = logging.getLogger(__name__)
 
@@ -391,7 +392,7 @@ _ABSOLUTE_PATH_WITH_QUERY_RE = re.compile(
 _SENSITIVE_QUERY_PARAM_FRAGMENT_RE = re.compile(
     r"([?&]("
     + "|".join(re.escape(key) for key in sorted(_SENSITIVE_QUERY_PARAMS, key=len, reverse=True))
-    + r")=)([^&#\s\"']+)",
+    + r")=)([^&#;\s\"']+)",
     re.IGNORECASE,
 )
 
@@ -400,6 +401,22 @@ _SENSITIVE_QUERY_PARAM_FRAGMENT_RE = re.compile(
 # Catches things like `https://user:token@api.example.com/v1/foo`.
 _URL_USERINFO_RE = re.compile(
     r"(https?|wss?|ftp)://([^/\s:@]+):([^/\s@]+)@",
+)
+
+# Strict provider-egress URL redaction accepts more URL-reference forms than
+# the display/log helpers above. Parameter delimiters stay in capture groups so
+# redaction preserves the original query/fragment layout byte-for-byte, while
+# the key is decoded separately for classification. Values stop at query or
+# fragment pair separators; both ``&`` and ``;`` are valid in deployed URLs.
+_STRICT_URL_PARAM_RE = re.compile(
+    r"([?#&;])([A-Za-z0-9_.~+%\-]+)=([^#&;\s\"'<>]*)"
+)
+
+# Match userinfo in both absolute (``scheme://user:pass@host``) and
+# network-path (``//user:pass@host``) references. The authority boundary stops
+# at path/query/fragment delimiters so an ``@`` elsewhere in a URL is ignored.
+_STRICT_URL_USERINFO_RE = re.compile(
+    r"((?:[A-Za-z][A-Za-z0-9+.-]*:)?//)([^/\s?#@]+)@"
 )
 
 # HTTP access logs often use a relative request target rather than a full URL:
@@ -481,14 +498,18 @@ def _mask_token(token: str) -> str:
 def _redact_query_string(query: str) -> str:
     """Redact sensitive parameter values in a URL query string.
 
-    Handles `k=v&k=v` format. Sensitive keys (case-insensitive) have values
-    replaced with `***`. Non-sensitive keys pass through unchanged.
+    Handles both `&` and `;` parameter delimiters. Sensitive keys
+    (case-insensitive) have values replaced with `***`. Non-sensitive keys and
+    the original delimiters pass through unchanged.
     Empty or malformed pairs are preserved as-is.
     """
     if not query:
         return query
     parts = []
-    for pair in query.split("&"):
+    for pair in re.split(r"([&;])", query):
+        if pair in {"&", ";"}:
+            parts.append(pair)
+            continue
         if "=" not in pair:
             parts.append(pair)
             continue
@@ -497,7 +518,7 @@ def _redact_query_string(query: str) -> str:
             parts.append(f"{key}=***")
         else:
             parts.append(pair)
-    return "&".join(parts)
+    return "".join(parts)
 
 
 def _redact_url_query_params(text: str) -> str:
@@ -566,6 +587,41 @@ def _redact_url_userinfo(text: str) -> str:
         lambda m: f"{m.group(1)}://{m.group(2)}:***@",
         text,
     )
+
+
+def _canonical_url_param_name(name: str) -> str:
+    """Decode a URL parameter name for bounded, case-insensitive matching."""
+    decoded = name
+    for _ in range(3):
+        next_value = unquote_plus(decoded)
+        if next_value == decoded:
+            break
+        decoded = next_value
+    return decoded.casefold().replace("-", "_")
+
+
+def _redact_strict_url_credentials(text: str) -> str:
+    """Redact credentials from absolute, relative, and network URL references.
+
+    This is intentionally stricter than display/log redaction and is used only
+    at explicit secret-egress boundaries. It preserves original keys,
+    separators, public parameters, hosts, and paths while masking sensitive
+    values and URL userinfo.
+    """
+    def _redact_param(match: re.Match) -> str:
+        if _canonical_url_param_name(match.group(2)) not in _SENSITIVE_QUERY_PARAMS:
+            return match.group(0)
+        return f"{match.group(1)}{match.group(2)}=***"
+
+    def _redact_userinfo(match: re.Match) -> str:
+        userinfo = match.group(2)
+        if ":" in userinfo:
+            username, _, _password = userinfo.partition(":")
+            return f"{match.group(1)}{username}:***@"
+        return f"{match.group(1)}***@"
+
+    text = _STRICT_URL_PARAM_RE.sub(_redact_param, text)
+    return _STRICT_URL_USERINFO_RE.sub(_redact_userinfo, text)
 
 
 def redact_cdp_url(value: object) -> str:
@@ -651,6 +707,7 @@ def redact_sensitive_text(
     force: bool = False,
     code_file: bool = False,
     file_read: bool = False,
+    redact_url_credentials: bool = False,
 ) -> str:
     """Apply all redaction patterns to a block of text.
 
@@ -658,6 +715,11 @@ def redact_sensitive_text(
     Enabled by default. Disable via security.redact_secrets: false in config.yaml.
     Set force=True for safety boundaries that must never return raw secrets
     regardless of the user's global logging redaction preference.
+
+    Set redact_url_credentials=True at non-navigation egress boundaries to
+    additionally redact credential-named query parameters and ``user:pass@``
+    URL userinfo. The default remains False because actionable OAuth callback,
+    magic-link, and pre-signed URLs must survive ordinary tool flows unchanged.
 
     Set code_file=True to skip the ENV-assignment and JSON-field regex
     patterns when the text is known to be source code (e.g. MAX_TOKENS=***
@@ -839,6 +901,8 @@ def redact_sensitive_text(
 
     # Isolated query fragments (`&X-Amz-Signature=...`) in truncated logs.
     text = _redact_sensitive_query_param_fragments(text)
+    if redact_url_credentials:
+        text = _redact_strict_url_credentials(text)
 
     # Form-urlencoded bodies (only triggers on clean k=v&k=v inputs).
     if "&" in text and "=" in text:
