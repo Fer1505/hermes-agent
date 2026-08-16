@@ -8,22 +8,32 @@ Backup and import commands for hermes CLI.
 HERMES_HOME root.
 """
 
+import ctypes
+import hashlib
 import json
 import logging
 import os
+import secrets
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 import threading
 import time
 import zipfile
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional
 
 from hermes_constants import get_default_hermes_root, get_hermes_home, display_hermes_home
+from agent.file_safety import (
+    ProtectedFileCapability,
+    ProtectedFileOperation,
+    require_protected_control_file_capability,
+)
 
 # Shared formatter; the private alias is kept because claw.py and the backup
 # tests import ``_format_size`` from this module.
@@ -127,6 +137,64 @@ _IMPORT_SKIP_NAMES = {
     "gateway.lock",
     "processes.json",
 }
+_IMPORT_SKIP_NAMES_FOLDED = {name.casefold() for name in _IMPORT_SKIP_NAMES}
+
+_EXTERNAL_PREFIX = "_external/"
+_BACKUP_MANIFEST_NAME = "_hermes_backup_manifest.json"
+_BACKUP_FORMAT = "hermes-backup"
+_BACKUP_FORMAT_VERSION = 1
+_MAX_BACKUP_MEMBERS = 100_000
+_MAX_BACKUP_MEMBER_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_BACKUP_TOTAL_BYTES = 20 * 1024 * 1024 * 1024
+_MAX_BACKUP_COMPRESSION_RATIO = 500
+_COMPRESSION_RATIO_MIN_BYTES = 1024 * 1024
+_MAX_BACKUP_MANIFEST_BYTES = 8 * 1024 * 1024
+_COPY_CHUNK_BYTES = 1024 * 1024
+
+
+class BackupError(RuntimeError):
+    """A fail-closed full backup or import validation error."""
+
+
+class BackupPromotedDurabilityError(BackupError):
+    """Archive was promoted but its directory entry could not be confirmed durable."""
+
+
+class RestoreActivatedDurabilityError(BackupError):
+    """Restored root is active but its directory entry durability is unknown."""
+
+
+class RestoreActivatedCleanupError(BackupError):
+    """Restored root is active but displaced-target cleanup was not confirmed."""
+
+
+class RestoreRolledBackError(BackupError):
+    """Activation failed and the original empty target was restored."""
+
+
+class RestoreRollbackError(BackupError):
+    """Activation failed and rollback could not be confirmed."""
+
+
+@dataclass(frozen=True)
+class _RestoreMember:
+    info: zipfile.ZipInfo
+    relative_path: str
+    target: Path
+    external: bool
+    skip_runtime: bool
+    expected_sha256: Optional[str]
+    verified_sha256: str
+    expected_mode: Optional[int]
+
+
+@dataclass(frozen=True)
+class _PrevalidatedMember:
+    info: zipfile.ZipInfo
+    effective_path: str
+    expected_sha256: Optional[str]
+    verified_sha256: str
+    expected_mode: Optional[int]
 
 # zipfile.open() drops Unix mode bits on extract; restore tightens these to 0600.
 _SECRET_FILE_NAMES = {".env", "auth.json", "state.db"}
@@ -218,58 +286,47 @@ def _atomic_output_path(final_path: Path):
         raise
 
 
-def _collect_memory_provider_external_paths() -> List[Path]:
-    """Return existing absolute paths the active memory provider stores
-    outside HERMES_HOME, resolved from config only (no network, no init).
-
-    Reads ``memory.provider`` from config, loads just that provider, and asks
-    it for ``backup_paths()``. Returns an empty list when no external provider
-    is active or the provider can't be loaded — backup must never fail because
-    of a flaky plugin.
-    """
+def _collect_memory_provider_declared_paths() -> List[Path]:
+    """Return all absolute paths declared by the active memory provider."""
     try:
         from plugins.memory import _get_active_memory_provider, load_memory_provider
-    except Exception:
-        return []
-
-    try:
         active = _get_active_memory_provider()
-    except Exception:
-        active = None
+    except Exception as exc:
+        raise BackupError(
+            f"could not resolve active memory-provider backup paths: {exc}"
+        ) from exc
     if not active:
         return []
-
     try:
         provider = load_memory_provider(active)
-    except Exception:
-        provider = None
-    if provider is None:
-        return []
-
-    try:
+        if provider is None:
+            raise BackupError(f"could not load active memory provider {active!r}")
         declared = provider.backup_paths() or []
+    except BackupError:
+        raise
     except Exception as exc:
-        logger.warning("backup_paths() failed for memory provider %r: %s", active, exc)
-        return []
+        raise BackupError(
+            f"backup_paths() failed for active memory provider {active!r}: {exc}"
+        ) from exc
 
     out: List[Path] = []
-    seen: set = set()
+    seen: set[Path] = set()
     for raw in declared:
-        try:
-            p = Path(raw).expanduser()
-        except Exception:
-            continue
-        if not p.exists():
-            continue
-        try:
-            resolved = p.resolve()
-        except (OSError, ValueError):
-            continue
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        out.append(p)
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            raise BackupError(
+                f"active memory provider {active!r} declared a non-absolute backup path: {path}"
+            )
+        lexical = Path(os.path.abspath(path))
+        if lexical not in seen:
+            seen.add(lexical)
+            out.append(lexical)
     return out
+
+
+def _collect_memory_provider_external_paths() -> List[Path]:
+    """Return existing paths declared by the active memory provider."""
+    return [path for path in _collect_memory_provider_declared_paths() if path.exists()]
 
 
 def _iter_external_files(base: Path) -> List[Path]:
@@ -798,6 +855,91 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
 # Import
 # ---------------------------------------------------------------------------
 
+def _normalized_archive_path(value: str, *, allow_directory: bool = False) -> str:
+    """Return a safe canonical POSIX archive path or raise ``BackupError``."""
+    if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
+        raise BackupError(f"unsafe archive member path: {value!r}")
+    if value.startswith("/"):
+        raise BackupError(f"absolute archive member path is not allowed: {value!r}")
+    raw = value[:-1] if allow_directory and value.endswith("/") else value
+    parts = raw.split("/")
+    if not raw or any(part in {"", ".", ".."} for part in parts):
+        raise BackupError(f"archive member path traversal is not allowed: {value!r}")
+    if parts[0].endswith(":"):
+        raise BackupError(f"drive-qualified archive member path is not allowed: {value!r}")
+    normalized = PurePosixPath(*parts).as_posix()
+    if normalized != raw:
+        raise BackupError(f"non-canonical archive member path is not allowed: {value!r}")
+    return normalized
+
+
+def _ensure_safe_filesystem_path(
+    anchor: Path,
+    target: Path,
+    *,
+    final_may_be_file: bool,
+    final_may_be_directory: bool,
+    allow_missing: bool,
+) -> Path:
+    """Validate containment and reject symlink/special-file components."""
+    anchor = anchor.resolve()
+    lexical = Path(os.path.abspath(target))
+    try:
+        relative = lexical.relative_to(anchor)
+    except ValueError as exc:
+        raise BackupError(f"path escapes its governed root: {target}") from exc
+
+    cursor = anchor
+    for index, part in enumerate(relative.parts):
+        cursor = cursor / part
+        is_final = index == len(relative.parts) - 1
+        try:
+            mode = cursor.lstat().st_mode
+        except FileNotFoundError:
+            if allow_missing:
+                continue
+            raise BackupError(f"declared backup path does not exist: {target}")
+        except OSError as exc:
+            raise BackupError(f"could not inspect governed path {cursor}: {exc}") from exc
+        if stat.S_ISLNK(mode):
+            raise BackupError(f"symlink path component is not allowed: {cursor}")
+        if is_final:
+            if stat.S_ISREG(mode) and final_may_be_file:
+                continue
+            if stat.S_ISDIR(mode) and final_may_be_directory:
+                continue
+            raise BackupError(f"special or unexpected target type is not allowed: {cursor}")
+        if not stat.S_ISDIR(mode):
+            raise BackupError(f"non-directory path component is not allowed: {cursor}")
+    return lexical
+
+
+def _zip_member_is_special(info: zipfile.ZipInfo) -> bool:
+    mode = (info.external_attr >> 16) & 0xFFFF
+    file_type = stat.S_IFMT(mode)
+    if info.is_dir():
+        return file_type not in {0, stat.S_IFDIR}
+    return file_type not in {0, stat.S_IFREG}
+
+
+def _enforce_member_quota(info: zipfile.ZipInfo) -> None:
+    if info.file_size < 0 or info.file_size > _MAX_BACKUP_MEMBER_BYTES:
+        raise BackupError(
+            f"archive member exceeds the {_format_size(_MAX_BACKUP_MEMBER_BYTES)} limit: "
+            f"{info.filename}"
+        )
+    if info.file_size >= _COMPRESSION_RATIO_MIN_BYTES:
+        if info.compress_size <= 0:
+            raise BackupError(f"archive member has an invalid compressed size: {info.filename}")
+        if info.file_size > info.compress_size * _MAX_BACKUP_COMPRESSION_RATIO:
+            raise BackupError(
+                f"archive member exceeds the {_MAX_BACKUP_COMPRESSION_RATIO}:1 "
+                f"compression-ratio limit: {info.filename}"
+            )
+
+
+
+
 def _validate_backup_zip(zf: zipfile.ZipFile) -> tuple[bool, str]:
     """Check that a zip looks like a Hermes backup.
 
@@ -807,7 +949,15 @@ def _validate_backup_zip(zf: zipfile.ZipFile) -> tuple[bool, str]:
     if not names:
         return False, "zip archive is empty"
 
-    # Look for telltale files that a hermes home would have
+    if _BACKUP_MANIFEST_NAME in names:
+        try:
+            manifest = _read_backup_manifest(zf)
+        except BackupError as exc:
+            return False, str(exc)
+        if manifest is not None:
+            return True, ""
+
+    # Legacy archives have no manifest, so require telltale in-home files.
     markers = {"config.yaml", ".env", "state.db"}
     found = set()
     for n in names:
@@ -849,8 +999,1072 @@ def _detect_prefix(zf: zipfile.ZipFile) -> str:
     return ""
 
 
+def _read_backup_manifest(zf: zipfile.ZipFile) -> Optional[dict[str, object]]:
+    infos = [info for info in zf.infolist() if info.filename == _BACKUP_MANIFEST_NAME]
+    if not infos:
+        return None
+    if len(infos) != 1:
+        raise BackupError("backup contains duplicate manifest members")
+    info = infos[0]
+    if info.is_dir() or _zip_member_is_special(info):
+        raise BackupError("backup manifest is not a regular file")
+    if info.file_size > _MAX_BACKUP_MANIFEST_BYTES:
+        raise BackupError("backup manifest exceeds its size limit")
+    _enforce_member_quota(info)
+    try:
+        raw = zf.read(info)
+        manifest = json.loads(raw.decode("utf-8"))
+    except (OSError, RuntimeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BackupError(f"backup manifest is unreadable: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise BackupError("backup manifest must be a JSON object")
+    if manifest.get("format") != _BACKUP_FORMAT:
+        raise BackupError("backup manifest format is not recognized")
+    version = manifest.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != _BACKUP_FORMAT_VERSION:
+        raise BackupError(
+            f"unsupported backup manifest version: {version!r}"
+        )
+    if not isinstance(manifest.get("members"), list) or not manifest["members"]:
+        raise BackupError("backup manifest members must be a list")
+    if not isinstance(manifest.get("externalRoots", []), list):
+        raise BackupError("backup manifest externalRoots must be a list")
+    return manifest
+
+
+def _hash_zip_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with zf.open(info, "r") as src:
+            while True:
+                chunk = src.read(_COPY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MAX_BACKUP_MEMBER_BYTES:
+                    raise BackupError(
+                        f"archive member exceeds the per-member size limit: {info.filename}"
+                    )
+                digest.update(chunk)
+    except BackupError:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        raise BackupError(f"could not verify archive member {info.filename}: {exc}") from exc
+    if total != info.file_size:
+        raise BackupError(f"archive member size changed while reading: {info.filename}")
+    return digest.hexdigest(), total
+
+
+def _prevalidate_archive_contents(
+    zf: zipfile.ZipFile,
+) -> tuple[Optional[dict[str, object]], list[_PrevalidatedMember], str]:
+    """Validate every member, quota, manifest entry, size, hash, and CRC."""
+    manifest = _read_backup_manifest(zf)
+    prefix = "" if manifest is not None else _detect_prefix(zf)
+    file_infos: list[tuple[zipfile.ZipInfo, str]] = []
+    seen_paths: set[str] = set()
+
+    archive_infos = zf.infolist()
+    # Count directory records too. Otherwise an archive can stay below the
+    # file-member quota while forcing us to inspect an unbounded number of
+    # directory entries before any extraction begins. Current archives have
+    # at most one additional manifest member.
+    if len(archive_infos) > _MAX_BACKUP_MEMBERS + 1:
+        raise BackupError(
+            "archive contains too many entries; limit is "
+            f"{_MAX_BACKUP_MEMBERS + 1} including the manifest"
+        )
+
+    for info in archive_infos:
+        if info.filename == _BACKUP_MANIFEST_NAME:
+            continue
+        if info.flag_bits & 0x1:
+            raise BackupError(f"encrypted archive members are not supported: {info.filename}")
+        if info.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
+            raise BackupError(f"unsupported archive compression method: {info.filename}")
+        if _zip_member_is_special(info):
+            raise BackupError(f"symlink or special archive member is not allowed: {info.filename}")
+
+        member_name = info.filename
+        if prefix and member_name.startswith(prefix):
+            member_name = member_name[len(prefix):]
+        if info.is_dir() and not member_name:
+            # A legacy archive may include the explicit `.hermes/` wrapper
+            # directory in addition to its children.
+            continue
+        effective = _normalized_archive_path(
+            member_name,
+            allow_directory=info.is_dir(),
+        )
+        folded = effective.casefold()
+        if folded in seen_paths:
+            raise BackupError(f"duplicate archive member path: {effective}")
+        seen_paths.add(folded)
+        if info.is_dir():
+            continue
+        _enforce_member_quota(info)
+        file_infos.append((info, effective))
+
+    if len(file_infos) > _MAX_BACKUP_MEMBERS:
+        raise BackupError(
+            f"archive contains {len(file_infos)} files; limit is {_MAX_BACKUP_MEMBERS}"
+        )
+
+    manifest_members: dict[str, dict[str, object]] = {}
+    manifest_paths_folded: set[str] = set()
+    if manifest is not None:
+        if len(manifest["members"]) > _MAX_BACKUP_MEMBERS:
+            raise BackupError(
+                f"backup manifest contains too many members; limit is {_MAX_BACKUP_MEMBERS}"
+            )
+        for item in manifest["members"]:
+            if not isinstance(item, dict):
+                raise BackupError("backup manifest member entries must be objects")
+            raw_path = item.get("path")
+            if not isinstance(raw_path, str):
+                raise BackupError("backup manifest member path must be a string")
+            path = _normalized_archive_path(raw_path)
+            if path.casefold() in manifest_paths_folded:
+                raise BackupError(f"duplicate backup manifest member: {path}")
+            manifest_paths_folded.add(path.casefold())
+            scope = item.get("scope")
+            if scope not in {"hermes_home", "external"}:
+                raise BackupError(f"invalid backup manifest scope for {path}")
+            if (scope == "external") != path.startswith(_EXTERNAL_PREFIX):
+                raise BackupError(f"backup manifest scope/path mismatch for {path}")
+            size = item.get("size")
+            digest = item.get("sha256")
+            mode = item.get("mode")
+            if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+                raise BackupError(f"invalid backup manifest size for {path}")
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(ch not in "0123456789abcdef" for ch in digest)
+            ):
+                raise BackupError(f"invalid backup manifest SHA-256 for {path}")
+            if mode is not None and (
+                isinstance(mode, bool)
+                or not isinstance(mode, int)
+                or mode not in {0o600, 0o700}
+            ):
+                raise BackupError(f"invalid backup manifest mode for {path}")
+            manifest_members[path] = item
+
+        archive_paths = {effective for _info, effective in file_infos}
+        if archive_paths != set(manifest_members):
+            missing = sorted(set(manifest_members) - archive_paths)
+            extra = sorted(archive_paths - set(manifest_members))
+            raise BackupError(
+                "backup manifest/member mismatch"
+                + (f"; missing={missing[:3]}" if missing else "")
+                + (f"; undeclared={extra[:3]}" if extra else "")
+            )
+        for root in manifest.get("externalRoots", []):
+            if not isinstance(root, str):
+                raise BackupError("backup manifest external root must be a string")
+            _normalized_archive_path(root)
+
+    total_size = 0
+    total_compressed = 0
+    validated: list[_PrevalidatedMember] = []
+    for info, effective in file_infos:
+        actual_sha256, actual_size = _hash_zip_member(zf, info)
+        total_size += actual_size
+        total_compressed += info.compress_size
+        if total_size > _MAX_BACKUP_TOTAL_BYTES:
+            raise BackupError(
+                "archive exceeds the aggregate uncompressed-size limit of "
+                f"{_format_size(_MAX_BACKUP_TOTAL_BYTES)}"
+            )
+        expected_sha256: Optional[str] = None
+        expected_mode: Optional[int] = None
+        if manifest is not None:
+            item = manifest_members[effective]
+            if item["size"] != actual_size:
+                raise BackupError(f"backup manifest size mismatch for {effective}")
+            expected_sha256 = str(item["sha256"])
+            if expected_sha256 != actual_sha256:
+                raise BackupError(f"backup manifest hash mismatch for {effective}")
+            raw_mode = item.get("mode")
+            if raw_mode is not None:
+                expected_mode = int(raw_mode)
+                archived_mode = (info.external_attr >> 16) & 0o777
+                normalized_archived_mode = 0o700 if archived_mode & 0o111 else 0o600
+                if normalized_archived_mode != expected_mode:
+                    raise BackupError(f"backup manifest mode mismatch for {effective}")
+        validated.append(
+            _PrevalidatedMember(
+                info=info,
+                effective_path=effective,
+                expected_sha256=expected_sha256,
+                verified_sha256=actual_sha256,
+                expected_mode=expected_mode,
+            )
+        )
+
+    if (
+        total_size >= _COMPRESSION_RATIO_MIN_BYTES
+        and total_size > max(total_compressed, 1) * _MAX_BACKUP_COMPRESSION_RATIO
+    ):
+        raise BackupError(
+            f"archive exceeds the {_MAX_BACKUP_COMPRESSION_RATIO}:1 aggregate "
+            "compression-ratio limit"
+        )
+    return manifest, validated, prefix
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _build_restore_plan(
+    zf: zipfile.ZipFile,
+    hermes_root: Path,
+) -> tuple[list[_RestoreMember], Optional[dict[str, object]], str]:
+    manifest, members, prefix = _prevalidate_archive_contents(zf)
+    has_external = any(
+        member.effective_path.startswith(_EXTERNAL_PREFIX) for member in members
+    )
+    if has_external:
+        raise BackupError(
+            "automatic _external restore is disabled. Manifest v1 does not bind "
+            "provider/profile identity or root type, and an empty staged target "
+            "has no independently active provider policy. Preserve this archive "
+            "for a future provider-bound restore workflow."
+        )
+
+    if not any(
+        PurePosixPath(member.effective_path).name.casefold()
+        not in _IMPORT_SKIP_NAMES_FOLDED
+        for member in members
+    ):
+        raise BackupError(
+            "backup contains no restorable Hermes state after runtime-only "
+            "members are removed"
+        )
+
+    hermes_root_lexical = Path(os.path.abspath(hermes_root))
+    plan: list[_RestoreMember] = []
+    for member in members:
+        effective = member.effective_path
+        target = hermes_root_lexical / Path(*PurePosixPath(effective).parts)
+        _ensure_safe_filesystem_path(
+            hermes_root_lexical,
+            target,
+            final_may_be_file=True,
+            final_may_be_directory=False,
+            allow_missing=True,
+        )
+        skip_runtime = (
+            PurePosixPath(effective).name.casefold() in _IMPORT_SKIP_NAMES_FOLDED
+        )
+        plan.append(
+            _RestoreMember(
+                info=member.info,
+                relative_path=effective,
+                target=target,
+                external=False,
+                skip_runtime=skip_runtime,
+                expected_sha256=member.expected_sha256,
+                verified_sha256=member.verified_sha256,
+                expected_mode=member.expected_mode,
+            )
+        )
+    return plan, manifest, prefix
+
+
+@dataclass
+class _AnchoredDirectory:
+    """An absolute directory chain pinned by descriptor and (device, inode)."""
+
+    path: Path
+    fd: int
+    identities: tuple[tuple[int, int], ...]
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+
+def _identity(info: os.stat_result) -> tuple[int, int]:
+    return (info.st_dev, info.st_ino)
+
+
+def _directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _require_secure_restore_primitives() -> None:
+    """Fail closed unless descriptor-relative, no-follow restore is available."""
+    required_flags = ("O_DIRECTORY", "O_NOFOLLOW")
+    missing_flags = [name for name in required_flags if not getattr(os, name, 0)]
+    required_dir_fd = (os.open, os.mkdir, os.rename, os.stat, os.unlink, os.rmdir)
+    missing_dir_fd = [
+        function.__name__
+        for function in required_dir_fd
+        if function not in os.supports_dir_fd
+    ]
+    if (
+        os.name != "posix"
+        or missing_flags
+        or missing_dir_fd
+        or os.stat not in os.supports_follow_symlinks
+        or not hasattr(os, "fchmod")
+    ):
+        details = ", ".join(missing_flags + missing_dir_fd) or "POSIX no-follow support"
+        raise BackupError(
+            "secure restore is unavailable on this platform; missing required "
+            f"descriptor-relative primitive(s): {details}"
+        )
+    _load_atomic_exchange()
+
+
+def _load_atomic_exchange():
+    """Return the native atomic directory-exchange function or fail closed."""
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        function = getattr(library, "renameatx_np", None)
+    elif sys.platform.startswith("linux"):
+        function = getattr(library, "renameat2", None)
+    else:
+        function = None
+    if function is None:
+        raise BackupError(
+            "secure restore is unavailable: atomic directory exchange is unsupported"
+        )
+    function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    function.restype = ctypes.c_int
+    return function
+
+
+def _exchange_directories_at(
+    source_parent_fd: int,
+    source_name: str,
+    target_parent_fd: int,
+    target_name: str,
+) -> None:
+    """Atomically swap two directory entries relative to pinned parents."""
+    function = _load_atomic_exchange()
+    result = function(
+        source_parent_fd,
+        os.fsencode(source_name),
+        target_parent_fd,
+        os.fsencode(target_name),
+        0x00000002,  # RENAME_SWAP (Darwin) / RENAME_EXCHANGE (Linux)
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _open_anchored_directory(path: Path, *, create: bool) -> _AnchoredDirectory:
+    absolute = Path(os.path.abspath(path))
+    descriptor = os.open("/", _directory_open_flags())
+    identities = [_identity(os.fstat(descriptor))]
+    try:
+        for component in absolute.parts[1:]:
+            try:
+                child = os.open(component, _directory_open_flags(), dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                child = os.open(component, _directory_open_flags(), dir_fd=descriptor)
+            except OSError as exc:
+                raise BackupError(
+                    f"restore ancestor is not a stable real directory: {absolute}"
+                ) from exc
+            identities.append(_identity(os.fstat(child)))
+            os.close(descriptor)
+            descriptor = child
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return _AnchoredDirectory(absolute, descriptor, tuple(identities))
+
+
+def _revalidate_restore_anchor(anchor: _AnchoredDirectory) -> None:
+    """Confirm the lexical path still names the exact pinned directory chain."""
+    try:
+        current = _open_anchored_directory(anchor.path, create=False)
+    except (FileNotFoundError, BackupError, OSError) as exc:
+        raise BackupError("restore ancestor identity changed during import") from exc
+    try:
+        if (
+            current.identities != anchor.identities
+            or _identity(os.fstat(anchor.fd)) != anchor.identities[-1]
+        ):
+            raise BackupError("restore ancestor identity changed during import")
+    finally:
+        current.close()
+
+
+def _open_child_directory(parent_fd: int, name: str) -> int:
+    try:
+        return os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+    except OSError as exc:
+        raise BackupError(f"restore path component is not a real directory: {name}") from exc
+
+
+def _prepare_empty_restore_target(
+    parent_fd: int,
+    name: str,
+) -> tuple[int, tuple[int, int], bool]:
+    created = False
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        created = True
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(before.st_mode):
+        raise BackupError("import target is not a real directory")
+    target_fd = -1
+    identity = _identity(before)
+    try:
+        target_fd = _open_child_directory(parent_fd, name)
+        identity = _identity(os.fstat(target_fd))
+        if identity != _identity(before) or os.listdir(target_fd):
+            raise BackupError("import target is not the selected empty directory")
+    except BaseException:
+        if target_fd >= 0:
+            os.close(target_fd)
+        if created:
+            try:
+                _remove_directory_if_identity(parent_fd, name, identity)
+            except OSError:
+                pass
+        raise
+    return target_fd, identity, created
+
+
+def _revalidate_empty_restore_target(
+    parent_fd: int,
+    name: str,
+    target_fd: int,
+    target_identity: tuple[int, int],
+) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise BackupError("import target identity changed during staging") from exc
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or _identity(current) != target_identity
+        or _identity(os.fstat(target_fd)) != target_identity
+        or os.listdir(target_fd)
+    ):
+        raise BackupError("import target identity changed or is no longer empty")
+
+
+def _create_staging_directory(parent_fd: int) -> tuple[str, int, int]:
+    for _attempt in range(20):
+        name = f".hermes-import-{secrets.token_hex(8)}"
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        temp_identity = _identity(
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        )
+        temp_fd = -1
+        staged_fd = -1
+        try:
+            temp_fd = _open_child_directory(parent_fd, name)
+            os.mkdir("hermes-home", mode=0o700, dir_fd=temp_fd)
+            staged_fd = _open_child_directory(temp_fd, "hermes-home")
+            return name, temp_fd, staged_fd
+        except BaseException:
+            if staged_fd >= 0:
+                os.close(staged_fd)
+            if temp_fd >= 0:
+                os.close(temp_fd)
+            try:
+                _remove_directory_if_identity(parent_fd, name, temp_identity)
+            except OSError:
+                pass
+            raise
+    raise BackupError("could not allocate a private restore staging directory")
+
+
+def _open_relative_directory_at(
+    root_fd: int,
+    parts: tuple[str, ...],
+    *,
+    create: bool,
+    expected_identities: dict[str, tuple[int, int]],
+) -> int:
+    descriptor = os.dup(root_fd)
+    try:
+        for index, component in enumerate(parts):
+            try:
+                child = os.open(component, _directory_open_flags(), dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise BackupError(
+                        f"staged directory disappeared: {'/'.join(parts[:index + 1])}"
+                    )
+                os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                child = os.open(component, _directory_open_flags(), dir_fd=descriptor)
+            relative = "/".join(parts[:index + 1])
+            child_identity = _identity(os.fstat(child))
+            expected = expected_identities.get(relative)
+            if expected is None:
+                if not create:
+                    os.close(child)
+                    raise BackupError(f"unexpected staged directory: {relative}")
+                expected_identities[relative] = child_identity
+            elif child_identity != expected:
+                os.close(child)
+                raise BackupError(f"staged directory identity changed: {relative}")
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _copy_validated_member_at(
+    zf: zipfile.ZipFile,
+    member: _RestoreMember,
+    staged_fd: int,
+    directory_identities: dict[str, tuple[int, int]],
+    file_identities: dict[str, tuple[int, int]],
+) -> None:
+    parts = tuple(PurePosixPath(member.relative_path).parts)
+    parent_fd = _open_relative_directory_at(
+        staged_fd,
+        parts[:-1],
+        create=True,
+        expected_identities=directory_identities,
+    )
+    file_fd = -1
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        file_fd = os.open(
+            parts[-1],
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        initial_identity = _identity(os.fstat(file_fd))
+        with zf.open(member.info, "r") as src, os.fdopen(file_fd, "wb") as dst:
+            file_fd = -1
+            while True:
+                chunk = src.read(_COPY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MAX_BACKUP_MEMBER_BYTES:
+                    raise BackupError(
+                        f"archive member exceeds the per-member size limit: {member.relative_path}"
+                    )
+                digest.update(chunk)
+                dst.write(chunk)
+            os.fchmod(dst.fileno(), member.expected_mode or 0o600)
+            dst.flush()
+            os.fsync(dst.fileno())
+            final = os.fstat(dst.fileno())
+            if (
+                not stat.S_ISREG(final.st_mode)
+                or final.st_nlink != 1
+                or _identity(final) != initial_identity
+            ):
+                raise BackupError(f"staged member identity changed: {member.relative_path}")
+            file_identities[member.relative_path] = initial_identity
+        os.fsync(parent_fd)
+    except BackupError:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        raise BackupError(f"could not stage {member.relative_path}: {exc}") from exc
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        os.close(parent_fd)
+    if total != member.info.file_size:
+        raise BackupError(f"archive member size changed during staging: {member.relative_path}")
+    if digest.hexdigest() != member.verified_sha256:
+        raise BackupError(f"archive member hash changed during staging: {member.relative_path}")
+
+
+def _open_staged_regular_file(
+    staged_fd: int,
+    relative_path: str,
+    directory_identities: dict[str, tuple[int, int]],
+    file_identities: dict[str, tuple[int, int]],
+) -> int:
+    parts = tuple(PurePosixPath(relative_path).parts)
+    parent_fd = _open_relative_directory_at(
+        staged_fd,
+        parts[:-1],
+        create=False,
+        expected_identities=directory_identities,
+    )
+    try:
+        descriptor = os.open(
+            parts[-1],
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+    except BaseException:
+        os.close(parent_fd)
+        raise
+    os.close(parent_fd)
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or _identity(info) != file_identities.get(relative_path)
+    ):
+        os.close(descriptor)
+        raise BackupError(f"staged member is not a private regular file: {relative_path}")
+    return descriptor
+
+
+def _verify_staged_members(
+    staged_fd: int,
+    plan: list[_RestoreMember],
+    directory_identities: dict[str, tuple[int, int]],
+    file_identities: dict[str, tuple[int, int]],
+) -> None:
+    for member in plan:
+        if member.skip_runtime:
+            continue
+        descriptor = _open_staged_regular_file(
+            staged_fd,
+            member.relative_path,
+            directory_identities,
+            file_identities,
+        )
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            before = os.fstat(descriptor)
+            while True:
+                chunk = os.read(descriptor, _COPY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if (
+            _identity(before) != _identity(after)
+            or after.st_nlink != 1
+            or total != member.info.file_size
+            or digest.hexdigest() != member.verified_sha256
+            or stat.S_IMODE(after.st_mode) != (member.expected_mode or 0o600)
+        ):
+            raise BackupError(f"staged member changed before promotion: {member.relative_path}")
+
+
+def _validate_staged_databases_at(
+    staged_fd: int,
+    plan: list[_RestoreMember],
+    directory_identities: dict[str, tuple[int, int]],
+    file_identities: dict[str, tuple[int, int]],
+) -> None:
+    """Reject corrupt SQLite members through an already-open, no-follow fd."""
+    descriptor_prefix = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
+    if not os.path.isdir(descriptor_prefix):
+        raise BackupError("secure SQLite validation requires a descriptor filesystem")
+    for member in plan:
+        if member.skip_runtime or PurePosixPath(member.relative_path).suffix.casefold() != ".db":
+            continue
+        descriptor = _open_staged_regular_file(
+            staged_fd,
+            member.relative_path,
+            directory_identities,
+            file_identities,
+        )
+        connection = None
+        before = os.fstat(descriptor)
+        try:
+            uri = f"file:{descriptor_prefix}/{descriptor}?mode=ro&immutable=1"
+            connection = sqlite3.connect(uri, uri=True)
+            rows = connection.execute("PRAGMA quick_check").fetchall()
+        except sqlite3.Error as exc:
+            database_name = PurePosixPath(member.relative_path).name
+            raise BackupError(
+                f"restored SQLite integrity check failed for {database_name}: {exc}"
+            ) from exc
+        finally:
+            if connection is not None:
+                connection.close()
+            after = os.fstat(descriptor)
+            os.close(descriptor)
+        if _identity(before) != _identity(after) or rows != [("ok",)]:
+            raise BackupError(
+                "restored SQLite integrity check failed for "
+                f"{PurePosixPath(member.relative_path).name}: {rows[:3]}"
+            )
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name != "posix":
+        return
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _verify_tree_shape_at(
+    directory_fd: int,
+    directory_identities: dict[str, tuple[int, int]],
+    file_identities: dict[str, tuple[int, int]],
+    prefix: str = "",
+) -> None:
+    for name in os.listdir(directory_fd):
+        relative = f"{prefix}/{name}" if prefix else name
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            if _identity(info) != directory_identities.get(relative):
+                raise BackupError(
+                    f"unexpected or identity-changed staged directory: {relative}"
+                )
+            child_fd = _open_child_directory(directory_fd, name)
+            try:
+                _verify_tree_shape_at(
+                    child_fd,
+                    directory_identities,
+                    file_identities,
+                    relative,
+                )
+            finally:
+                os.close(child_fd)
+        elif (
+            not stat.S_ISREG(info.st_mode)
+            or _identity(info) != file_identities.get(relative)
+        ):
+            raise BackupError(
+                f"unexpected or identity-changed staged filesystem object: {relative}"
+            )
+
+
+def _fsync_tree_at(
+    directory_fd: int,
+    directory_identities: dict[str, tuple[int, int]],
+    file_identities: dict[str, tuple[int, int]],
+    prefix: str = "",
+) -> None:
+    for name in os.listdir(directory_fd):
+        relative = f"{prefix}/{name}" if prefix else name
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            if _identity(info) != directory_identities.get(relative):
+                raise BackupError(
+                    f"unexpected or identity-changed staged directory: {relative}"
+                )
+            child_fd = _open_child_directory(directory_fd, name)
+            try:
+                _fsync_tree_at(
+                    child_fd,
+                    directory_identities,
+                    file_identities,
+                    relative,
+                )
+            finally:
+                os.close(child_fd)
+        elif (
+            not stat.S_ISREG(info.st_mode)
+            or _identity(info) != file_identities.get(relative)
+        ):
+            raise BackupError(
+                f"unexpected or identity-changed staged filesystem object: {relative}"
+            )
+    os.fsync(directory_fd)
+
+
+def _empty_directory_at(directory_fd: int) -> None:
+    """Remove descendants without following any staged or attacker link."""
+    for name in os.listdir(directory_fd):
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            child_fd = _open_child_directory(directory_fd, name)
+            try:
+                _empty_directory_at(child_fd)
+            finally:
+                os.close(child_fd)
+            os.rmdir(name, dir_fd=directory_fd)
+        else:
+            os.unlink(name, dir_fd=directory_fd)
+
+
+def _remove_directory_if_identity(
+    parent_fd: int,
+    name: str,
+    expected_identity: tuple[int, int],
+) -> bool:
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(info.st_mode) or _identity(info) != expected_identity:
+        return False
+    directory_fd = _open_child_directory(parent_fd, name)
+    try:
+        if _identity(os.fstat(directory_fd)) != expected_identity:
+            return False
+        _empty_directory_at(directory_fd)
+    finally:
+        os.close(directory_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+    return True
+
+
+def _cleanup_staging_directory(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+) -> None:
+    _empty_directory_at(directory_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def _verify_promoted_target(
+    parent_fd: int,
+    target_name: str,
+    staged_identity: tuple[int, int],
+    staging_parent_fd: int,
+    original_target_identity: tuple[int, int],
+) -> None:
+    promoted = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(promoted.st_mode) or _identity(promoted) != staged_identity:
+        raise BackupError("promoted restore target identity could not be confirmed")
+    displaced = os.stat(
+        "hermes-home", dir_fd=staging_parent_fd, follow_symlinks=False
+    )
+    if not stat.S_ISDIR(displaced.st_mode) or _identity(displaced) != original_target_identity:
+        raise BackupError("import target was substituted during atomic promotion")
+    promoted_fd = _open_child_directory(parent_fd, target_name)
+    try:
+        if _identity(os.fstat(promoted_fd)) != staged_identity:
+            raise BackupError("promoted restore target identity changed")
+    finally:
+        os.close(promoted_fd)
+
+
+def _fsync_restore_parent(parent_fd: int) -> None:
+    os.fsync(parent_fd)
+
+
+def _stage_and_activate_restore(
+    zf: zipfile.ZipFile,
+    plan: list[_RestoreMember],
+    hermes_root: Path,
+) -> tuple[int, int, list[str]]:
+    """Stage and atomically activate using only pinned, no-follow descriptors."""
+    _require_secure_restore_primitives()
+    hermes_root = Path(os.path.abspath(hermes_root))
+    parent = _open_anchored_directory(hermes_root.parent, create=True)
+    target_name = hermes_root.name
+    target_fd = -1
+    temp_fd = -1
+    staged_fd = -1
+    temp_name = ""
+    target_created = False
+    promoted = False
+    staged_identity: Optional[tuple[int, int]] = None
+    target_identity: Optional[tuple[int, int]] = None
+    promotion_attempted = False
+    directory_identities: dict[str, tuple[int, int]] = {}
+    file_identities: dict[str, tuple[int, int]] = {}
+    try:
+        (
+            target_fd,
+            target_identity,
+            target_created,
+        ) = _prepare_empty_restore_target(parent.fd, target_name)
+        temp_name, temp_fd, staged_fd = _create_staging_directory(parent.fd)
+        staged_identity = _identity(os.fstat(staged_fd))
+        directory_identities[""] = staged_identity
+
+        skipped_runtime: list[str] = []
+        for member in plan:
+            if member.skip_runtime:
+                skipped_runtime.append(member.relative_path)
+                continue
+            _copy_validated_member_at(
+                zf,
+                member,
+                staged_fd,
+                directory_identities,
+                file_identities,
+            )
+
+        _verify_staged_members(
+            staged_fd, plan, directory_identities, file_identities
+        )
+        _validate_staged_databases_at(
+            staged_fd, plan, directory_identities, file_identities
+        )
+        _fsync_tree_at(
+            staged_fd, directory_identities, file_identities
+        )
+        os.fsync(temp_fd)
+        _revalidate_restore_anchor(parent)
+        _revalidate_empty_restore_target(
+            parent.fd, target_name, target_fd, target_identity
+        )
+
+        promotion_attempted = True
+        _exchange_directories_at(temp_fd, "hermes-home", parent.fd, target_name)
+        promoted = True
+        _verify_promoted_target(
+            parent.fd,
+            target_name,
+            staged_identity,
+            temp_fd,
+            target_identity,
+        )
+        promoted_fd = _open_child_directory(parent.fd, target_name)
+        try:
+            _verify_staged_members(
+                promoted_fd, plan, directory_identities, file_identities
+            )
+            _verify_tree_shape_at(
+                promoted_fd, directory_identities, file_identities
+            )
+        finally:
+            os.close(promoted_fd)
+        _revalidate_restore_anchor(parent)
+        try:
+            _fsync_restore_parent(parent.fd)
+        except BaseException as exc:
+            raise RestoreActivatedDurabilityError(
+                "restore root was activated, but parent-directory durability "
+                f"could not be confirmed: {exc}"
+            ) from exc
+
+        try:
+            _cleanup_staging_directory(parent.fd, temp_name, temp_fd)
+            temp_name = ""
+            _fsync_restore_parent(parent.fd)
+        except BaseException as exc:
+            raise RestoreActivatedCleanupError(
+                "restore root is active, but displaced empty-target cleanup "
+                f"could not be confirmed: {exc}"
+            ) from exc
+
+        restored = sum(1 for member in plan if not member.skip_runtime)
+        return restored, 0, skipped_runtime
+    except (RestoreActivatedDurabilityError, RestoreActivatedCleanupError):
+        raise
+    except BaseException as exc:
+        if promotion_attempted and staged_identity is not None:
+            try:
+                current = os.stat(
+                    target_name, dir_fd=parent.fd, follow_symlinks=False
+                )
+                promoted = stat.S_ISDIR(current.st_mode) and _identity(current) == staged_identity
+            except OSError:
+                promoted = False
+        if promoted:
+            rollback_error: Optional[BaseException] = None
+            try:
+                _exchange_directories_at(temp_fd, "hermes-home", parent.fd, target_name)
+                promoted = False
+                restored_target = os.stat(
+                    target_name, dir_fd=parent.fd, follow_symlinks=False
+                )
+                if _identity(restored_target) != target_identity:
+                    raise BackupError("original empty target identity was not restored")
+                if target_created and not _remove_directory_if_identity(
+                    parent.fd, target_name, target_identity
+                ):
+                    raise BackupError("temporary empty target could not be removed")
+                target_created = False
+                _cleanup_staging_directory(parent.fd, temp_name, temp_fd)
+                temp_name = ""
+                _fsync_restore_parent(parent.fd)
+            except BaseException as rollback_exc:
+                rollback_error = rollback_exc
+            if rollback_error is not None:
+                raise RestoreRollbackError(
+                    "restore activation failed and rollback could not be confirmed: "
+                    f"{rollback_error}"
+                ) from exc
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise RestoreRolledBackError(
+                f"restore activation failed; empty-target state was restored: {exc}"
+            ) from exc
+        cleanup_error: Optional[BaseException] = None
+        try:
+            if temp_name:
+                _cleanup_staging_directory(parent.fd, temp_name, temp_fd)
+                temp_name = ""
+            if target_created and target_identity is not None:
+                if not _remove_directory_if_identity(
+                    parent.fd, target_name, target_identity
+                ):
+                    raise BackupError("temporary empty target could not be removed")
+                target_created = False
+            _fsync_restore_parent(parent.fd)
+        except BaseException as cleanup_exc:
+            cleanup_error = cleanup_exc
+        if cleanup_error is not None:
+            raise RestoreRollbackError(
+                "restore failed before activation and cleanup could not be confirmed: "
+                f"{cleanup_error}"
+            ) from exc
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        if isinstance(exc, BackupError):
+            raise
+        raise BackupError(f"could not stage or activate import: {exc}") from exc
+    finally:
+        if staged_fd >= 0:
+            os.close(staged_fd)
+        if temp_fd >= 0:
+            try:
+                _empty_directory_at(temp_fd)
+            except OSError:
+                pass
+            os.close(temp_fd)
+        if temp_name:
+            try:
+                os.rmdir(temp_name, dir_fd=parent.fd)
+            except OSError:
+                pass
+        if not promoted and target_created and target_identity is not None:
+            try:
+                _remove_directory_if_identity(parent.fd, target_name, target_identity)
+            except OSError:
+                pass
+        if target_fd >= 0:
+            os.close(target_fd)
+        parent.close()
+
+
 def run_import(args) -> None:
-    """Restore a Hermes backup from a zip file."""
+    """Restore a fully prevalidated Hermes backup into an empty root."""
     zip_path = Path(args.zipfile).expanduser().resolve()
 
     if not zip_path.is_file():
@@ -861,233 +2075,154 @@ def run_import(args) -> None:
         print(f"Error: Not a valid zip file: {zip_path}")
         sys.exit(1)
 
-    hermes_root = get_default_hermes_root()
+    hermes_root = Path(os.path.abspath(get_default_hermes_root()))
+    require_protected_control_file_capability(
+        ProtectedFileOperation.IMPORT,
+        (zip_path, hermes_root),
+        capability=ProtectedFileCapability.BACKUP_RESTORE,
+    )
+    if hermes_root.is_symlink():
+        print(f"Error: Import target cannot be a symlink: {hermes_root}")
+        raise SystemExit(1)
+    if hermes_root.exists() and not hermes_root.is_dir():
+        print(f"Error: Import target is not a directory: {hermes_root}")
+        raise SystemExit(1)
+    if hermes_root.exists() and any(hermes_root.iterdir()):
+        print(
+            "Error: Import into an existing nonempty Hermes home is disabled. "
+            "--force cannot safely provide all-or-nothing overlay semantics; "
+            "import into an empty profile/root instead."
+        )
+        raise SystemExit(1)
 
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        # Validate
-        ok, reason = _validate_backup_zip(zf)
-        if not ok:
-            print(f"Error: {reason}")
-            sys.exit(1)
-
-        prefix = _detect_prefix(zf)
-        members = [n for n in zf.namelist() if not n.endswith("/")]
-        file_count = len(members)
-
-        print(f"Backup contains {file_count} files")
-        print(f"Target: {display_hermes_home()}")
-
-        if prefix:
-            print(f"Detected archive prefix: {prefix!r} (will be stripped)")
-
-        # Check for existing installation
-        has_config = (hermes_root / "config.yaml").exists()
-        has_env = (hermes_root / ".env").exists()
-
-        if (has_config or has_env) and not args.force:
-            print()
-            print("Warning: Target directory already has Hermes configuration.")
-            print("Importing will overwrite existing files with backup contents.")
-            print()
-            try:
-                answer = input("Continue? [y/N] ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                print("\nAborted.")
-                sys.exit(1)
-            if answer not in {"y", "yes"}:
-                print("Aborted.")
-                return
-
-        # Extract
-        print(f"\nImporting {file_count} files ...")
-        hermes_root.mkdir(parents=True, exist_ok=True)
-
-        errors = []
-        restored = 0
-        restored_external = 0
-        skipped_runtime: list[str] = []
-        home_dir = Path.home().resolve()
-        t0 = time.monotonic()
-
-        for member in members:
-            # External memory-provider state captured under the reserved
-            # ``_external/`` arc prefix restores to its original home-relative
-            # location (e.g. ~/.honcho/config.json), NOT under HERMES_HOME.
-            if member.startswith(_EXTERNAL_PREFIX):
-                ext_rel = member[len(_EXTERNAL_PREFIX):]
-                if not ext_rel:
-                    continue
-                target = home_dir / ext_rel
-                # Security: the resolved target must stay under the home dir.
-                try:
-                    target.resolve().relative_to(home_dir)
-                except ValueError:
-                    errors.append(f"  {member}: path traversal blocked")
-                    continue
-                try:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    with zf.open(member) as src, open(target, "wb") as dst:
-                        dst.write(src.read())
-                    # External provider configs commonly hold credentials.
-                    if target.suffix in {".json", ".env", ".conf"} or target.name in _SECRET_FILE_NAMES:
-                        try:
-                            os.chmod(target, 0o600)
-                        except OSError:
-                            pass
-                    restored += 1
-                    restored_external += 1
-                except (PermissionError, OSError) as exc:
-                    errors.append(f"  {member}: {exc}")
-                if restored % 500 == 0:
-                    print(f"  {restored}/{file_count} files ...")
-                continue
-
-            # Strip prefix if detected
-            if prefix and member.startswith(prefix):
-                rel = member[len(prefix):]
-            else:
-                rel = member
-
-            if not rel:
-                continue
-
-            # Never overwrite volatile gateway/process runtime state. These are
-            # namespaced to the machine/container the backup was taken on;
-            # clobbering them (especially gateway_state.json) breaks the gateway
-            # reconciler on the target and disconnects hosted instances from the
-            # Nous portal. Matched by basename so both the root profile and
-            # named profiles (profiles/<name>/gateway_state.json) are covered.
-            if Path(rel).name in _IMPORT_SKIP_NAMES:
-                skipped_runtime.append(rel)
-                continue
-
-            target = hermes_root / rel
-
-            # Security: reject absolute paths and traversals
-            try:
-                target.resolve().relative_to(hermes_root.resolve())
-            except ValueError:
-                errors.append(f"  {rel}: path traversal blocked")
-                continue
-
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(member) as src, open(target, "wb") as dst:
-                    dst.write(src.read())
-                if target.name in _SECRET_FILE_NAMES:
-                    os.chmod(target, 0o600)
-                restored += 1
-            except (PermissionError, OSError) as exc:
-                errors.append(f"  {rel}: {exc}")
-
-            if restored % 500 == 0:
-                print(f"  {restored}/{file_count} files ...")
-
-        elapsed = time.monotonic() - t0
-
-        # Summary
-        print()
-        print(f"Import complete: {restored} files restored in {elapsed:.1f}s")
-        print(f"  Target: {display_hermes_home()}")
-
-        if restored_external:
-            print(
-                f"\n  Restored {restored_external} memory-provider file(s) to "
-                f"their original location(s) outside {display_hermes_home()}."
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            ok, reason = _validate_backup_zip(zf)
+            if not ok:
+                raise BackupError(reason)
+            plan, manifest, prefix = _build_restore_plan(
+                zf,
+                hermes_root,
             )
-
-        if errors:
-            print(f"\n  Warnings ({len(errors)} files skipped):")
-            for e in errors[:10]:
-                print(e)
-            if len(errors) > 10:
-                print(f"  ... and {len(errors) - 10} more")
-
-        if skipped_runtime:
+            print(f"Backup contains {len(plan)} files")
+            print(f"Target: {display_hermes_home()}")
             print(
-                f"\n  Preserved {len(skipped_runtime)} runtime state "
-                f"file(s) (kept this machine's, not the backup's):"
+                "Format: manifest v1"
+                if manifest is not None
+                else "Format: legacy marker-only archive (in-home restore only)"
             )
-            for rel in sorted(skipped_runtime)[:10]:
-                print(f"    {rel}")
-            if len(skipped_runtime) > 10:
-                print(f"    ... and {len(skipped_runtime) - 10} more")
+            if prefix:
+                print(f"Detected archive prefix: {prefix!r} (will be stripped)")
+            print(f"\nImporting {len(plan)} files ...")
+            t0 = time.monotonic()
+            restored, restored_external, skipped_runtime = _stage_and_activate_restore(
+                zf,
+                plan,
+                hermes_root,
+            )
+            elapsed = time.monotonic() - t0
+    except RestoreActivatedDurabilityError as exc:
+        print(f"Error: Restore activated with durability unknown: {exc}")
+        raise SystemExit(1) from exc
+    except RestoreActivatedCleanupError as exc:
+        print(f"Error: Restore activated but cleanup is incomplete: {exc}")
+        raise SystemExit(1) from exc
+    except (BackupError, OSError, RuntimeError, ValueError, zipfile.BadZipFile) as exc:
+        print(f"Error: Import failed: {exc}")
+        raise SystemExit(1) from exc
 
-        # Post-import: restore profile wrapper scripts
-        profiles_dir = hermes_root / "profiles"
-        restored_profiles = []
-        if profiles_dir.is_dir():
-            try:
-                from hermes_cli.profiles import (
-                    create_wrapper_script, check_alias_collision,
-                    _is_wrapper_dir_in_path, _get_wrapper_dir,
-                )
-                for entry in sorted(profiles_dir.iterdir()):
-                    if not entry.is_dir():
-                        continue
-                    profile_name = entry.name
-                    # Only create wrappers for directories with config
-                    if not (entry / "config.yaml").exists() and not (entry / ".env").exists():
-                        continue
-                    collision = check_alias_collision(profile_name)
-                    if collision:
-                        print(f"  Skipped alias '{profile_name}': {collision}")
-                        restored_profiles.append((profile_name, False))
-                    else:
-                        wrapper = create_wrapper_script(profile_name)
-                        restored_profiles.append((profile_name, wrapper is not None))
-
-                if restored_profiles:
-                    created = [n for n, ok in restored_profiles if ok]
-                    skipped = [n for n, ok in restored_profiles if not ok]
-                    if created:
-                        print(f"\n  Profile aliases restored: {', '.join(created)}")
-                    if skipped:
-                        print(f"  Profile aliases skipped:  {', '.join(skipped)}")
-                    if not _is_wrapper_dir_in_path():
-                        print(f"\n  Note: {_get_wrapper_dir()} is not in your PATH.")
-                        print('  Add to your shell config (~/.bashrc or ~/.zshrc):')
-                        print('    export PATH="$HOME/.local/bin:$PATH"')
-            except ImportError:
-                # hermes_cli.profiles might not be available (fresh install)
-                if any(profiles_dir.iterdir()):
-                    print("\n  Profiles detected but aliases could not be created.")
-                    print("  Run: hermes profile list  (after installing hermes)")
-
-        # Guidance
-        print()
-        if not (hermes_root / "hermes-agent").is_dir():
-            print("Note: The hermes-agent codebase was not included in the backup.")
-            print("  If this is a fresh install, run: hermes update")
-
+    restored_profiles: list[str] = []
+    profiles_dir = hermes_root / "profiles"
+    if profiles_dir.is_dir():
+        for entry in sorted(profiles_dir.iterdir()):
+            if not entry.is_dir() or entry.is_symlink():
+                continue
+            if not (entry / "config.yaml").exists() and not (entry / ".env").exists():
+                continue
+            restored_profiles.append(entry.name)
         if restored_profiles:
-            gw_profiles = [n for n, _ in restored_profiles]
-            print("\nTo re-enable gateway services for profiles:")
-            for pname in gw_profiles:
-                print(f"  hermes -p {pname} gateway install")
+            print(
+                "\n  Profile configuration restored; automatic writes to "
+                "~/.local/bin are disabled during import."
+            )
+            print("  Review profiles, then recreate aliases with the profile command.")
 
-        # Bring the restored install to life: the backup may contain bot
-        # tokens and registered cron jobs, but they're inert without a
-        # gateway process. Install/start the service automatically (a
-        # platform-less gateway is a supported mode, so this is safe even
-        # for backups with no messaging config). Best-effort and prompt-free;
-        # failures print a manual fallback and never fail the import.
-        try:
-            from hermes_cli.gateway import ensure_gateway_service, _is_service_running
+    print()
+    print(f"Import complete: {restored} files restored in {elapsed:.1f}s")
+    print(f"  Target: {display_hermes_home()}")
+    if restored_external:
+        print(
+            f"\n  Restored {restored_external} memory-provider file(s) to "
+            f"their currently declared location(s) outside {display_hermes_home()}."
+        )
+    if skipped_runtime:
+        print(
+            f"\n  Dropped {len(skipped_runtime)} source-machine runtime state file(s):"
+        )
+        for rel in sorted(skipped_runtime)[:10]:
+            print(f"    {rel}")
+        if len(skipped_runtime) > 10:
+            print(f"    ... and {len(skipped_runtime) - 10} more")
 
-            if not _is_service_running():
-                print()
-                ensure_gateway_service(context="import")
-        except Exception:
-            print("\nStart the gateway to activate cron jobs and messaging:")
-            print("  hermes gateway install")
-
-        print("Done. Your Hermes configuration has been restored.")
+    print()
+    if not (hermes_root / "hermes-agent").is_dir():
+        print("Note: The hermes-agent codebase was not included in the backup.")
+        print("  If this is a fresh install, run: hermes update")
+    if restored_profiles:
+        print("\nTo re-enable gateway services for profiles:")
+        for profile_name in restored_profiles:
+            print(f"  hermes -p {profile_name} gateway install")
+    print("Done. The validated Hermes state has been restored.")
 
 
 # ---------------------------------------------------------------------------
 # Quick state snapshots (used by /snapshot slash command and hermes backup --quick)
 # ---------------------------------------------------------------------------
+
+# Critical state files to include in quick snapshots (relative to HERMES_HOME).
+# Everything else is either regeneratable (logs, cache) or managed separately
+# (skills, repo, sessions/).
+#
+# Entries may be individual files OR directories.  Directories are captured
+# recursively; missing entries are silently skipped.  Pairing data lives in
+# platform-specific JSON blobs outside state.db, so it's listed here explicitly
+# — `hermes update` snapshots this set before pulling so approved-user lists
+# are recoverable if anything goes wrong (issue #15733).
+_QUICK_STATE_FILES = (
+    "state.db",
+    "config.yaml",
+    ".env",
+    "auth.json",
+    "cron/jobs.json",
+    "cron/executions.db",
+    "gateway_state.json",
+    "channel_directory.json",
+    "channel_aliases.json",
+    "processes.json",
+    "gateway/discord_message_recovery.db",  # Discord reconnect replay ledger
+    # Per-profile user-created stores that live outside the git checkout and
+    # are therefore destroyed if the update flow removes/replaces the file and
+    # the post-update schema-init re-creates an empty one (issue #52889). All
+    # are at $HERMES_HOME/<name> for the default/root profile; on non-root
+    # profiles the real path is outside HERMES_HOME and the entry is silently
+    # skipped (best-effort, same as the pairing stores). SQLite DBs are copied
+    # WAL-safely via _safe_copy_db.
+    "projects.db",                      # per-profile project store
+    "response_store.db",                # gateway conversation history / tool payloads
+    "memory_store.db",                  # holographic memory facts/entities
+    "verification_evidence.db",         # agent verification audit trail
+    "kanban.db",                        # default board (back-compat <root>/kanban.db)
+    "kanban/boards",                    # non-default boards: each <slug>/kanban.db + board metadata (workspaces/ + attachments/ are skipped as regenerable)
+    # Pairing stores (generic + per-platform JSONs outside state.db)
+    "pairing",                          # legacy location (gateway/pairing.py)
+    "platforms/pairing",                # new location (gateway/pairing.py)
+    "feishu_comment_pairing.json",      # Feishu comment subscription pairings
+)
+
+_QUICK_SNAPSHOTS_DIR = "state-snapshots"
+_QUICK_DEFAULT_KEEP = 20
+
+
 
 # Critical state files to include in quick snapshots (relative to HERMES_HOME).
 # Everything else is either regeneratable (logs, cache) or managed separately

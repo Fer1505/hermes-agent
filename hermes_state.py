@@ -9883,11 +9883,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if sessions_dir is None:
             return
         for suffix in (".json", ".jsonl"):
-            p = sessions_dir / f"{session_id}{suffix}"
-            try:
-                p.unlink(missing_ok=True)
-            except OSError:
-                pass
+            for basename in (f"{session_id}{suffix}", f"session_{session_id}{suffix}"):
+                p = sessions_dir / basename
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
         # request_dump files use session_id as a prefix component
         try:
             for p in sessions_dir.glob(f"request_dump_{session_id}_*.json"):

@@ -3180,7 +3180,8 @@ class TestCodexAuxiliaryAdapterTimeout:
                 return SimpleNamespace(output=None, usage=None)
 
         class FakeResponses:
-            def stream(self, **kwargs):
+            def create(self, **kwargs):
+                assert kwargs["stream"] is True
                 return FakeStream()
 
         fake_client = SimpleNamespace(responses=FakeResponses())
@@ -3209,7 +3210,8 @@ class TestCodexAuxiliaryAdapterTimeout:
                 raise AssertionError("get_final_response should not be reached")
 
         class FakeResponses:
-            def stream(self, **kwargs):
+            def create(self, **kwargs):
+                assert kwargs["stream"] is True
                 return FakeStream()
 
         fake_client = SimpleNamespace(responses=FakeResponses())

@@ -1,4 +1,7 @@
+import json
 from unittest.mock import Mock, patch
+
+import pytest
 
 
 HOST = "example-host"
@@ -6,6 +9,17 @@ PORT = 9223
 WS_URL = f"ws://{HOST}:{PORT}/devtools/browser/abc123"
 HTTP_URL = f"http://{HOST}:{PORT}"
 VERSION_URL = f"{HTTP_URL}/json/version"
+
+
+def _discovery_response(ws_url=WS_URL, *, status_code=200, headers=None):
+    response = Mock()
+    response.status_code = status_code
+    response.headers = headers or {}
+    response.raise_for_status.return_value = None
+    response.iter_content.return_value = [
+        json.dumps({"webSocketDebuggerUrl": ws_url}).encode("utf-8")
+    ]
+    return response
 
 
 class TestResolveCdpOverride:
@@ -21,9 +35,7 @@ class TestResolveCdpOverride:
         raw = "https://cdp.example/json/version?access_token=super-secret-token-123456"
         resolved_ws = "wss://cdp.example/devtools/browser/abc?token=super-secret-token-123456"
 
-        response = Mock()
-        response.raise_for_status.return_value = None
-        response.json.return_value = {"webSocketDebuggerUrl": resolved_ws}
+        response = _discovery_response(resolved_ws)
 
         with patch("tools.browser_tool.requests.get", return_value=response), \
                 patch("tools.browser_tool.logger.info") as mock_info:
@@ -62,8 +74,14 @@ class TestResolveCdpOverride:
 
     def test_normalizes_provider_returned_http_cdp_url_when_creating_session(self, monkeypatch):
         import tools.browser_tool as browser_tool
+        from agent.browser_provider import (
+            REMOTE_PROVIDER_EGRESS_WITH_CROSS_AUTHORITY_DISCOVERY,
+        )
 
         provider = Mock()
+        type(provider).egress_capability = (
+            REMOTE_PROVIDER_EGRESS_WITH_CROSS_AUTHORITY_DISCOVERY
+        )
         provider.create_session.return_value = {
             "session_name": "cloud-session",
             "bb_session_id": "bu_123",
@@ -71,9 +89,7 @@ class TestResolveCdpOverride:
             "features": {"browser_use": True},
         }
 
-        response = Mock()
-        response.raise_for_status.return_value = None
-        response.json.return_value = {"webSocketDebuggerUrl": WS_URL}
+        response = _discovery_response()
 
         monkeypatch.setattr(browser_tool, "_active_sessions", {})
         monkeypatch.setattr(browser_tool, "_session_last_activity", {})
@@ -82,7 +98,8 @@ class TestResolveCdpOverride:
         monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "")
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
 
-        with patch("tools.browser_tool.requests.get", return_value=response) as mock_get:
+        with patch("tools.browser_tool._is_public_network_url", return_value=True), \
+                patch("tools.browser_tool.requests.get", return_value=response) as mock_get:
             session_info = browser_tool._get_session_info("task-browser-use")
 
         assert session_info["cdp_url"] == WS_URL
@@ -90,7 +107,128 @@ class TestResolveCdpOverride:
         mock_get.assert_called_once_with(
             "https://cdp.browser-use.example/session/json/version",
             timeout=10,
+            allow_redirects=False,
+            stream=True,
         )
+
+
+class TestProviderCdpGovernance:
+    def test_operator_override_keeps_explicit_private_websocket_supported(self):
+        from tools.browser_tool import _resolve_cdp_override
+
+        private = "ws://127.0.0.1:9222/devtools/browser/operator"
+        assert _resolve_cdp_override(private) == private
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "ftp://public.example/devtools/browser/x",
+            "wss://user:password@public.example/devtools/browser/x",
+            "wss://public.example/devtools/browser/x#fragment",
+        ],
+    )
+    def test_provider_rejects_unsupported_or_credentialed_endpoint(self, endpoint):
+        from agent.browser_provider import REMOTE_PROVIDER_EGRESS
+        from tools.browser_tool import (
+            _CDP_PROVENANCE_CLOUD_PROVIDER,
+            _resolve_cdp_override,
+        )
+
+        with pytest.raises(ValueError):
+            _resolve_cdp_override(
+                endpoint,
+                provenance=_CDP_PROVENANCE_CLOUD_PROVIDER,
+                source_contract=REMOTE_PROVIDER_EGRESS,
+            )
+
+    def test_provider_endpoint_fails_closed_when_not_public(self):
+        from agent.browser_provider import REMOTE_PROVIDER_EGRESS
+        from tools.browser_tool import (
+            _CDP_PROVENANCE_CLOUD_PROVIDER,
+            _resolve_cdp_override,
+        )
+
+        with patch("tools.browser_tool._is_public_network_url", return_value=False):
+            with pytest.raises(ValueError, match="public-network preflight"):
+                _resolve_cdp_override(
+                    "wss://relay.example/devtools/browser/x",
+                    provenance=_CDP_PROVENANCE_CLOUD_PROVIDER,
+                    source_contract=REMOTE_PROVIDER_EGRESS,
+                )
+
+    def test_provider_discovery_rejects_redirect_and_oversized_body(self):
+        from agent.browser_provider import REMOTE_PROVIDER_EGRESS
+        from tools.browser_tool import (
+            _CDP_PROVENANCE_CLOUD_PROVIDER,
+            _MAX_CDP_DISCOVERY_BYTES,
+            _resolve_cdp_override,
+        )
+
+        for response in (
+            _discovery_response(status_code=302),
+            _discovery_response(
+                headers={"content-length": str(_MAX_CDP_DISCOVERY_BYTES + 1)}
+            ),
+        ):
+            with patch("tools.browser_tool._is_public_network_url", return_value=True), \
+                    patch("tools.browser_tool.requests.get", return_value=response) as get:
+                with pytest.raises(RuntimeError, match="Provider CDP discovery failed"):
+                    _resolve_cdp_override(
+                        "https://discovery.example/session",
+                        provenance=_CDP_PROVENANCE_CLOUD_PROVIDER,
+                        source_contract=REMOTE_PROVIDER_EGRESS,
+                    )
+            assert get.call_args.kwargs["allow_redirects"] is False
+            assert get.call_args.kwargs["stream"] is True
+            response.close.assert_called_once_with()
+
+    def test_provider_validates_returned_websocket_scheme(self):
+        from agent.browser_provider import REMOTE_PROVIDER_EGRESS
+        from tools.browser_tool import (
+            _CDP_PROVENANCE_CLOUD_PROVIDER,
+            _resolve_cdp_override,
+        )
+
+        response = _discovery_response("https://relay.example/not-websocket")
+        with patch("tools.browser_tool._is_public_network_url", return_value=True), \
+                patch("tools.browser_tool.requests.get", return_value=response):
+            with pytest.raises(ValueError, match="unsupported URL scheme"):
+                _resolve_cdp_override(
+                    "https://discovery.example/session",
+                    provenance=_CDP_PROVENANCE_CLOUD_PROVIDER,
+                    source_contract=REMOTE_PROVIDER_EGRESS,
+                )
+
+    def test_cross_authority_discovery_requires_explicit_contract(self):
+        from agent.browser_provider import (
+            REMOTE_PROVIDER_EGRESS,
+            REMOTE_PROVIDER_EGRESS_WITH_CROSS_AUTHORITY_DISCOVERY,
+        )
+        from tools.browser_tool import (
+            _CDP_PROVENANCE_CLOUD_PROVIDER,
+            _resolve_cdp_override,
+        )
+
+        endpoint = "https://discovery.example/session"
+        websocket = "wss://relay.other.example/devtools/browser/x"
+        response = _discovery_response(websocket)
+        with patch("tools.browser_tool._is_public_network_url", return_value=True), \
+                patch("tools.browser_tool.requests.get", return_value=response):
+            with pytest.raises(ValueError, match="cross-authority"):
+                _resolve_cdp_override(
+                    endpoint,
+                    provenance=_CDP_PROVENANCE_CLOUD_PROVIDER,
+                    source_contract=REMOTE_PROVIDER_EGRESS,
+                )
+
+        response = _discovery_response(websocket)
+        with patch("tools.browser_tool._is_public_network_url", return_value=True), \
+                patch("tools.browser_tool.requests.get", return_value=response):
+            assert _resolve_cdp_override(
+                endpoint,
+                provenance=_CDP_PROVENANCE_CLOUD_PROVIDER,
+                source_contract=REMOTE_PROVIDER_EGRESS_WITH_CROSS_AUTHORITY_DISCOVERY,
+            ) == websocket
 
 
 class TestGetCdpOverride:
@@ -105,31 +243,31 @@ class TestGetCdpOverride:
             raising=False,
         )
 
-        response = Mock()
-        response.raise_for_status.return_value = None
-        response.json.return_value = {"webSocketDebuggerUrl": WS_URL}
+        response = _discovery_response()
 
         with patch("tools.browser_tool.requests.get", return_value=response) as mock_get:
             resolved = browser_tool._get_cdp_override()
 
         assert resolved == WS_URL
-        mock_get.assert_called_once_with(VERSION_URL, timeout=10)
+        mock_get.assert_called_once_with(
+            VERSION_URL, timeout=10, allow_redirects=False, stream=True
+        )
 
     def test_uses_config_browser_cdp_url_when_env_missing(self, monkeypatch):
         import tools.browser_tool as browser_tool
 
         monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
 
-        response = Mock()
-        response.raise_for_status.return_value = None
-        response.json.return_value = {"webSocketDebuggerUrl": WS_URL}
+        response = _discovery_response()
 
         with patch("hermes_cli.config.read_raw_config", return_value={"browser": {"cdp_url": HTTP_URL}}), \
              patch("tools.browser_tool.requests.get", return_value=response) as mock_get:
             resolved = browser_tool._get_cdp_override()
 
         assert resolved == WS_URL
-        mock_get.assert_called_once_with(VERSION_URL, timeout=10)
+        mock_get.assert_called_once_with(
+            VERSION_URL, timeout=10, allow_redirects=False, stream=True
+        )
 
     def test_camofox_yields_to_config_cdp_override(self, monkeypatch):
         """CAMOFOX_URL + a persistent browser.cdp_url config override must NOT

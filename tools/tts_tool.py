@@ -61,6 +61,28 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
+
+_TTS_CONTROL_DIRECTIVE = re.compile(
+    r"\[\[\s*(?:tts(?::[^\]]*)?|/tts|audio_as_voice)\s*\]\]",
+    flags=re.IGNORECASE,
+)
+
+
+def _strip_tts_control_directives(text: str) -> str:
+    """Remove delivery/control markers that must never be spoken aloud."""
+    return _TTS_CONTROL_DIRECTIVE.sub(" ", text)
+
+
+def _set_private_audio_permissions(path: str) -> None:
+    """Best-effort owner-only permissions for generated voice artifacts."""
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        logger.debug(
+            "Failed to tighten TTS audio permissions for %s",
+            path,
+            exc_info=True,
+        )
 def get_env_value(name, default=None):
     """Read env values through the live config module.
 
@@ -3448,6 +3470,7 @@ def _text_to_speech_single(
         elif provider in {"elevenlabs", "openai", "mistral", "gemini"}:
             voice_compatible = want_opus and file_str.endswith(".ogg")
 
+        _set_private_audio_permissions(file_str)
         file_size = os.path.getsize(file_str)
         logger.info("TTS audio saved: %s (%s bytes, provider: %s)", file_str, f"{file_size:,}", provider)
 
@@ -3515,6 +3538,10 @@ def text_to_speech_tool(
         str: JSON result with success, file_path, file_paths, and MEDIA tag.
     """
     if not text or not text.strip():
+        return tool_error("Text is required", success=False)
+
+    text = _strip_tts_control_directives(text).strip()
+    if not text:
         return tool_error("Text is required", success=False)
 
     # Normalize text via the shared cleaner: markdown, emoji, think blocks,
@@ -3654,6 +3681,7 @@ def text_to_speech_tool(
         )
 
         for path in final_paths:
+            _set_private_audio_permissions(path)
             logger.info(
                 "TTS audio saved: %s (%s bytes, provider: %s)",
                 path,

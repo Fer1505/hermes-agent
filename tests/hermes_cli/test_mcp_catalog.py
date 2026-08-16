@@ -191,6 +191,31 @@ class TestManifestParsing:
 
 
 class TestInstall:
+    def test_exact_catalog_command_can_receive_catalog_attestation(self, catalog_dir):
+        _write_manifest(catalog_dir, "demo", _basic_manifest())
+        from hermes_cli.mcp_security import (
+            upgrade_matching_catalog_stdio_entry,
+            validate_mcp_server_entry,
+        )
+
+        upgraded = upgrade_matching_catalog_stdio_entry(
+            "demo", {"command": "npx", "args": ["-y", "demo-mcp"], "enabled": True}
+        )
+
+        assert upgraded is not None
+        assert upgraded["_hermes_stdio_authorization"]["authorization"] == "catalog"
+        assert validate_mcp_server_entry(
+            "demo", upgraded, require_attestation=True
+        ) == []
+
+    def test_custom_command_cannot_borrow_catalog_attestation(self, catalog_dir):
+        _write_manifest(catalog_dir, "demo", _basic_manifest())
+        from hermes_cli.mcp_security import upgrade_matching_catalog_stdio_entry
+
+        assert upgrade_matching_catalog_stdio_entry(
+            "demo", {"command": "npx", "args": ["-y", "different-package"]}
+        ) is None
+
     def test_install_simple_stdio_writes_config(self, catalog_dir):
         _write_manifest(catalog_dir, "demo", _basic_manifest())
         from hermes_cli.mcp_catalog import install_entry
@@ -201,7 +226,7 @@ class TestInstall:
         cfg = load_config()
         servers = cfg["mcp_servers"]
         assert "demo" in servers
-        assert servers["demo"]["command"] == "npx"
+        assert Path(servers["demo"]["command"]).name in {"npx", "npx-cli.js"}
         assert servers["demo"]["args"] == ["-y", "demo-mcp"]
         assert servers["demo"]["enabled"] is True
 

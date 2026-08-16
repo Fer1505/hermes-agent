@@ -147,6 +147,35 @@ class TestBundledPluginsRegister:
             type(provider).emergency_cleanup is not BrowserProvider.emergency_cleanup
         )
 
+    @pytest.mark.parametrize(
+        "plugin_name,allows_cross_authority",
+        [
+            ("browserbase", False),
+            ("browser-use", True),
+            ("firecrawl", False),
+        ],
+    )
+    def test_each_plugin_declares_truthful_egress_contract(
+        self, plugin_name: str, allows_cross_authority: bool
+    ) -> None:
+        _ensure_plugins_loaded()
+        from agent.browser_provider import (
+            BrowserControlTransport,
+            BrowserEgressCapability,
+        )
+        from agent.browser_registry import get_provider
+
+        provider = get_provider(plugin_name)
+        assert provider is not None
+        capability = provider.egress_capability
+        assert isinstance(capability, BrowserEgressCapability)
+        assert capability.control_transport is BrowserControlTransport.CDP
+        assert capability.requires_cdp_url is True
+        assert (
+            capability.allows_cross_authority_cdp_discovery
+            is allows_cross_authority
+        )
+
 
 
 # ---------------------------------------------------------------------------
@@ -293,5 +322,4 @@ class TestPickerIntegration:
         rows = _plugin_browser_providers()
         names = sorted(r.get("browser_provider") for r in rows)
         assert names == ["browserbase", "firecrawl"]
-
 

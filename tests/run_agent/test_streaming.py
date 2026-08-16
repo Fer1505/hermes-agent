@@ -626,6 +626,80 @@ class TestCodexStreamCallbacks:
         # 1 initial + 1 retry = 2 calls
         assert call_count["n"] == 2
 
+    def test_codex_stream_synthesizes_output_when_final_output_is_none(self):
+        """Collected text survives a completed response with ``output=None``."""
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = False
+        events = [
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(type="response.output_text.delta", delta="primary "),
+            SimpleNamespace(type="response.output_text.delta", delta="ok"),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(
+                    status="completed", id="r1", usage=None, output=None
+                ),
+            ),
+        ]
+
+        class _FakeCreateStream:
+            def __iter__(self_inner):
+                return iter(events)
+
+            def close(self_inner):
+                return None
+
+        mock_client = MagicMock()
+        mock_client.responses.create.return_value = _FakeCreateStream()
+        response = agent._run_codex_stream({}, client=mock_client)
+        assert response.output[0].content[0].text == "primary ok"
+
+    def test_codex_stream_salvages_output_after_midflight_sdk_failure(self):
+        """Collected text survives an SDK iteration failure after deltas."""
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = False
+
+        class _BrokenCreateStream:
+            def __iter__(self_inner):
+                def _events():
+                    yield SimpleNamespace(
+                        type="response.output_text.delta", delta="primary "
+                    )
+                    yield SimpleNamespace(
+                        type="response.output_text.delta", delta="ok"
+                    )
+                    raise TypeError("'NoneType' object is not iterable")
+
+                return _events()
+
+            def close(self_inner):
+                return None
+
+        mock_client = MagicMock()
+        mock_client.responses.create.return_value = _BrokenCreateStream()
+        response = agent._run_codex_stream({}, client=mock_client)
+        assert response.output[0].content[0].text == "primary ok"
+
     def test_codex_create_stream_fallback_refreshes_activity_on_every_event(self):
         from run_agent import AIAgent
 
@@ -1634,4 +1708,3 @@ class TestBedrockReasoningStaleFloor:
         from agent.chat_completion_helpers import _bedrock_reasoning_stale_floor
 
         assert _bedrock_reasoning_stale_floor(model_id) == expected
-

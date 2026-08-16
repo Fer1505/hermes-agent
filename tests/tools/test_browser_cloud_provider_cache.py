@@ -15,6 +15,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from agent.browser_provider import REMOTE_PROVIDER_EGRESS
 import tools.browser_tool as browser_tool
 
 
@@ -82,6 +83,10 @@ class TestCloudProviderCachePolicy:
             def name(self):
                 return "cache-replacement"
 
+            @property
+            def egress_capability(self):
+                return REMOTE_PROVIDER_EGRESS
+
             def is_available(self):
                 return True
 
@@ -138,6 +143,10 @@ class TestCloudProviderCachePolicy:
             @property
             def name(self):
                 return "cache-race"
+
+            @property
+            def egress_capability(self):
+                return REMOTE_PROVIDER_EGRESS
 
             def is_available(self):
                 return True

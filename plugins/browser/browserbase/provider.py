@@ -38,7 +38,11 @@ from typing import Any, Dict, Optional
 
 import requests
 
-from agent.browser_provider import BrowserProvider
+from agent.browser_provider import (
+    REMOTE_PROVIDER_EGRESS,
+    BrowserEgressCapability,
+    BrowserProvider,
+)
 from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
@@ -58,6 +62,11 @@ class BrowserbaseBrowserProvider(BrowserProvider):
     @property
     def display_name(self) -> str:
         return "Browserbase"
+
+    @property
+    def egress_capability(self) -> BrowserEgressCapability:
+        """Pages run remotely; provider-managed egress is not verified by Hermes."""
+        return REMOTE_PROVIDER_EGRESS
 
     def is_available(self) -> bool:
         return self._get_config_or_none() is not None

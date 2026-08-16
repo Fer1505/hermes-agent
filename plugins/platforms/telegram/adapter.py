@@ -18,6 +18,7 @@ import html as _html
 import re
 import threading
 import time
+import uuid
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
@@ -357,7 +358,7 @@ from plugins.platforms.telegram.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
-from utils import atomic_replace, env_float, env_int
+from utils import atomic_json_write, atomic_replace, env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _TELEGRAM_IMAGE_MIME_TO_EXT = {
@@ -851,6 +852,8 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        self._peer_relay = self._load_peer_relay_config()
+        self._peer_relay_task: Optional[asyncio.Task] = None
         self._drop_delayed_deliveries = False
         self._polling_error_task: Optional[asyncio.Task] = None
         self._polling_conflict_count: int = 0
@@ -991,6 +994,252 @@ class TelegramAdapter(BasePlatformAdapter):
         torn-down session, producing stale/duplicate deliveries.
         """
         return bool(getattr(self, "_drop_delayed_deliveries", False))
+
+    def _load_peer_relay_config(self) -> Dict[str, Any]:
+        raw = self.config.extra.get("peer_relay") if self.config.extra else None
+        if not isinstance(raw, dict):
+            return {"enabled": False}
+
+        enabled_raw = raw.get("enabled", False)
+        if isinstance(enabled_raw, str):
+            enabled = enabled_raw.strip().lower() in {"true", "1", "yes", "on"}
+        else:
+            enabled = bool(enabled_raw)
+        profile = str(raw.get("profile") or raw.get("name") or "").strip()
+        display_name = str(raw.get("display_name") or profile or "Telegram peer").strip()
+        home = _Path(raw.get("home") or os.getenv("HERMES_HOME") or ".").expanduser()
+        inbox = _Path(
+            raw.get("inbox") or (home / "telegram_peer_relay" / "inbox")
+        ).expanduser()
+
+        groups_raw = raw.get("groups") or raw.get("allowed_chats") or []
+        if isinstance(groups_raw, (str, int)):
+            groups = {str(groups_raw)}
+        elif isinstance(groups_raw, list):
+            groups = {str(item) for item in groups_raw if str(item).strip()}
+        else:
+            groups = set()
+
+        peers: list[dict[str, str]] = []
+        peers_raw = raw.get("peers") or []
+        if isinstance(peers_raw, dict):
+            peers_raw = [peers_raw]
+        if isinstance(peers_raw, list):
+            for peer in peers_raw:
+                if not isinstance(peer, dict):
+                    continue
+                peer_profile = str(peer.get("profile") or peer.get("name") or "").strip()
+                if peer.get("inbox"):
+                    peer_inbox = _Path(peer["inbox"]).expanduser()
+                elif peer.get("home"):
+                    peer_inbox = (
+                        _Path(peer["home"]).expanduser()
+                        / "telegram_peer_relay"
+                        / "inbox"
+                    )
+                else:
+                    continue
+                peers.append({"profile": peer_profile, "inbox": str(peer_inbox)})
+        try:
+            poll_interval = max(
+                0.1,
+                float(raw.get("poll_interval_seconds", raw.get("poll_interval", 0.4))),
+            )
+        except (TypeError, ValueError):
+            poll_interval = 0.4
+        try:
+            max_depth = max(1, int(raw.get("max_depth", 4)))
+        except (TypeError, ValueError):
+            max_depth = 4
+        return {
+            "enabled": enabled,
+            "profile": profile,
+            "display_name": display_name,
+            "home": str(home),
+            "inbox": str(inbox),
+            "groups": groups,
+            "peers": peers,
+            "poll_interval_seconds": poll_interval,
+            "max_depth": max_depth,
+        }
+
+    def _peer_relay_enabled(self) -> bool:
+        return bool(self._peer_relay.get("enabled"))
+
+    def _peer_relay_group_allowed(self, chat_id: Optional[str]) -> bool:
+        groups = self._peer_relay.get("groups") or set()
+        return bool(groups) and ("*" in groups or str(chat_id or "") in groups)
+
+    def _start_peer_relay(self) -> None:
+        if not self._peer_relay_enabled():
+            return
+        if self._peer_relay_task and not self._peer_relay_task.done():
+            return
+        inbox = _Path(str(self._peer_relay["inbox"]))
+        inbox.mkdir(parents=True, exist_ok=True)
+        self._peer_relay_task = asyncio.create_task(
+            self._peer_relay_loop(),
+            name=f"telegram-peer-relay-{self._peer_relay.get('profile') or 'profile'}",
+        )
+
+    async def _stop_peer_relay(self) -> None:
+        task = self._peer_relay_task
+        self._peer_relay_task = None
+        if not task or task.done():
+            return
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+    async def _peer_relay_loop(self) -> None:
+        while True:
+            try:
+                await self._process_peer_relay_inbox_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Telegram peer relay poll failed: %s",
+                    self.name,
+                    exc,
+                    exc_info=True,
+                )
+            await asyncio.sleep(
+                float(self._peer_relay.get("poll_interval_seconds") or 0.4)
+            )
+
+    async def _after_final_text_response_sent(
+        self,
+        event: MessageEvent,
+        content: str,
+        result: SendResult,
+    ) -> None:
+        if not self._peer_relay_enabled():
+            return
+        source = event.source
+        if not source or source.chat_type not in {"group", "forum"}:
+            return
+        if not self._peer_relay_group_allowed(source.chat_id):
+            return
+        peers = self._peer_relay.get("peers") or []
+        if not peers:
+            return
+        raw_payload = event.raw_message if isinstance(event.raw_message, dict) else {}
+        inbound_depth = int(raw_payload.get("relay_depth") or 0)
+        max_depth = int(self._peer_relay.get("max_depth") or 4)
+        if inbound_depth >= max_depth:
+            return
+        profile = str(self._peer_relay.get("profile") or "")
+        payload = {
+            "schema": "hermes-agent.telegram-peer-relay.v1",
+            "origin_profile": profile,
+            "origin_display_name": self._peer_relay.get("display_name") or profile or self.name,
+            "chat_id": source.chat_id,
+            "chat_name": source.chat_name,
+            "chat_type": source.chat_type,
+            "thread_id": source.thread_id,
+            "message_id": result.message_id,
+            "text": content,
+            "trigger_user_id": source.user_id,
+            "trigger_user_name": source.user_name,
+            "trigger_message_id": event.message_id,
+            "channel_prompt": event.channel_prompt,
+            "relay_depth": inbound_depth + 1,
+            "created_at": time.time(),
+        }
+        for peer in peers:
+            if profile and str(peer.get("profile") or "") == profile:
+                continue
+            inbox = _Path(str(peer.get("inbox") or "")).expanduser()
+            if not str(inbox):
+                continue
+            target = inbox / (
+                f"{time.time_ns()}-{profile or 'telegram'}-{uuid.uuid4().hex}.json"
+            )
+            await asyncio.to_thread(atomic_json_write, target, payload, indent=2)
+
+    async def _process_peer_relay_inbox_once(self) -> int:
+        if not self._peer_relay_enabled():
+            return 0
+        inbox = _Path(str(self._peer_relay["inbox"]))
+        inbox.mkdir(parents=True, exist_ok=True)
+        processed = 0
+        for item_path in sorted(inbox.glob("*.json")):
+            claim = item_path.with_suffix(item_path.suffix + ".processing")
+            try:
+                os.replace(item_path, claim)
+            except FileNotFoundError:
+                continue
+            try:
+                payload = json.loads(claim.read_text(encoding="utf-8"))
+                await self._handle_peer_relay_payload(payload)
+                processed += 1
+            except Exception as exc:
+                bad_path = claim.with_suffix(claim.suffix + ".bad")
+                try:
+                    os.replace(claim, bad_path)
+                except OSError:
+                    pass
+                logger.warning(
+                    "[%s] Failed to process Telegram peer relay payload %s: %s",
+                    self.name,
+                    item_path.name,
+                    exc,
+                    exc_info=True,
+                )
+                continue
+            claim.unlink(missing_ok=True)
+        return processed
+
+    async def _handle_peer_relay_payload(self, payload: Dict[str, Any]) -> None:
+        if payload.get("schema") != "hermes-agent.telegram-peer-relay.v1":
+            return
+        origin_profile = str(payload.get("origin_profile") or "").strip()
+        if origin_profile and origin_profile == str(self._peer_relay.get("profile") or ""):
+            return
+        chat_id = str(payload.get("chat_id") or "")
+        if not self._peer_relay_group_allowed(chat_id):
+            return
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            return
+        try:
+            relay_depth = int(payload.get("relay_depth") or 1)
+        except (TypeError, ValueError):
+            relay_depth = 1
+        if relay_depth > int(self._peer_relay.get("max_depth") or 4):
+            return
+        origin_name = str(
+            payload.get("origin_display_name") or origin_profile or "Telegram peer"
+        ).strip()
+        trigger_user_id = payload.get("trigger_user_id") or f"relay:{origin_profile or origin_name}"
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=payload.get("chat_name"),
+            chat_type=str(payload.get("chat_type") or "group"),
+            user_id=str(trigger_user_id),
+            user_name=origin_name,
+            thread_id=str(payload["thread_id"]) if payload.get("thread_id") is not None else None,
+            is_bot=True,
+            message_id=str(payload["message_id"]) if payload.get("message_id") is not None else None,
+        )
+        event = MessageEvent(
+            text=f"{origin_name}: {text}",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=payload,
+            message_id=str(payload["message_id"]) if payload.get("message_id") is not None else None,
+            reply_to_message_id=(
+                str(payload["trigger_message_id"])
+                if payload.get("trigger_message_id") is not None
+                else None
+            ),
+            channel_prompt=payload.get("channel_prompt"),
+            internal=True,
+        )
+        await self.handle_message(event)
 
     def _notification_kwargs(
         self, metadata: Optional[Dict[str, Any]]
@@ -4792,6 +5041,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # though polling/webhook is already live (#46298). Defer them to a
             # cancellable background task so connect() returns as soon as the
             # transport is up.
+            self._start_peer_relay()
             self._start_post_connect_housekeeping()
 
             return True
@@ -4941,6 +5191,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending delayed deliveries, and disconnect."""
+        await self._stop_peer_relay()
         # Mark disconnected first so the drop guard short-circuits any flush
         # that wins the race against teardown and prevents new delayed tasks
         # from being scheduled by late update handlers.

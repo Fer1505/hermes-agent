@@ -1426,7 +1426,8 @@ class HonchoMemoryProvider(MemoryProvider):
         # ``saveMessages`` is the operator's hard write gate. Previously it
         # was parsed into HonchoClientConfig but never enforced here, so a
         # cached hybrid provider kept writing even after containment was set.
-        if self._config and not getattr(self._config, "save_messages", True):
+        config = getattr(self, "_config", None)
+        if config and not getattr(config, "save_messages", True):
             return
         if _is_internal_gateway_turn(user_content):
             logger.debug("Honcho sync skipped machine-generated gateway turn")
@@ -1488,8 +1489,10 @@ class HonchoMemoryProvider(MemoryProvider):
             return
         # ``saveMessages`` is the operator's hard write gate; the memory-tool
         # mirror is an automatic Honcho mutation path and must respect it too,
-        # otherwise containment would only cover conversation turns.
-        if self._config and not getattr(self._config, "save_messages", True):
+        # otherwise containment would only cover conversation turns. Test and
+        # recovery callers may construct the provider without full config.
+        config = getattr(self, "_config", None)
+        if config and not getattr(config, "save_messages", True):
             return
         if self._recall_mode == "tools" and not self._session_ready():
             return

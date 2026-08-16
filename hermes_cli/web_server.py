@@ -11319,6 +11319,14 @@ def _import_sessions_for_profile(profile: Optional[str], sessions: List[Dict[str
         db.close()
 
 
+def _sessions_dir_for_profile(profile: Optional[str]) -> Path:
+    """Return the profile-scoped directory for sensitive session artifacts."""
+    if not profile:
+        return get_hermes_home() / "sessions"
+    _name, home = _cron_profile_home(profile)
+    return Path(home) / "sessions"
+
+
 app.include_router(_sessions_routes.manage_router)
 from hermes_cli.web_routers.sessions import (  # noqa: E402,F401 — legacy re-exports; tests call these via web_server.<name>
     bulk_delete_sessions_endpoint,

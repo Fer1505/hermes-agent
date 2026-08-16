@@ -117,6 +117,32 @@ class TestMirrorToSession:
 
         assert result is False
 
+    def test_provider_message_id_survives_jsonl_roundtrip(self, tmp_path):
+        sessions_dir, index_file = _setup_sessions(tmp_path, {
+            "s1": {
+                "session_id": "sess_abc",
+                "origin": {"platform": "telegram", "chat_id": "12345"},
+                "updated_at": "2026-01-01T00:00:00",
+            }
+        })
+
+        with patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file), \
+             patch("gateway.mirror._append_to_sqlite"):
+            result = mirror_to_session(
+                "telegram",
+                "12345",
+                "Hello!",
+                source_label="cli",
+                provider_message_id="1067",
+            )
+
+        assert result is True
+        mirrored = json.loads(
+            (sessions_dir / "sess_abc.jsonl").read_text(encoding="utf-8").strip()
+        )
+        assert mirrored["message_id"] == "1067"
+
 
 class TestAppendToSqlite:
     def test_connection_is_closed_after_use(self, tmp_path):
@@ -129,4 +155,3 @@ class TestAppendToSqlite:
 
         mock_db.append_message.assert_called_once()
         mock_db.close.assert_called_once()
-

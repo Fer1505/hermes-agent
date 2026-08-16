@@ -937,4 +937,71 @@ class TestProfilesToServe:
         assert serve["worker"] == get_profile_dir("worker")
 
 
+class TestProfileLifecycleCapabilityDenial:
+    """Typed denials occur before any profile or service mutation."""
+
+    @staticmethod
+    def _deny(*_args, **_kwargs):
+        raise PermissionError("profile lifecycle denied")
+
+    def test_delete_denial_has_zero_effect(self, profile_env, monkeypatch):
+        create_profile("denied-delete", no_alias=True)
+        profile_dir = get_profile_dir("denied-delete")
+        marker = profile_dir / "marker.txt"
+        marker.write_text("unchanged", encoding="utf-8")
+        cleanup = MagicMock()
+        monkeypatch.setattr(
+            profiles, "require_protected_control_file_capability", self._deny
+        )
+        monkeypatch.setattr(profiles, "_cleanup_gateway_service", cleanup)
+
+        with pytest.raises(PermissionError, match="lifecycle denied"):
+            delete_profile("denied-delete", yes=True)
+
+        assert marker.read_text(encoding="utf-8") == "unchanged"
+        cleanup.assert_not_called()
+
+    def test_export_denial_creates_no_archive(self, profile_env, tmp_path, monkeypatch):
+        create_profile("denied-export", no_alias=True)
+        output = tmp_path / "denied-export.tar.gz"
+        monkeypatch.setattr(
+            profiles, "require_protected_control_file_capability", self._deny
+        )
+
+        with pytest.raises(PermissionError, match="lifecycle denied"):
+            export_profile("denied-export", str(output))
+
+        assert not output.exists()
+
+    def test_import_denial_creates_no_profile(self, profile_env, tmp_path, monkeypatch):
+        create_profile("source-export", no_alias=True)
+        archive = export_profile(
+            "source-export", str(tmp_path / "source-export.tar.gz")
+        )
+        target = get_profile_dir("denied-import")
+        monkeypatch.setattr(
+            profiles, "require_protected_control_file_capability", self._deny
+        )
+
+        with pytest.raises(PermissionError, match="lifecycle denied"):
+            import_profile(str(archive), name="denied-import")
+
+        assert not target.exists()
+
+    def test_rename_denial_preserves_source_and_target(self, profile_env, monkeypatch):
+        create_profile("denied-old", no_alias=True)
+        source = get_profile_dir("denied-old")
+        target = get_profile_dir("denied-new")
+        marker = source / "marker.txt"
+        marker.write_text("unchanged", encoding="utf-8")
+        monkeypatch.setattr(
+            profiles, "require_protected_control_file_capability", self._deny
+        )
+
+        with pytest.raises(PermissionError, match="lifecycle denied"):
+            rename_profile("denied-old", "denied-new")
+
+        assert marker.read_text(encoding="utf-8") == "unchanged"
+        assert not target.exists()
+
 

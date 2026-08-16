@@ -435,6 +435,142 @@ from cron.executions import create_execution, finish_execution, mark_execution_r
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
 
+
+def _cron_auth_fallback_disabled_for_job(cfg: dict, job: dict) -> bool:
+    """Return whether an unattended job must fail closed on auth failure."""
+    if job.get("allow_auth_fallback") is True:
+        return False
+    policy = (cfg or {}).get("fallback_policy") or {}
+    if isinstance(policy, dict):
+        cron_policy = policy.get("cron") or {}
+        if (
+            isinstance(cron_policy, dict)
+            and cron_policy.get("allow_on_auth_error") is True
+        ):
+            return False
+    return True
+
+
+def _bad_human_facing_cron_output_reason(
+    job: dict, final_response: str
+) -> str | None:
+    """Identify non-results that must not be recorded/delivered as success."""
+    del job
+    text = (final_response or "").strip()
+    if not text or text.upper().startswith(SILENT_MARKER):
+        return None
+
+    squashed = re.sub(r"\s+", " ", text).strip()
+    lower = squashed.lower()
+    if lower in {
+        "how can i help you today?",
+        "how may i help you today?",
+        "what can i help you with?",
+        "what can i help you with today?",
+    } or (
+        len(squashed) <= 180
+        and lower.startswith(
+            (
+                "how can i help",
+                "how may i help",
+                "what can i help",
+                "what would you like me to do",
+            )
+        )
+    ):
+        return "generic assistant prompt"
+
+    if len(squashed) <= 400 and lower.startswith(
+        (
+            "[no-op]",
+            "[no op]",
+            "[no action taken",
+            "[execution complete. no output generated",
+            "no action taken.",
+            "no action was taken.",
+        )
+    ):
+        return "cron produced a no-op marker instead of completing the scheduled task"
+
+    context_deflections = (
+        "i need more context",
+        "i need additional context",
+        "i need more information",
+        "i need additional information",
+        "please provide more context",
+        "please provide the source",
+        "please provide the required",
+        "please provide the exact",
+        "could you please provide",
+        "could you please tell me what you would like me to do",
+    )
+    if (
+        len(squashed) <= 320
+        and any(phrase in lower for phrase in context_deflections)
+    ) or (
+        len(squashed) <= 1200 and lower.startswith(context_deflections)
+    ):
+        return "cron asked for context instead of completing the scheduled task"
+
+    if len(squashed) <= 1200 and lower.startswith(
+        (
+            "i will review ",
+            "i will perform ",
+            "i'll review ",
+            "i'll perform ",
+            "here is a plan",
+            "here's the plan",
+            "execution plan:",
+            "proposed plan:",
+        )
+    ):
+        return "cron returned a plan instead of completing the scheduled task"
+
+    if re.search(r"tool ['\"][^'\"]+['\"] does not exist", text, re.IGNORECASE):
+        return "nonexistent tool error leaked into final response"
+    if "available tools:" in lower and "does not exist" in lower:
+        return "nonexistent tool error leaked into final response"
+
+    if any(
+        marker in lower
+        for marker in (
+            "<|tool_code|>",
+            "<tool_code",
+            "```tool_code",
+            "[tool]",
+            "[/tool]",
+            "<tool_call",
+            "recipient_name",
+            "tool_uses",
+            "commentary to=functions.",
+            "assistant to=functions.",
+        )
+    ) or re.search(r"(?im)^\s*tool_code\b", text):
+        return "raw or fake tool-call syntax leaked into final response"
+
+    if lower.startswith("[no action required]"):
+        return "[NO ACTION REQUIRED] is not a valid delivery suppression marker"
+    return None
+
+
+def _format_rejected_cron_output(
+    output: str, final_response: str, reason: str
+) -> str:
+    """Preserve a bounded rejected response in the local audit document."""
+    rejected = (final_response or "").strip()
+    if len(rejected) > 4000:
+        rejected = rejected[:4000].rstrip() + "\n... [truncated]"
+    quoted = "\n".join(
+        f"> {line}" if line else ">" for line in rejected.splitlines()
+    )
+    return (
+        f"{(output or '').rstrip()}\n\n"
+        "## Cron Output Rejected\n\n"
+        f"Reason: {reason}\n\n"
+        "Rejected final response:\n\n"
+        f"{quoted}\n"
+    )
+
 # Canonical silence tokens recognized in cron output.  Cron's contract is
 # intentionally looser than the gateway's exact-whole-response rule: the cron
 # system prompt *instructs* the agent to emit "[SILENT]", and real agents often
@@ -4175,6 +4311,15 @@ def run_job(
                 or primary_provider_for_drift
             )
         except AuthError as auth_exc:
+            if _cron_auth_fallback_disabled_for_job(_cfg, job):
+                logger.error(
+                    "Job '%s': primary auth failed and cron auth fallback is disabled: %s",
+                    job_id,
+                    auth_exc,
+                )
+                raise RuntimeError(
+                    format_runtime_provider_error(auth_exc)
+                ) from auth_exc
             # Primary provider auth failed — try each configured provider/model
             # pair atomically. Keeping the primary model while changing only the
             # provider can silently route a paid GPT model through OpenRouter.
@@ -4320,7 +4465,11 @@ def run_job(
                     f"config is pinned or restored. See #44585."
                 )
 
-        fallback_model = get_fallback_chain(_cfg) or None
+        fallback_model = (
+            get_fallback_chain(_cfg) or None
+            if not _cron_auth_fallback_disabled_for_job(_cfg, job)
+            else None
+        )
         credential_pool = None
         runtime_provider = str(runtime.get("provider") or "").strip().lower()
         if runtime_provider:
@@ -4902,6 +5051,18 @@ def run_one_job(
             raise
         finally:
             reset_secret_scope(_scope_token)
+
+        if success and not job.get("no_agent"):
+            rejection_reason = _bad_human_facing_cron_output_reason(
+                job, final_response
+            )
+            if rejection_reason:
+                success = False
+                error = f"Rejected cron final output: {rejection_reason}"
+                output = _format_rejected_cron_output(
+                    output, final_response, rejection_reason
+                )
+                final_response = ""
 
         # Everything from here through delivery runs with the agent still live
         # (deferred teardown). Wrap it ALL in a try/finally so that if any step

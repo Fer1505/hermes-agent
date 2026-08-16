@@ -58,7 +58,13 @@ class BrowserControlTransport(str, Enum):
 
 @dataclass(frozen=True)
 class BrowserEgressCapability:
-    """Truthful network-boundary contract for a remote browser provider."""
+    """Truthful network-boundary contract for a browser provider.
+
+    ``execution_location`` describes where page JavaScript and navigation run,
+    while ``network_boundary`` describes who enforces the page's outbound
+    network policy. The control transport is recorded separately because a
+    CDP connection to a remote browser is not itself an egress guarantee.
+    """
 
     execution_location: BrowserExecutionLocation
     network_boundary: BrowserNetworkBoundary
@@ -80,6 +86,7 @@ class BrowserEgressCapability:
             raise TypeError("allows_cross_authority_cdp_discovery must be a bool")
 
     def as_session_metadata(self) -> Dict[str, object]:
+        """Return a JSON-serializable copy for session observability."""
         metadata = asdict(self)
         return {
             key: value.value if isinstance(value, Enum) else value
@@ -112,9 +119,9 @@ REMOTE_PROVIDER_EGRESS_WITH_CROSS_AUTHORITY_DISCOVERY = BrowserEgressCapability(
 class BrowserProvider(abc.ABC):
     """Abstract base class for a cloud browser backend.
 
-    Subclasses must implement :meth:`name`, :meth:`is_available`, and the
-    three lifecycle methods: :meth:`create_session`, :meth:`close_session`,
-    :meth:`emergency_cleanup`.
+    Subclasses must implement :meth:`name`, :attr:`egress_capability`,
+    :meth:`is_available`, and the three lifecycle methods:
+    :meth:`create_session`, :meth:`close_session`, :meth:`emergency_cleanup`.
 
     The lifecycle shape preserves the legacy ``CloudBrowserProvider`` contract
     bit-for-bit so the dispatcher in :mod:`tools.browser_tool` is a pure
@@ -135,6 +142,17 @@ class BrowserProvider(abc.ABC):
     def display_name(self) -> str:
         """Human-readable label shown in ``hermes tools``. Defaults to ``name``."""
         return self.name
+
+    @property
+    @abc.abstractmethod
+    def egress_capability(self) -> BrowserEgressCapability:
+        """Declare where page traffic originates and who controls it.
+
+        Providers must declare this explicitly. A backend with a different
+        boundary must return a different truthful contract rather than rely on
+        its name or a feature flag.
+        """
+        raise NotImplementedError
 
     @abc.abstractmethod
     def is_available(self) -> bool:
@@ -166,6 +184,12 @@ class BrowserProvider(abc.ABC):
         ``bb_session_id`` is a legacy key name kept for backward compat with
         the rest of :mod:`tools.browser_tool` — it holds the provider's
         session ID regardless of which provider is in use.
+
+        The dispatcher validates this metadata against
+        :attr:`egress_capability`. A remote provider whose contract requires
+        CDP must return a concrete public ``ws://`` or ``wss://`` endpoint;
+        cross-authority discovery is rejected unless the provider explicitly
+        declares that behavior.
 
         May raise ``ValueError`` (missing credentials) or ``RuntimeError``
         (network / API failure); the dispatcher surfaces these to the user.

@@ -275,10 +275,8 @@ class TestImport:
                 else:
                     zf.writestr(name, content)
 
-    def test_import_auto_installs_gateway_service(self, tmp_path, monkeypatch):
-        """After a restore, run_import brings the gateway service up without
-        prompting — restored cron jobs and bot tokens must not sit dormant
-        (the install-then-import dead-gateway bug)."""
+    def test_import_does_not_mutate_gateway_service(self, tmp_path, monkeypatch):
+        """Validated state restore never performs an implicit service mutation."""
         import hermes_cli.gateway as gateway_mod
 
         hermes_home = tmp_path / ".hermes"
@@ -299,7 +297,7 @@ class TestImport:
         from hermes_cli.backup import run_import
         run_import(Namespace(zipfile=str(zip_path), force=True))
 
-        assert calls and calls[0].get("context") == "import"
+        assert not calls
 
     def test_import_skips_service_when_already_running(self, tmp_path, monkeypatch):
         """A live gateway is left alone — no reinstall churn during import."""
@@ -325,9 +323,8 @@ class TestImport:
 
         assert not calls
 
-    def test_import_survives_service_layer_import_failure(self, tmp_path, monkeypatch, capsys):
-        """If the service helpers can't even be reached, import still completes
-        and prints the manual fallback."""
+    def test_import_is_independent_of_service_layer(self, tmp_path, monkeypatch, capsys):
+        """State restore completes without consulting gateway service helpers."""
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -347,8 +344,7 @@ class TestImport:
         run_import(Namespace(zipfile=str(zip_path), force=True))
 
         out = capsys.readouterr().out
-        assert "Done. Your Hermes configuration has been restored." in out
-        assert "hermes gateway install" in out
+        assert "Done. The validated Hermes state has been restored." in out
 
 
 
@@ -356,10 +352,8 @@ class TestImport:
 
 
 
-    def test_preserves_per_profile_gateway_state(self, tmp_path, monkeypatch):
-        """The skip is matched by basename, so a named profile's
-        gateway_state.json (profiles/<name>/gateway_state.json) is preserved
-        the same way the root profile's is."""
+    def test_nonempty_target_rejected_without_touching_profile_gateway_state(self, tmp_path, monkeypatch):
+        """Overlay import is rejected before touching live profile state."""
         hermes_home = tmp_path / ".hermes"
         (hermes_home / "profiles" / "coder").mkdir(parents=True)
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -378,18 +372,16 @@ class TestImport:
         args = Namespace(zipfile=str(zip_path), force=True)
 
         from hermes_cli.backup import run_import
-        run_import(args)
+        with pytest.raises(SystemExit):
+            run_import(args)
 
-        # Profile config is restored, but its live gateway state is preserved.
-        assert (hermes_home / "profiles" / "coder" / "config.yaml").read_text() == "model: anthropic\n"
+        assert not (hermes_home / "profiles" / "coder" / "config.yaml").exists()
         assert (
             hermes_home / "profiles" / "coder" / "gateway_state.json"
         ).read_text() == live_state
 
-    def test_preserves_runtime_pid_and_process_files(self, tmp_path, monkeypatch):
-        """gateway.pid / cron.pid / gateway.lock / processes.json from a backup
-        reference the source machine's process namespace and must never be
-        written over the target's."""
+    def test_nonempty_runtime_target_rejected_without_mutation(self, tmp_path, monkeypatch):
+        """A forced overlay cannot replace live process/runtime state."""
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -411,7 +403,8 @@ class TestImport:
         args = Namespace(zipfile=str(zip_path), force=True)
 
         from hermes_cli.backup import run_import
-        run_import(args)
+        with pytest.raises(SystemExit):
+            run_import(args)
 
         # Live runtime files are untouched; the backup's foreign ones never land.
         assert (hermes_home / "gateway.pid").read_text() == "4242"
@@ -435,7 +428,6 @@ class TestImport:
             "config.yaml": "model: openrouter\n",
             ".env": "OPENROUTER_API_KEY=sk-secret\n",
             "auth.json": '{"providers": {"nous": "token"}}',
-            "state.db": b"SQLite format 3\x00",
             "profiles/coder/.env": "ANTHROPIC_API_KEY=sk-ant-secret\n",
         })
 
@@ -444,7 +436,7 @@ class TestImport:
         from hermes_cli.backup import run_import
         run_import(args)
 
-        for rel in (".env", "auth.json", "state.db", "profiles/coder/.env"):
+        for rel in (".env", "auth.json", "profiles/coder/.env"):
             mode = (hermes_home / rel).stat().st_mode & 0o777
             assert mode == 0o600, f"{rel} restored with mode {oct(mode)}, expected 0o600"
 
@@ -685,8 +677,10 @@ class TestProfileRestoration:
         from hermes_cli.backup import run_import
         run_import(args)
 
-        # Only valid profile should get a wrapper
-        assert (wrapper_dir / "valid").exists()
+        # Import restores profile configuration but deliberately does not write
+        # command wrappers outside HERMES_HOME.
+        assert (hermes_home / "profiles" / "valid" / "config.yaml").exists()
+        assert not (wrapper_dir / "valid").exists()
         assert not (wrapper_dir / "empty").exists()
 
 
@@ -1300,9 +1294,8 @@ class TestMemoryProviderExternalPaths:
         (outside / "leak.json").unlink()
         outside.rmdir()
 
-    def test_import_restores_external_to_home_relative_location(self, tmp_path, monkeypatch):
-        """_external/ members restore to ~/<relpath>, not under HERMES_HOME,
-        and credential-shaped files get 0600."""
+    def test_import_rejects_unbound_external_members(self, tmp_path, monkeypatch):
+        """Manifest-v1 cannot safely bind an external provider/root identity."""
         dst_home = tmp_path / "dst"
         dst_home.mkdir()
         hermes_home = dst_home / ".hermes"
@@ -1319,16 +1312,12 @@ class TestMemoryProviderExternalPaths:
         monkeypatch.setattr(Path, "home", lambda: dst_home)
 
         from hermes_cli.backup import run_import
-        run_import(Namespace(zipfile=str(zip_path), force=True))
+        with pytest.raises(SystemExit):
+            run_import(Namespace(zipfile=str(zip_path), force=True))
 
         restored = dst_home / ".honcho" / "config.json"
-        assert restored.exists()
-        assert restored.read_text() == '{"peer":"bob"}'
-        # Credential-shaped file tightened.
-        assert (restored.stat().st_mode & 0o777) == 0o600
-        # External state did NOT leak into HERMES_HOME.
+        assert not restored.exists()
         assert not (hermes_home / "_external").exists()
-
 
 
 

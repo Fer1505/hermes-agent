@@ -65,6 +65,7 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 from agent.redact import redact_cdp_url
 from hermes_constants import (
     agent_browser_runnable,
@@ -151,12 +152,14 @@ try:
     from tools.url_safety import (
         is_safe_url as _is_safe_url,
         is_always_blocked_url as _is_always_blocked_url,
+        is_public_network_url as _is_public_network_url,
         normalize_url_for_request as _normalize_url_for_request,
         sensitive_query_param_name as _sensitive_query_param_name,
     )
 except Exception:
     _is_safe_url = lambda url: False  # noqa: E731 — fail-closed: block all if safety module unavailable
     _is_always_blocked_url = lambda url: True  # noqa: E731 — fail-closed on the floor too
+    _is_public_network_url = lambda url, **kwargs: False  # noqa: E731 — fail-closed
     _normalize_url_for_request = lambda url: url  # noqa: E731 — best-effort fallback
     _sensitive_query_param_name = lambda url: None  # noqa: E731 — best-effort fallback
 # Browser-provider ABC + registry — PR #25214 moved the per-vendor providers
@@ -166,6 +169,7 @@ except Exception:
 # shims for callers that import them from this module.
 from agent.browser_provider import (
     REMOTE_PROVIDER_EGRESS,
+    BrowserControlTransport,
     BrowserEgressCapability,
     BrowserProvider as CloudBrowserProvider,  # noqa: F401  (legacy alias)
 )
@@ -457,7 +461,160 @@ def _get_extraction_model() -> Optional[str]:
     return os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip() or None
 
 
-def _resolve_cdp_override(cdp_url: str) -> str:
+_CDP_PROVENANCE_OPERATOR = "operator-override"
+_CDP_PROVENANCE_CLOUD_PROVIDER = "cloud-provider"
+_PROVIDER_CDP_ALLOWED_SCHEMES = frozenset({"http", "https", "ws", "wss"})
+_PROVIDER_CDP_WEBSOCKET_SCHEMES = frozenset({"ws", "wss"})
+_MAX_CDP_DISCOVERY_BYTES = 64 * 1024
+
+
+def _validated_provider_cdp_parts(
+    endpoint: str,
+    *,
+    allowed_schemes: frozenset[str],
+):
+    """Parse and public-network preflight a provider-returned CDP endpoint."""
+    if not isinstance(endpoint, str):
+        raise ValueError("Provider CDP endpoint must be a string")
+    raw = endpoint.strip()
+    if not raw or any(char.isspace() or ord(char) < 32 for char in raw):
+        raise ValueError("Provider CDP endpoint is empty or malformed")
+    try:
+        parsed = urlsplit(raw)
+        _ = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Provider CDP endpoint is malformed") from exc
+    if parsed.scheme.lower() not in allowed_schemes or not parsed.hostname:
+        raise ValueError("Provider CDP endpoint uses an unsupported URL scheme")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Provider CDP endpoint must not contain URL userinfo credentials")
+    if parsed.fragment:
+        raise ValueError("Provider CDP endpoint must not contain a URL fragment")
+    if not _is_public_network_url(raw, allowed_schemes=allowed_schemes):
+        raise ValueError("Provider CDP endpoint did not pass public-network preflight")
+    return parsed
+
+
+def _cdp_authority(parsed) -> tuple[str, int | None]:
+    """Return a normalized authority, mapping HTTP↔WS default ports."""
+    scheme = parsed.scheme.lower()
+    default_port = 443 if scheme in {"https", "wss"} else 80
+    return ((parsed.hostname or "").lower().rstrip("."), parsed.port or default_port)
+
+
+def _bounded_cdp_discovery_json(response: Any) -> Dict[str, Any]:
+    """Decode a bounded JSON object without buffering an untrusted body."""
+    content_length = response.headers.get("content-length")
+    if isinstance(content_length, str) and content_length.strip().isdigit():
+        if int(content_length) > _MAX_CDP_DISCOVERY_BYTES:
+            raise ValueError("CDP discovery response exceeds the size limit")
+
+    body = bytearray()
+    for chunk in response.iter_content(chunk_size=8192):
+        if not chunk:
+            continue
+        body.extend(chunk)
+        if len(body) > _MAX_CDP_DISCOVERY_BYTES:
+            raise ValueError("CDP discovery response exceeds the size limit")
+    try:
+        payload = json.loads(bytes(body).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("CDP discovery response is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("CDP discovery response must be a JSON object")
+    return payload
+
+
+def _resolve_provider_cdp_endpoint(
+    cdp_url: str,
+    capability: BrowserEgressCapability,
+) -> str:
+    """Resolve a provider endpoint under its explicit, unpinned contract."""
+    parsed = _validated_provider_cdp_parts(
+        cdp_url,
+        allowed_schemes=_PROVIDER_CDP_ALLOWED_SCHEMES,
+    )
+    scheme = parsed.scheme.lower()
+
+    if scheme in _PROVIDER_CDP_WEBSOCKET_SCHEMES and (
+        parsed.path not in {"", "/"} or parsed.query
+    ):
+        return cdp_url.strip()
+
+    if scheme in _PROVIDER_CDP_WEBSOCKET_SCHEMES:
+        discovery_scheme = "https" if scheme == "wss" else "http"
+        parsed = urlsplit(
+            urlunsplit(
+                (discovery_scheme, parsed.netloc, parsed.path, parsed.query, "")
+            )
+        )
+
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/json/version"):
+        path = f"{path}/json/version" if path else "/json/version"
+    version_url = urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
+    discovery_parts = _validated_provider_cdp_parts(
+        version_url,
+        allowed_schemes=frozenset({"http", "https"}),
+    )
+
+    import requests  # lazy — shared module object, test patches still apply
+
+    response = None
+    try:
+        response = requests.get(
+            version_url,
+            timeout=10,
+            allow_redirects=False,
+            stream=True,
+        )
+        if 300 <= response.status_code < 400:
+            raise ValueError("CDP discovery redirects are not allowed")
+        response.raise_for_status()
+        payload = _bounded_cdp_discovery_json(response)
+    except Exception as exc:
+        logger.warning(
+            "Provider CDP discovery failed for %s: %s",
+            _sanitize_url_for_logs(version_url),
+            type(exc).__name__,
+        )
+        raise RuntimeError(
+            f"Provider CDP discovery failed ({type(exc).__name__})"
+        ) from None
+    finally:
+        if response is not None:
+            response.close()
+
+    ws_url = payload.get("webSocketDebuggerUrl")
+    if not isinstance(ws_url, str) or not ws_url.strip():
+        raise ValueError("CDP discovery did not return webSocketDebuggerUrl")
+    ws_url = ws_url.strip()
+    websocket_parts = _validated_provider_cdp_parts(
+        ws_url,
+        allowed_schemes=_PROVIDER_CDP_WEBSOCKET_SCHEMES,
+    )
+    if (
+        _cdp_authority(discovery_parts) != _cdp_authority(websocket_parts)
+        and not capability.allows_cross_authority_cdp_discovery
+    ):
+        raise ValueError(
+            "Provider CDP discovery returned a cross-authority websocket "
+            "without declaring that behavior"
+        )
+    logger.info(
+        "Resolved provider CDP endpoint %s -> %s (public preflight; DNS unpinned)",
+        _sanitize_url_for_logs(version_url),
+        _sanitize_url_for_logs(ws_url),
+    )
+    return ws_url
+
+
+def _resolve_cdp_override(
+    cdp_url: str,
+    *,
+    provenance: str = _CDP_PROVENANCE_OPERATOR,
+    source_contract: Optional[BrowserEgressCapability] = None,
+) -> str:
     """Normalize a user-supplied CDP endpoint into a concrete connectable URL.
 
     Accepts:
@@ -469,6 +626,13 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     webSocketDebuggerUrl so downstream tools always receive a concrete browser
     websocket instead of an ambiguous host:port URL.
     """
+    if provenance == _CDP_PROVENANCE_CLOUD_PROVIDER:
+        if not isinstance(source_contract, BrowserEgressCapability):
+            raise ValueError("Provider CDP endpoint requires an egress source contract")
+        return _resolve_provider_cdp_endpoint(cdp_url, source_contract)
+    if provenance != _CDP_PROVENANCE_OPERATOR:
+        raise ValueError("Unknown CDP endpoint provenance")
+
     raw = (cdp_url or "").strip()
     if not raw:
         return ""
@@ -489,12 +653,20 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     else:
         version_url = discovery_url.rstrip("/") + "/json/version"
 
+    response = None
     try:
         import requests  # lazy — shared module object, test patches still apply
 
-        response = requests.get(version_url, timeout=10)
+        response = requests.get(
+            version_url,
+            timeout=10,
+            allow_redirects=False,
+            stream=True,
+        )
+        if 300 <= response.status_code < 400:
+            raise ValueError("CDP discovery redirects are not allowed")
         response.raise_for_status()
-        payload = response.json()
+        payload = _bounded_cdp_discovery_json(response)
     except Exception as exc:
         logger.warning(
             "Failed to resolve CDP endpoint %s via %s: %s",
@@ -503,6 +675,9 @@ def _resolve_cdp_override(cdp_url: str) -> str:
             _sanitize_url_for_logs(exc),
         )
         return raw
+    finally:
+        if response is not None:
+            response.close()
 
     ws_url = str(payload.get("webSocketDebuggerUrl") or "").strip()
     if ws_url:
@@ -2297,7 +2472,133 @@ def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
         "bb_session_id": None,
         "cdp_url": cdp_url,
         "features": {"cdp_override": True},
+        "cdp_endpoint": {
+            "provenance": _CDP_PROVENANCE_OPERATOR,
+            "network_policy": "operator-trusted-unpinned",
+        },
     }
+
+
+def _allow_local_fallback_on_cloud_failure() -> bool:
+    """Return the explicit config.yaml opt-in for degraded local execution."""
+    try:
+        from hermes_cli.config import read_raw_config
+
+        return is_truthy_value(
+            cfg_get(
+                read_raw_config(),
+                "browser",
+                "allow_local_fallback_on_cloud_failure",
+                default=False,
+            ),
+            default=False,
+        )
+    except Exception as exc:
+        logger.debug("Could not read cloud fallback policy; failing closed: %s", exc)
+        return False
+
+
+def _provider_egress_capability(
+    provider: CloudBrowserProvider,
+) -> BrowserEgressCapability:
+    """Resolve and validate the provider's explicit egress contract."""
+    if getattr(type(provider), "egress_capability", None) is None:
+        raise ValueError(
+            f"Cloud provider {type(provider).__name__} does not declare an "
+            "egress_capability contract"
+        )
+    capability = provider.egress_capability
+    if not isinstance(capability, BrowserEgressCapability):
+        raise ValueError(
+            f"Cloud provider {type(provider).__name__} returned an invalid "
+            "egress_capability contract"
+        )
+    return capability
+
+
+def _validate_cloud_session(
+    provider: CloudBrowserProvider,
+    session_info: object,
+) -> Dict[str, Any]:
+    """Validate cloud metadata before it can select the CDP backend."""
+    if not isinstance(session_info, dict) or not session_info:
+        raise ValueError(f"Cloud provider returned invalid session: {session_info!r}")
+
+    validated = dict(session_info)
+    for key in ("session_name", "bb_session_id"):
+        value = validated.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                f"Cloud provider returned invalid session metadata: {key} "
+                "must be a non-empty string"
+            )
+    if not isinstance(validated.get("features"), dict):
+        raise ValueError(
+            "Cloud provider returned invalid session metadata: features must be a dict"
+        )
+
+    capability = _provider_egress_capability(provider)
+    if (
+        capability.control_transport is not BrowserControlTransport.CDP
+        or not capability.requires_cdp_url
+    ):
+        raise ValueError(
+            f"Cloud provider {type(provider).__name__} declares an unsupported "
+            "egress transport contract"
+        )
+
+    raw_cdp_url = validated.get("cdp_url")
+    if not isinstance(raw_cdp_url, str) or not raw_cdp_url.strip():
+        raise ValueError(
+            "Cloud provider returned invalid session metadata: cdp_url must be "
+            "a non-empty websocket URL"
+        )
+    resolved_cdp_url = _resolve_cdp_override(
+        raw_cdp_url,
+        provenance=_CDP_PROVENANCE_CLOUD_PROVIDER,
+        source_contract=capability,
+    )
+    parsed = urlsplit(resolved_cdp_url)
+    try:
+        _ = parsed.port
+    except ValueError:
+        invalid_port = True
+    else:
+        invalid_port = False
+    if (
+        parsed.scheme.lower() not in {"ws", "wss"}
+        or not parsed.hostname
+        or invalid_port
+        or any(char.isspace() or ord(char) < 32 for char in resolved_cdp_url)
+    ):
+        raise ValueError(
+            "Cloud provider returned invalid session metadata: cdp_url must "
+            "resolve to a ws:// or wss:// endpoint"
+        )
+
+    validated["cdp_url"] = resolved_cdp_url
+    validated["egress"] = capability.as_session_metadata()
+    validated["cdp_endpoint"] = {
+        "provenance": _CDP_PROVENANCE_CLOUD_PROVIDER,
+        "network_policy": "public-preflight-unpinned",
+    }
+    return validated
+
+
+def _close_rejected_cloud_session(
+    provider: CloudBrowserProvider,
+    session_info: object,
+) -> None:
+    """Best-effort cleanup when a created cloud session fails validation."""
+    if not isinstance(session_info, dict):
+        return
+    session_id = session_info.get("bb_session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        return
+    try:
+        provider.close_session(session_id)
+    except Exception as exc:
+        logger.warning("Could not close rejected cloud browser session: %s", exc)
 
 
 def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
@@ -2370,21 +2671,27 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
         if provider is None:
             session_info = _create_local_session(task_id)
         else:
+            created_session: object = None
             try:
-                session_info = provider.create_session(task_id)
-                # Validate cloud provider returned a usable session
-                if not session_info or not isinstance(session_info, dict):
-                    raise ValueError(f"Cloud provider returned invalid session: {session_info!r}")
-                if session_info.get("cdp_url"):
-                    # Some cloud providers (including Browser-Use v3) return an HTTP
-                    # CDP discovery URL instead of a raw websocket endpoint.
-                    session_info = dict(session_info)
-                    session_info["cdp_url"] = _resolve_cdp_override(str(session_info["cdp_url"]))
+                created_session = provider.create_session(task_id)
+                session_info = _validate_cloud_session(provider, created_session)
             except Exception as e:
                 provider_name = type(provider).__name__
+                _close_rejected_cloud_session(provider, created_session)
+                if getattr(provider, "configuration_error", False) is True:
+                    raise RuntimeError(
+                        f"Cloud provider configuration failed closed: {e}"
+                    ) from e
+                if not _allow_local_fallback_on_cloud_failure():
+                    raise RuntimeError(
+                        f"Cloud provider {provider_name} failed ({e}). Local browser "
+                        "fallback is disabled by default; set "
+                        "browser.allow_local_fallback_on_cloud_failure: true in "
+                        "config.yaml to opt in."
+                    ) from e
                 logger.warning(
-                    "Cloud provider %s failed (%s); attempting fallback to local "
-                    "Chromium for task %s",
+                    "Cloud provider %s failed (%s); explicit policy permits fallback "
+                    "to local Chromium for task %s",
                     provider_name, e, task_id,
                     exc_info=True,
                 )

@@ -14,7 +14,27 @@ from unittest.mock import Mock
 
 import pytest
 
+from agent.browser_provider import REMOTE_PROVIDER_EGRESS
 import tools.browser_tool as browser_tool
+
+
+class _DeclaredCloudProvider:
+    egress_capability = REMOTE_PROVIDER_EGRESS
+
+    def __init__(self):
+        self.create_calls = 0
+
+    def create_session(self, task_id):
+        self.create_calls += 1
+        return {
+            "session_name": "cloud-sess",
+            "bb_session_id": "bb_123",
+            "cdp_url": "wss://real.browserbase.com/ws",
+            "features": {"cloud": True},
+        }
+
+    def close_session(self, session_id):
+        return True
 
 
 @pytest.fixture(autouse=True)
@@ -115,19 +135,16 @@ class TestHybridRoutingSessionCreation:
 
     def test_bare_task_id_with_cloud_provider_uses_cloud(self, monkeypatch):
         """A bare task_id with cloud provider configured hits the cloud path."""
-        provider = Mock()
-        provider.create_session.return_value = {
-            "session_name": "cloud-sess",
-            "bb_session_id": "bb_123",
-            "cdp_url": "wss://real.browserbase.com/ws",
-        }
+        provider = _DeclaredCloudProvider()
         monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
         monkeypatch.setattr(browser_tool, "_ensure_cdp_supervisor", lambda t: None)
-        monkeypatch.setattr(browser_tool, "_resolve_cdp_override", lambda u: u)
+        monkeypatch.setattr(
+            browser_tool, "_is_public_network_url", lambda *args, **kwargs: True
+        )
 
         session = browser_tool._get_session_info("default")
 
-        assert provider.create_session.call_count == 1
+        assert provider.create_calls == 1
         assert session["bb_session_id"] == "bb_123"
         assert session["session_key"] == "default"
         assert session["owner_task_id"] == "default"

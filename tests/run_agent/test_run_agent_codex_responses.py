@@ -608,6 +608,90 @@ def test_run_codex_stream_delivers_redacted_commentary_once(monkeypatch):
 
 
 
+def test_run_codex_stream_multiple_commentary_items_are_not_reemitted(monkeypatch):
+    from agent.codex_responses_adapter import _normalize_codex_response
+
+    agent = _build_agent(monkeypatch)
+    delivered = []
+    agent.interim_assistant_callback = (
+        lambda text, *, already_streamed=False: delivered.append(text)
+    )
+    commentary_items = [
+        SimpleNamespace(
+            type="message",
+            phase="commentary",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text=text)],
+        )
+        for text in ("First update.", "Second update.")
+    ]
+    events = []
+    for item in commentary_items:
+        text_value = item.content[0].text
+        events.extend([
+            SimpleNamespace(
+                type="response.output_item.added",
+                item=SimpleNamespace(type="message", phase="commentary"),
+            ),
+            SimpleNamespace(type="response.output_text.delta", delta=text_value),
+            SimpleNamespace(type="response.output_item.done", item=item),
+        ])
+    events.append(SimpleNamespace(
+        type="response.completed",
+        response=SimpleNamespace(status="completed"),
+    ))
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **_kwargs: _FakeCreateStream(events))
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+    normalized, finish_reason = _normalize_codex_response(response)
+    agent._emit_interim_assistant_message(
+        agent._build_assistant_message(normalized, finish_reason)
+    )
+    assert delivered == ["First update.", "Second update."]
+
+
+def test_run_codex_stream_salvages_multiple_commentary_items(monkeypatch):
+    import httpx
+
+    agent = _build_agent(monkeypatch)
+    delivered = []
+    agent.interim_assistant_callback = (
+        lambda text, *, already_streamed=False: delivered.append(text)
+    )
+    commentary_events = []
+    for text_value in ("First update.", "Second update."):
+        item = SimpleNamespace(
+            type="message",
+            phase="commentary",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text=text_value)],
+        )
+        commentary_events.extend([
+            SimpleNamespace(
+                type="response.output_item.added",
+                item=SimpleNamespace(type="message", phase="commentary"),
+            ),
+            SimpleNamespace(type="response.output_text.delta", delta=text_value),
+            SimpleNamespace(type="response.output_item.done", item=item),
+        ])
+
+    class _DroppingStream(_FakeCreateStream):
+        def __iter__(self):
+            yield from super().__iter__()
+            raise httpx.RemoteProtocolError("connection dropped")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            create=lambda **_kwargs: _DroppingStream(commentary_events)
+        )
+    )
+    response = agent._run_codex_stream(_codex_request_kwargs())
+    assert response.status == "completed"
+    assert delivered == ["First update.", "Second update."]
+
+
 def test_run_codex_stream_returns_terminal_response_when_post_terminal_drain_fails(
     monkeypatch, caplog
 ):

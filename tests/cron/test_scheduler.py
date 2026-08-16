@@ -11,6 +11,7 @@ import pytest
 
 from cron.scheduler import (
     SILENT_MARKER,
+    _bad_human_facing_cron_output_reason,
     _build_job_prompt,
     _deliver_result,
     _merge_mcp_into_per_job_toolsets,
@@ -743,7 +744,10 @@ class TestRunJobConfigEnvVarExpansion:
             "fallback_providers:\n"
             "  - provider: anthropic\n"
             "  - provider: openrouter\n"
-            "    model: z-ai/glm-5.2\n",
+            "    model: z-ai/glm-5.2\n"
+            "fallback_policy:\n"
+            "  cron:\n"
+            "    allow_on_auth_error: true\n",
             encoding="utf-8",
         )
         job = {
@@ -786,6 +790,53 @@ class TestRunJobConfigEnvVarExpansion:
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["provider"] == "openrouter"
         assert kwargs["model"] == "z-ai/glm-5.2"
+
+    def test_auth_fallback_fails_closed_by_default(self, tmp_path, monkeypatch):
+        """A scheduled job cannot silently change provider/model on auth error."""
+        from hermes_cli.auth import AuthError
+
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  provider: openai-codex\n"
+            "  default: gpt-5.5\n"
+            "fallback_providers:\n"
+            "  - provider: custom\n"
+            "    model: gemma4:e4b\n"
+            "    base_url: http://127.0.0.1:11434/v1\n",
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("HERMES_MODEL", raising=False)
+        job = {
+            "id": "fail-closed-auth",
+            "name": "fail closed auth",
+            "prompt": "hi",
+            "deliver": "local",
+        }
+        fake_db = MagicMock()
+        resolve_calls = []
+
+        def _resolve_runtime_provider(**kwargs):
+            resolve_calls.append(kwargs)
+            raise AuthError("codex auth failed", provider="openai-codex")
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   side_effect=_resolve_runtime_provider), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert "(FAILED)" in output
+        assert final_response == ""
+        assert "codex auth failed" in error
+        assert resolve_calls == [
+            {"requested": None, "target_model": "gpt-5.5"}
+        ]
+        mock_agent_cls.assert_not_called()
 
 
     def test_unexpanded_ref_passthrough_when_var_unset(self, tmp_path, monkeypatch):
@@ -995,6 +1046,100 @@ class TestRunJobSkillBacked:
         assert success is True
         assert error is None
         assert final_response == "ok"
+
+
+class TestCronOutputValidation:
+    def _telegram_job(self):
+        return {
+            "id": "cron-validate-job",
+            "name": "validator",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+    @pytest.mark.parametrize(
+        ("response", "reason_fragment"),
+        [
+            ("How can I help you today?", "generic assistant"),
+            ("I need more context to complete this.", "asked for context"),
+            ("[no-op]", "no-op marker"),
+            (
+                "[No action taken. The prompt describes a scenario.]",
+                "no-op marker",
+            ),
+            (
+                "[Execution complete. No output generated.]",
+                "no-op marker",
+            ),
+            (
+                "Please provide the source files and exact scope before I run this.",
+                "asked for context",
+            ),
+            (
+                "I will review the work orders and provide a concise status.",
+                "returned a plan",
+            ),
+            (
+                "Tool 'web_search' does not exist. Available tools: terminal",
+                "nonexistent tool",
+            ),
+            ("```tool_code\nprint('x')\n```", "tool-call syntax"),
+            ("[Tool] internal_diagnostics() [/Tool]", "tool-call syntax"),
+            ("tool_code print('hello')", "tool-call syntax"),
+            (
+                '{"recipient_name":"functions.exec_command","tool_uses":[]}',
+                "tool-call syntax",
+            ),
+            ("[NO ACTION REQUIRED]", "suppression marker"),
+        ],
+    )
+    def test_bad_human_facing_cron_output_is_rejected(
+        self, response, reason_fragment
+    ):
+        reason = _bad_human_facing_cron_output_reason(
+            self._telegram_job(), response
+        )
+        assert reason is not None
+        assert reason_fragment in reason
+
+    def test_silent_marker_is_not_rejected(self):
+        assert (
+            _bad_human_facing_cron_output_reason(
+                self._telegram_job(), "[SILENT]"
+            )
+            is None
+        )
+
+    def test_run_one_job_audits_rejection_and_never_delivers_it_as_success(self):
+        from cron.scheduler import run_one_job
+
+        job = self._telegram_job()
+        saved_output = {}
+
+        def _save_job_output(job_id, output):
+            saved_output.update(job_id=job_id, output=output)
+            return "/tmp/out.md"
+
+        with patch("cron.scheduler.claim_dispatch", return_value=True), \
+             patch("cron.scheduler.create_execution", return_value={"id": "exec"}), \
+             patch("cron.scheduler.mark_execution_running"), \
+             patch("cron.scheduler.finish_execution"), \
+             patch("cron.scheduler.run_job", return_value=(
+                 True, "# output", "How can I help you today?", None
+             )), \
+             patch("cron.scheduler.save_job_output", side_effect=_save_job_output), \
+             patch("cron.scheduler._deliver_result") as deliver_mock, \
+             patch("cron.scheduler.mark_job_run") as mark_mock:
+            assert run_one_job(job) is True
+
+        assert saved_output["job_id"] == "cron-validate-job"
+        assert "Cron Output Rejected" in saved_output["output"]
+        assert "How can I help you today?" in saved_output["output"]
+        deliver_mock.assert_called_once()
+        delivered_text = deliver_mock.call_args.args[1]
+        assert "failed" in delivered_text.lower()
+        assert "Rejected cron final output" in delivered_text
+        assert mark_mock.call_args.args[1] is False
 
 
 class TestSilentDelivery:
@@ -2030,4 +2175,3 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-

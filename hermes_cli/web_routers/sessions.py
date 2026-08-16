@@ -46,6 +46,7 @@ _maybe_auto_archive_for_profile = late("_maybe_auto_archive_for_profile")
 _open_session_db_for_profile = late("_open_session_db_for_profile")
 _prune_sessions = late("_prune_sessions")
 _read_session_import_body = late("_read_session_import_body")
+_sessions_dir_for_profile = late("_sessions_dir_for_profile")
 _session_latest_descendant = late("_session_latest_descendant")
 _strip_session_list_rows = late("_strip_session_list_rows")
 
@@ -414,9 +415,8 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
     * Active and archived sessions ARE deleted when explicitly
       selected — unlike ``DELETE /api/sessions/empty``, the user
       hand-picked the rows so we trust the selection.
-    * Like the other session-delete endpoints, this does NOT pass a
-      ``sessions_dir`` through; on-disk transcript / request-dump
-      cleanup runs at the CLI/agent layer on the next prune pass.
+    * On-disk transcript and request-dump artifacts are deleted in the same
+      governed operation as their database rows.
 
     The response carries the actual deleted count, so the dashboard
     can surface it in a toast. The IDs that were removed are not
@@ -437,7 +437,10 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
     def _delete() -> int:
         db = _open_session_db_for_profile(body.profile, read_only=False)
         try:
-            return db.delete_sessions(body.ids)
+            return db.delete_sessions(
+                body.ids,
+                sessions_dir=_sessions_dir_for_profile(body.profile),
+            )
         finally:
             db.close()
 

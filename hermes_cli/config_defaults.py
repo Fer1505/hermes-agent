@@ -589,10 +589,10 @@ DEFAULT_CONFIG = {
 
     # Tool loop guardrails nudge models when they repeat failed or
     # non-progressing tool calls. Soft warnings are always-on by default;
-    # hard stops are opt-in so interactive CLI/TUI sessions keep flowing.
+    # hard stops fail closed by default for autonomous/profile sessions.
     "tool_loop_guardrails": {
         "warnings_enabled": True,
-        "hard_stop_enabled": False,
+        "hard_stop_enabled": True,
         "warn_after": {
             "exact_failure": 2,
             "same_tool_failure": 3,
@@ -733,7 +733,7 @@ DEFAULT_CONFIG = {
                                       # 0 for long-running rolling-compaction sessions
                                       # where you want nothing pinned except the
                                       # system prompt + rolling summary + recent tail.
-        "abort_on_summary_failure": False,  # When True, auto-compression that fails
+        "abort_on_summary_failure": True,  # Fail closed when summary generation fails.
                                       # to generate a summary (aux LLM errored / returned
                                       # non-JSON / timed out) aborts entirely instead of
                                       # dropping the middle window with a static
@@ -950,7 +950,7 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
-            "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
+            "timeout": 360,        # seconds — compression summarises large contexts; increase for local models
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },

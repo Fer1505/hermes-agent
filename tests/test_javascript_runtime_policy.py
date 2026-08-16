@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SUPPORTED_NODE_RANGE = "^22.12.0 || ^24.0.0"
+SUPPORTED_NODE_RANGE = ">=22.22.0"
 
 
 def _load_json(path: str) -> dict:
@@ -39,5 +39,5 @@ def test_docs_workflows_no_longer_use_node_20() -> None:
     ):
         workflow = (REPO_ROOT / path).read_text(encoding="utf-8")
 
-        assert "node-version: 22" in workflow
+        assert "node-version: 26" in workflow
         assert "node-version: 20" not in workflow
