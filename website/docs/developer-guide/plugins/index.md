@@ -85,6 +85,18 @@ profile-scoped writable directory managed by Hermes.
 Values declared in portable MCP `env` are visible package data, not a secret
 storage mechanism. Do not place credentials in `mcp.json`.
 
+Portable stdio is authorized only for a normal user-installed Git package and
+only when `hermes plugins enable` (or install with `--enable`) is run explicitly.
+Its `command` must be a package-contained direct native executable such as
+`./bin/server`; scripts and indirect launchers including `python`, `node`, and
+`npx` are refused. Hermes binds the receipt to the canonical plugin key, Git
+source and revision, complete package tree, manifest, MCP configuration, exact
+launch values, and executable bytes. Package code is therefore immutable after
+authorization; write runtime state only beneath `PLUGIN_DATA`. After an update
+or force reinstall, run `hermes plugins enable <plugin-name>` again to review
+and authorize the new bytes. Bundled and project-local portable stdio packages
+currently remain fail closed because they lack the normal Git install record.
+
 The current portable subset supports stdio and Streamable HTTP MCP entries.
 Portable `streamable-http` entries are routed through Hermes' existing native
 remote MCP client (the same runtime that powers URL-based `mcp_servers`

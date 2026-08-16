@@ -100,16 +100,14 @@ class TestLoadMCPConfig:
         """Valid mcp_servers config is returned as-is."""
         servers = {
             "filesystem": {
-                "command": "npx",
-                "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
-                "env": {},
+                "url": "https://example.com/mcp",
             }
         }
         with patch("hermes_cli.config.load_config", return_value={"mcp_servers": servers}):
             from tools.mcp_tool import _load_mcp_config
             result = _load_mcp_config()
             assert "filesystem" in result
-            assert result["filesystem"]["command"] == "npx"
+            assert result["filesystem"]["url"] == "https://example.com/mcp"
 
     def test_mcp_servers_not_dict_returns_empty(self):
         """mcp_servers set to non-dict value -> empty dict."""
@@ -119,12 +117,10 @@ class TestLoadMCPConfig:
             assert result == {}
 
     def test_portable_servers_merge_after_native_interpolation(self):
-        native = {"native": {"command": "node", "args": ["${PORT}"]}}
+        native = {"native": {"url": "https://example.com/${PORT}"}}
         portable = {
             "agent-plugin-demo__worker": {
-                "command": "python",
-                "args": ["${UNKNOWN}"],
-                "cwd": "/plugin",
+                "url": "https://portable.example/${UNKNOWN}",
             }
         }
         manager = SimpleNamespace(get_portable_mcp_servers=lambda: portable)
@@ -138,13 +134,15 @@ class TestLoadMCPConfig:
 
             result = _load_mcp_config()
 
-        assert result["native"]["args"] == ["3000"]
-        assert result["agent-plugin-demo__worker"]["args"] == ["${UNKNOWN}"]
+        assert result["native"]["url"] == "https://example.com/3000"
+        assert result["agent-plugin-demo__worker"]["url"].endswith("/${UNKNOWN}")
 
     def test_portable_server_resolves_through_real_plugin_discovery(
         self, tmp_path, monkeypatch
     ):
         import json
+        import shutil
+        import sys
         import yaml
         from hermes_cli.agent_plugins import MCP_SCHEMA_V1, PLUGIN_SCHEMA_V1
         from hermes_cli import plugins as plugins_mod
@@ -152,6 +150,10 @@ class TestLoadMCPConfig:
         home = tmp_path / "home"
         plugin = home / "plugins" / "portable"
         plugin.mkdir(parents=True)
+        executable = plugin / "bin" / "worker"
+        executable.parent.mkdir()
+        shutil.copy2(sys.executable, executable)
+        executable.chmod(0o700)
         (plugin / "plugin.json").write_text(
             json.dumps({"$schema": PLUGIN_SCHEMA_V1, "name": "portable.test"})
         )
@@ -160,12 +162,23 @@ class TestLoadMCPConfig:
                 {
                     "$schema": MCP_SCHEMA_V1,
                     "mcpServers": {
-                        "worker": {"type": "stdio", "command": "python"}
+                        "worker": {"type": "stdio", "command": "./bin/worker"}
                     },
                 }
             )
         )
         home.mkdir(exist_ok=True)
+        (home / "plugins" / ".install-metadata.json").write_text(
+            json.dumps(
+                {
+                    "portable": {
+                        "source": "https://example.test/portable.git",
+                        "revision": "a" * 40,
+                        "pinned": True,
+                    }
+                }
+            )
+        )
         (home / "config.yaml").write_text(
             yaml.safe_dump({"plugins": {"enabled": ["portable.test"]}})
         )
@@ -175,12 +188,21 @@ class TestLoadMCPConfig:
         monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(bundled))
         monkeypatch.setattr(plugins_mod, "_plugin_manager", None)
 
+        from hermes_cli.mcp_security import authorize_portable_plugin_stdio_entries
+        from hermes_cli.plugins import _portable_skill_namespace
+
+        authorize_portable_plugin_stdio_entries(
+            "portable.test",
+            plugin,
+            home / "plugin-data" / _portable_skill_namespace("portable.test"),
+        )
+
         from tools.mcp_tool import _load_mcp_config
 
         result = _load_mcp_config()
 
         [server] = result.values()
-        assert server["command"] == "python"
+        assert server["command"] == str(executable.resolve())
         assert server["cwd"] == str(plugin.resolve())
         assert server["env"]["PLUGIN_ROOT"] == str(plugin.resolve())
         assert server["env"]["PLUGIN_DATA"].startswith(str(home / "plugin-data"))
@@ -881,7 +903,7 @@ class TestToolsetInjection:
             server._tools = mock_tools
             return server
 
-        fake_config = {"fs": {"command": "npx", "args": []}}
+        fake_config = {"fs": {"url": "https://example.com/fs"}}
 
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
              patch("tools.mcp_tool._servers", fresh_servers), \
@@ -920,8 +942,8 @@ class TestToolsetInjection:
             return server
 
         fake_config = {
-            "broken": {"command": "bad"},
-            "good": {"command": "npx", "args": []},
+            "broken": {"url": "https://example.com/broken"},
+            "good": {"url": "https://example.com/good"},
         }
         fake_toolsets = {
             "hermes-cli": {"tools": [], "description": "CLI", "includes": []},
@@ -2199,8 +2221,8 @@ class TestDiscoveryFailedCount:
         from tools.mcp_tool import discover_mcp_tools, _servers, _ensure_mcp_loop
 
         fake_config = {
-            "good_server": {"command": "npx", "args": ["good"]},
-            "bad_server": {"command": "npx", "args": ["bad"]},
+            "good_server": {"url": "https://example.com/good"},
+            "bad_server": {"url": "https://example.com/bad"},
         }
 
         async def fake_register(name, cfg):
@@ -2243,9 +2265,9 @@ class TestDiscoveryFailedCount:
         from tools.mcp_tool import discover_mcp_tools, _servers, _ensure_mcp_loop
 
         fake_config = {
-            "ok1": {"command": "npx", "args": ["ok1"]},
-            "ok2": {"command": "npx", "args": ["ok2"]},
-            "fail1": {"command": "npx", "args": ["fail"]},
+            "ok1": {"url": "https://example.com/ok1"},
+            "ok2": {"url": "https://example.com/ok2"},
+            "fail1": {"url": "https://example.com/fail"},
         }
 
         async def selective_register(name, cfg):
@@ -2525,7 +2547,7 @@ class TestRegisterMcpServers:
     def test_connects_new_servers(self):
         from tools.mcp_tool import register_mcp_servers, _servers, _ensure_mcp_loop
 
-        fake_config = {"my_server": {"command": "npx", "args": ["test"]}}
+        fake_config = {"my_server": {"url": "https://example.com/mcp"}}
 
         async def fake_register(name, cfg):
             server = _make_mock_server(name)
@@ -2587,8 +2609,8 @@ class TestRegisterMcpServers:
         )
 
         fake_config = {
-            "srv_a": {"command": "npx", "args": ["a"]},
-            "srv_b": {"command": "npx", "args": ["b"]},
+            "srv_a": {"url": "https://example.com/a"},
+            "srv_b": {"url": "https://example.com/b"},
         }
 
         # Simulate that srv_a is already connecting from another call
@@ -2654,15 +2676,15 @@ class TestMcpParallelToolCalls:
         )
         fake_config = {
             "parallel_srv": {
-                "command": "echo",
+                "url": "https://example.com/parallel",
                 "supports_parallel_tool_calls": True,
             },
             "serial_srv": {
-                "command": "echo",
+                "url": "https://example.com/serial",
                 "supports_parallel_tool_calls": False,
             },
             "default_srv": {
-                "command": "echo",
+                "url": "https://example.com/default",
                 # no supports_parallel_tool_calls key
             },
         }

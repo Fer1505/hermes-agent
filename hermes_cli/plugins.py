@@ -4676,6 +4676,18 @@ class PluginManager:
                         internal_name,
                     )
                     continue
+                if "command" in config:
+                    from hermes_cli.mcp_security import (
+                        attach_portable_plugin_stdio_attestation,
+                    )
+
+                    config = attach_portable_plugin_stdio_attestation(
+                        lookup_key,
+                        server_name,
+                        package.root,
+                        dict(package.manifest),
+                        config,
+                    )
                 self._portable_mcp_servers[internal_name] = dict(config)
             loaded.enabled = True
         except Exception as exc:

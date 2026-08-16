@@ -752,6 +752,17 @@ def _install_plugin_core(
                     f"Run {recommended_update_command()} to update Hermes.",
                 ) from None
 
+        if target.exists() and force:
+            old_manifest = _read_manifest(target)
+            old_name = old_manifest.get("name") or target.name
+            old_key = _resolve_plugin_key(old_name) or old_name
+            try:
+                _revoke_portable_plugin(old_key, target)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise PluginOperationError(
+                    f"Could not revoke portable MCP authority before reinstall: {exc}"
+                ) from exc
+
         if target.exists() and not force:
             raise PluginOperationError(
                 f"Plugin '{plugin_name}' already exists. Use force reinstall "
@@ -917,6 +928,15 @@ def cmd_install(
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
 
+    installed_key = _resolve_plugin_key(installed_name) or installed_name
+    try:
+        # A successful install/reinstall never inherits executable authority
+        # from bytes that previously occupied the same plugin identity/root.
+        _revoke_portable_plugin(installed_key, target)
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] Could not revoke stale portable MCP authority: {exc}")
+        sys.exit(1)
+
     if not (target / "plugin.yaml").exists() and not (target / "plugin.yml").exists() and not (target / "plugin.json").exists() and not (
         target / "__init__.py"
     ).exists():
@@ -945,14 +965,27 @@ def cmd_install(
             should_enable = False
 
     if should_enable:
+        receipt_snapshot = None
+        try:
+            receipt_snapshot = _authorize_portable_plugin(installed_key)
+        except (OSError, RuntimeError, ValueError, PluginOperationError) as exc:
+            console.print(f"[red]Error:[/red] Portable MCP authorization failed: {exc}")
+            sys.exit(1)
         enabled = _get_enabled_set()
         disabled = _get_disabled_set()
-        enabled.add(installed_name)
-        disabled.discard(installed_name)
-        _save_enabled_set(enabled)
-        _save_disabled_set(disabled)
+        enabled.add(installed_key)
+        disabled.discard(installed_key)
+        try:
+            _save_enabled_set(enabled)
+            _save_disabled_set(disabled)
+        except Exception:
+            if receipt_snapshot is not None:
+                from hermes_cli.mcp_security import restore_operator_receipts
+
+                restore_operator_receipts(receipt_snapshot)
+            raise
         console.print(
-            f"[green]✓[/green] Plugin [bold]{installed_name}[/bold] enabled.",
+            f"[green]✓[/green] Plugin [bold]{installed_key}[/bold] enabled.",
         )
     else:
         console.print(
@@ -1015,6 +1048,14 @@ def cmd_update(name: str) -> None:
 
     console.print(f"[dim]Updating {name}...[/dim]")
 
+    update_key = _resolve_plugin_key(name) or name
+    try:
+        # Revoke before bytes can move, then verify again after the update.
+        _revoke_portable_plugin(update_key, target)
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] Could not revoke portable MCP authority: {exc}")
+        sys.exit(1)
+
     ok, output = _git_pull_plugin_dir(target)
     if not ok:
         console.print(f"[red]Error:[/red] {output}")
@@ -1026,6 +1067,13 @@ def cmd_update(name: str) -> None:
             install_record["revision"] = _git_head_revision(target, git_exe)
             metadata[target.name] = install_record
             _write_install_metadata(metadata)
+
+    updated_key = _resolve_plugin_key(name) or update_key
+    try:
+        _revoke_portable_plugin(updated_key, target)
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] Could not revoke portable MCP authority: {exc}")
+        sys.exit(1)
 
     # Same stale-bytecode class as the main checkout (#6207/#60242): the
     # pull just changed .py files under this plugin dir, so drop any
@@ -1110,8 +1158,10 @@ def cmd_remove(name: str) -> None:
         sys.exit(1)
 
     try:
+        removal_key = _resolve_plugin_key(name) or name
+        _revoke_portable_plugin(removal_key, target)
         _remove_plugin_core(target)
-    except (OSError, PluginOperationError) as exc:
+    except (OSError, RuntimeError, ValueError, PluginOperationError) as exc:
         console.print(f"[red]Error:[/red] Could not remove plugin '{name}': {exc}")
         sys.exit(1)
     _display_removed(name, plugins_dir)
@@ -1185,6 +1235,52 @@ def _get_enabled_set() -> set:
         return set(enabled) if isinstance(enabled, list) else set()
     except Exception:
         return set()
+
+
+def _portable_plugin_location(key: str) -> tuple[Path, str] | None:
+    """Return ``(root, source-kind)`` when *key* is a portable package."""
+    for entry in _discover_all_plugins():
+        # entry = (name, version, description, source, dir_path, key)
+        if key not in (entry[0], entry[5]) or not entry[4]:
+            continue
+        root = Path(entry[4])
+        if (
+            not (root / "plugin.yaml").exists()
+            and not (root / "plugin.yml").exists()
+            and (root / "plugin.json").is_file()
+        ):
+            return root, str(entry[3])
+    return None
+
+
+def _authorize_portable_plugin(key: str) -> dict | None:
+    """Authorize stdio for one explicit user-plugin enable action."""
+    location = _portable_plugin_location(key)
+    if location is None:
+        return None
+    root, source = location
+    if source not in {"user", "git"}:
+        raise PluginOperationError(
+            "Portable stdio authorization currently supports only normal "
+            "user-installed Git plugins; bundled/project packages remain fail closed."
+        )
+    from hermes_cli.mcp_security import authorize_portable_plugin_stdio_entries
+    from hermes_cli.plugins import _portable_skill_namespace
+
+    return authorize_portable_plugin_stdio_entries(
+        key,
+        root,
+        get_hermes_home() / "plugin-data" / _portable_skill_namespace(key),
+    )
+
+
+def _revoke_portable_plugin(key: str, root: Path | None = None) -> None:
+    location = _portable_plugin_location(key)
+    if root is None and location is not None:
+        root = location[0]
+    from hermes_cli.mcp_security import revoke_portable_plugin_stdio_entries
+
+    revoke_portable_plugin_stdio_entries(plugin_key=key, plugin_root=root)
 
 
 def _save_enabled_set(enabled: set) -> None:
@@ -1291,6 +1387,15 @@ def cmd_enable(name: str, allow_tool_override: Optional[bool] = None) -> None:
 
     already_enabled = key in enabled and key not in disabled
 
+    # Explicit enable/re-enable is the sole authority-issuance seam for a
+    # previously installed portable package.  Issue before config persistence.
+    receipt_snapshot = None
+    try:
+        receipt_snapshot = _authorize_portable_plugin(key)
+    except (OSError, RuntimeError, ValueError, PluginOperationError) as exc:
+        console.print(f"[red]Error:[/red] Portable MCP authorization failed: {exc}")
+        sys.exit(1)
+
     if not already_enabled:
         enabled.add(key)
         disabled.discard(key)
@@ -1309,8 +1414,15 @@ def cmd_enable(name: str, allow_tool_override: Optional[bool] = None) -> None:
             if entry[5] == key:
                 disabled.discard(entry[0])
                 break
-        _save_enabled_set(enabled)
-        _save_disabled_set(disabled)
+        try:
+            _save_enabled_set(enabled)
+            _save_disabled_set(disabled)
+        except Exception:
+            if receipt_snapshot is not None:
+                from hermes_cli.mcp_security import restore_operator_receipts
+
+                restore_operator_receipts(receipt_snapshot)
+            raise
         console.print(
             f"[green]✓[/green] Plugin [bold]{key}[/bold] enabled. "
             "Takes effect on next session."
@@ -1557,6 +1669,12 @@ def cmd_disable(name: str) -> None:
 
     enabled = _get_enabled_set()
     disabled = _get_disabled_set()
+
+    try:
+        _revoke_portable_plugin(key)
+    except (OSError, RuntimeError, ValueError) as exc:
+        console.print(f"[red]Error:[/red] Could not revoke portable MCP authority: {exc}")
+        sys.exit(1)
 
     if key not in enabled and key in disabled:
         console.print(f"[dim]Plugin '{key}' is already disabled.[/dim]")

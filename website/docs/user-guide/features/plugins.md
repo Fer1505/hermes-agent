@@ -168,6 +168,19 @@ hermes plugins disable <name>     # remove from allow-list + add to disabled
 
 After `hermes plugins install owner/repo`, you're asked `Enable 'name' now? [y/N]` — defaults to no. Skip the prompt for scripted installs with `--enable` or `--no-enable`.
 
+Portable Agent Plugins v1 packages use a root `plugin.json` (and may include
+`skills/` plus `mcp.json`) instead of native `plugin.yaml`/Python registration.
+Portable stdio MCP is fail closed: it is supported only for normal
+user-installed Git packages, must launch a package-contained direct native
+executable (`./bin/server`, not `python`, `node`, `npx`, or a shell), and gets
+an exact protected receipt only during explicit install-with-enable or
+`hermes plugins enable`. Any package, manifest, MCP config, executable, launch,
+source, or revision drift quarantines the server. Keep mutable state in
+`PLUGIN_DATA`, and re-run `hermes plugins enable <name>` after update or force
+reinstall. Bundled and project-local portable stdio packages are not currently
+authorizable; their skills and remote HTTP MCP entries remain separate from
+this executable boundary.
+
 For a reproducible install, pin a full immutable commit (tags, branches, and
 abbreviated SHAs are not accepted):
 

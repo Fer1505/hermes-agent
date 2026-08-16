@@ -41,6 +41,7 @@ import shutil
 import stat
 import tempfile
 import uuid
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -188,21 +189,189 @@ def _launch_payload(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _portable_launch_payload(entry: dict[str, Any]) -> dict[str, Any]:
+    """Canonical launch payload for package-owned portable MCP servers."""
+    launch = _launch_payload(entry)
+    launch["cwd"] = str(entry.get("cwd") or "")
+    return launch
+
+
+def _portable_tree_digest(root: Path) -> str:
+    """Hash every package byte and executable bit, excluding only ``.git``.
+
+    Portable packages must keep runtime state in ``PLUGIN_DATA``.  Symlinks
+    are rejected rather than followed so the authorization cannot be made to
+    cover bytes outside the installed package root.
+    """
+    resolved_root = root.resolve(strict=True)
+    if not resolved_root.is_dir():
+        raise ValueError("portable plugin root is not a directory")
+    records: list[dict[str, Any]] = []
+
+    def _walk_error(error: OSError) -> None:
+        raise ValueError(f"portable plugin package cannot be fully traversed: {error}")
+
+    for current, dirnames, filenames in os.walk(
+        resolved_root,
+        topdown=True,
+        onerror=_walk_error,
+    ):
+        current_path = Path(current)
+        if current_path == resolved_root:
+            dirnames[:] = [name for name in dirnames if name != ".git"]
+        dirnames.sort()
+        filenames.sort()
+        for dirname in dirnames:
+            path = current_path / dirname
+            if path.is_symlink() or (
+                hasattr(path, "is_junction") and path.is_junction()
+            ):
+                raise ValueError(
+                    f"portable plugin package contains a symlink or junction: {path}"
+                )
+        for filename in filenames:
+            path = current_path / filename
+            if path.is_symlink() or (
+                hasattr(path, "is_junction") and path.is_junction()
+            ):
+                raise ValueError(
+                    f"portable plugin package contains a symlink or junction: {path}"
+                )
+            try:
+                mode = path.stat().st_mode
+            except OSError as exc:
+                raise ValueError(f"portable plugin package cannot be inspected: {exc}") from exc
+            if not stat.S_ISREG(mode):
+                raise ValueError(f"portable plugin package contains a non-regular file: {path}")
+            records.append({
+                "path": path.relative_to(resolved_root).as_posix(),
+                "executable": bool(mode & 0o111),
+                "sha256": _sha256_file(path),
+            })
+    return _canonical_digest(records)
+
+
+def _portable_install_record(plugin_root: Path) -> dict[str, Any]:
+    """Return the exact normal Git-install record for a user plugin."""
+    metadata_path = plugin_root.parent / ".install-metadata.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "portable stdio authorization requires a normal user-installed Git plugin"
+        ) from exc
+    record = metadata.get(plugin_root.name) if isinstance(metadata, dict) else None
+    if not isinstance(record, dict):
+        raise ValueError(
+            "portable stdio authorization requires matching Git install metadata"
+        )
+    normalized = {
+        "source": record.get("source"),
+        "revision": record.get("revision"),
+        "pinned": record.get("pinned"),
+    }
+    if (
+        not isinstance(normalized["source"], str)
+        or not normalized["source"].strip()
+        or not isinstance(normalized["revision"], str)
+        or re.fullmatch(r"[0-9a-f]{40}", normalized["revision"]) is None
+        or not isinstance(normalized["pinned"], bool)
+    ):
+        raise ValueError("portable plugin Git install metadata is incomplete or invalid")
+    return normalized
+
+
+def _portable_receipt_key(plugin_key: str, raw_server_name: str) -> str:
+    return "portable:" + _canonical_digest({
+        "plugin_key": plugin_key,
+        "raw_server_name": raw_server_name,
+    })
+
+
+def _portable_runtime_server_name(plugin_key: str, raw_server_name: str) -> str:
+    from hermes_cli.plugins import _portable_skill_namespace
+
+    return f"{_portable_skill_namespace(plugin_key)}__{raw_server_name}"
+
+
+def _portable_entry_issues(entry: dict[str, Any], plugin_root: Path) -> list[str]:
+    issues = _operator_entry_issues(entry)
+    if issues:
+        return issues
+    command_path, error = _resolve_direct_executable(entry.get("command"))
+    if error or command_path is None:
+        return [error or "portable stdio executable cannot be resolved"]
+    try:
+        command_path.relative_to(plugin_root.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return ["portable stdio executable must be contained in the plugin package"]
+    return []
+
+
+def _portable_attestation(
+    plugin_key: str,
+    raw_server_name: str,
+    plugin_root: Path,
+    manifest: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    receipt_id: str,
+) -> dict[str, Any]:
+    root = plugin_root.resolve(strict=True)
+    issues = _portable_entry_issues(entry, root)
+    if issues:
+        raise ValueError("; ".join(issues))
+    command_path, _ = _resolve_direct_executable(entry.get("command"))
+    assert command_path is not None
+    configured = dict(entry)
+    configured["command"] = str(command_path)
+    launch = _portable_launch_payload(configured)
+    manifest_path = root / "plugin.json"
+    mcp_path = root / "mcp.json"
+    install_record = _portable_install_record(root)
+    return {
+        "schema": _ATTESTATION_SCHEMA,
+        "authorization": "portable_plugin",
+        "receipt_id": receipt_id,
+        "receipt_key": _portable_receipt_key(plugin_key, raw_server_name),
+        "plugin_key": plugin_key,
+        "plugin_name": manifest.get("name"),
+        "plugin_version": manifest.get("version", ""),
+        "plugin_root": str(root),
+        "install_record": install_record,
+        "manifest_sha256": _sha256_file(manifest_path),
+        "mcp_sha256": _sha256_file(mcp_path),
+        "package_tree_sha256": _portable_tree_digest(root),
+        "raw_server_name": raw_server_name,
+        "runtime_server_name": _portable_runtime_server_name(
+            plugin_key, raw_server_name
+        ),
+        "launch_sha256": _canonical_digest(launch),
+        "content": _content_hashes(command_path, launch["args"]),
+    }
+
+
 def _resolve_direct_executable(command: Any) -> tuple[Path | None, str | None]:
     text = str(command or "").strip()
     if not text:
         return None, "stdio command is missing"
     if any(ch in text for ch in ("\x00", "\r", "\n")):
         return None, "stdio command contains control characters"
-    try:
-        pieces = shlex.split(text, posix=(os.name != "nt"))
-    except ValueError:
-        return None, "stdio command has invalid quoting"
-    if len(pieces) != 1:
-        return None, "stdio command must be one direct executable path; move arguments to args"
-    resolved_text = shutil.which(pieces[0]) if not os.path.isabs(pieces[0]) else pieces[0]
+    if Path(text).is_absolute():
+        # A translated portable ``./...`` command is already one literal path
+        # token.  Do not shell-split valid absolute install paths containing
+        # spaces (notably Windows user profiles and macOS folder names).
+        resolved_text = text
+    else:
+        try:
+            pieces = shlex.split(text, posix=(os.name != "nt"))
+        except ValueError:
+            return None, "stdio command has invalid quoting"
+        if len(pieces) != 1:
+            return None, "stdio command must be one direct executable path; move arguments to args"
+        resolved_text = shutil.which(pieces[0])
     if not resolved_text:
-        return None, f"stdio executable was not found: {pieces[0]}"
+        return None, f"stdio executable was not found: {text}"
     try:
         path = Path(resolved_text).expanduser().resolve(strict=True)
         mode = path.stat().st_mode
@@ -306,6 +475,124 @@ def _save_operator_receipts(data: dict[str, Any]) -> None:
             os.unlink(tmp_name)
         except FileNotFoundError:
             pass
+
+
+def authorize_portable_plugin_stdio_entries(
+    plugin_key: str,
+    plugin_root: Path,
+    data_root: Path,
+) -> dict[str, Any]:
+    """Issue exact receipts for one explicitly enabled portable package.
+
+    The returned snapshot lets the CLI roll back receipts when persisting the
+    enabled-plugin configuration fails.  Discovery never calls this function.
+    """
+    if not isinstance(plugin_key, str) or not plugin_key:
+        raise ValueError("portable plugin registry key is required")
+    from hermes_cli.agent_plugins import load_agent_plugin
+
+    root = Path(plugin_root).resolve(strict=True)
+    package = load_agent_plugin(root, Path(data_root))
+    previous = deepcopy(_load_operator_receipts())
+    updated = deepcopy(previous)
+    servers = updated.setdefault("servers", {})
+    if not isinstance(servers, dict):
+        raise ValueError("MCP authorization receipt store is invalid")
+
+    # An explicit re-enable replaces every prior authority for this canonical
+    # key/root, including servers removed from the new package revision.
+    for key, receipt in list(servers.items()):
+        if not isinstance(receipt, dict) or receipt.get("authorization") != "portable_plugin":
+            continue
+        if receipt.get("plugin_key") == plugin_key or receipt.get("plugin_root") == str(root):
+            del servers[key]
+
+    for raw_server_name, entry in package.mcp_servers.items():
+        if "command" not in entry:
+            continue
+        receipt_id = uuid.uuid4().hex
+        attestation = _portable_attestation(
+            plugin_key,
+            raw_server_name,
+            root,
+            dict(package.manifest),
+            entry,
+            receipt_id=receipt_id,
+        )
+        servers[attestation["receipt_key"]] = dict(attestation)
+    _save_operator_receipts(updated)
+    return previous
+
+
+def restore_operator_receipts(snapshot: dict[str, Any]) -> None:
+    """Restore a snapshot returned by portable authorization."""
+    _save_operator_receipts(deepcopy(snapshot))
+
+
+def revoke_portable_plugin_stdio_entries(
+    *,
+    plugin_key: str | None = None,
+    plugin_root: Path | None = None,
+) -> None:
+    """Revoke every portable receipt matching a registry key or package root."""
+    if not plugin_key and plugin_root is None:
+        raise ValueError("portable receipt revocation requires a key or root")
+    resolved_root = str(Path(plugin_root).resolve(strict=False)) if plugin_root else None
+    receipts = _load_operator_receipts()
+    servers = receipts.get("servers", {})
+    changed = False
+    for key, receipt in list(servers.items()):
+        if not isinstance(receipt, dict) or receipt.get("authorization") != "portable_plugin":
+            continue
+        if (
+            (plugin_key is not None and receipt.get("plugin_key") == plugin_key)
+            or (resolved_root is not None and receipt.get("plugin_root") == resolved_root)
+        ):
+            del servers[key]
+            changed = True
+    if changed:
+        _save_operator_receipts(receipts)
+
+
+def attach_portable_plugin_stdio_attestation(
+    plugin_key: str,
+    raw_server_name: str,
+    plugin_root: Path,
+    manifest: dict[str, Any],
+    entry: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach an exact existing receipt during passive portable discovery.
+
+    Missing or drifted authority deliberately returns the unattested config;
+    the unchanged spawn-time validator will quarantine it.
+    """
+    configured = dict(entry)
+    receipt_key = _portable_receipt_key(plugin_key, raw_server_name)
+    try:
+        receipt = _load_operator_receipts().get("servers", {}).get(receipt_key)
+    except (OSError, RuntimeError, ValueError):
+        # Passive discovery must not turn a receipt-read/capability failure
+        # into a whole-plugin load failure.  Returning unattested keeps stdio
+        # quarantined by the unchanged spawn-time validator.
+        return configured
+    if not isinstance(receipt, dict) or receipt.get("authorization") != "portable_plugin":
+        return configured
+    try:
+        expected = _portable_attestation(
+            plugin_key,
+            raw_server_name,
+            Path(plugin_root),
+            manifest,
+            configured,
+            receipt_id=str(receipt.get("receipt_id") or ""),
+        )
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return configured
+    if receipt != expected:
+        return configured
+    configured["command"] = expected["content"][0]["resolved"]
+    configured[_ATTESTATION_KEY] = expected
+    return configured
 
 
 def _operator_entry_issues(entry: dict[str, Any]) -> list[str]:
@@ -485,7 +772,12 @@ def _strict_stdio_issues(name: str, entry: dict[str, Any]) -> list[str]:
             f"MCP server '{name}' is unpinned/provenance-free stdio software; "
             "re-add it with explicit operator authorization or install it from the catalog"
         ]
-    launch = _launch_payload(entry)
+    authorization = attestation.get("authorization")
+    launch = (
+        _portable_launch_payload(entry)
+        if authorization == "portable_plugin"
+        else _launch_payload(entry)
+    )
     if _canonical_digest(launch) != attestation.get("launch_sha256"):
         return [f"MCP server '{name}' command, args, or env changed after authorization"]
     command_path, error = _resolve_direct_executable(entry.get("command"))
@@ -495,7 +787,6 @@ def _strict_stdio_issues(name: str, entry: dict[str, Any]) -> list[str]:
     if content_issues:
         return [f"MCP server '{name}' {issue}" for issue in content_issues]
 
-    authorization = attestation.get("authorization")
     if authorization == "operator_cli":
         policy_issues = _operator_entry_issues(entry)
         if policy_issues:
@@ -547,6 +838,35 @@ def _strict_stdio_issues(name: str, entry: dict[str, Any]) -> list[str]:
         except (OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
             return [f"MCP server '{name}' catalog authorization is invalid: {exc}"]
         return []
+
+    if authorization == "portable_plugin":
+        try:
+            plugin_key = str(attestation.get("plugin_key") or "")
+            raw_server_name = str(attestation.get("raw_server_name") or "")
+            plugin_root = Path(str(attestation.get("plugin_root") or "")).resolve(strict=True)
+            manifest = json.loads((plugin_root / "plugin.json").read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("plugin manifest must be an object")
+            expected = _portable_attestation(
+                plugin_key,
+                raw_server_name,
+                plugin_root,
+                manifest,
+                entry,
+                receipt_id=str(attestation.get("receipt_id") or ""),
+            )
+            if name != expected.get("runtime_server_name"):
+                return [f"MCP server '{name}' does not match its portable authorization identity"]
+            if attestation != expected:
+                return [f"MCP server '{name}' portable plugin identity or package changed"]
+            receipt = _load_operator_receipts().get("servers", {}).get(
+                attestation.get("receipt_key")
+            )
+            if receipt != expected:
+                return [f"MCP server '{name}' has no matching portable plugin authorization receipt"]
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            return [f"MCP server '{name}' portable plugin authorization is invalid: {exc}"]
+        return []
     return [f"MCP server '{name}' has an unknown stdio authorization type"]
 
 
@@ -560,8 +880,9 @@ def validate_mcp_server_entry(
 
     Empty return means the entry passed the requested policy level. With
     ``require_attestation=True``, stdio is a strict allowlist: a current catalog
-    installation receipt or explicit direct-executable operator receipt is
-    required. The legacy diagnostic layer also flags:
+    installation receipt, explicit direct-executable operator receipt, or an
+    exact explicitly-enabled portable-package receipt is required. The legacy
+    diagnostic layer also flags:
 
     * a known hermes-0day IOC anywhere in command/args/env (hardcoded blocklist);
     * a shell interpreter whose inline script invokes network egress (#45620);

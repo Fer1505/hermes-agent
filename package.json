@@ -40,7 +40,8 @@
     "eslint-plugin-perfectionist": "5.10.0",
     "eslint-plugin-react-hooks": "7.1.1",
     "eslint-plugin-unused-imports": "4.4.1",
-    "globals": "17.7.0"
+    "globals": "17.7.0",
+    "lightningcss": "1.33.0"
   },
   "overrides": {
     "lodash": "4.18.1",
@@ -71,5 +72,8 @@
     "fsevents@2.3.2": true,
     "fsevents@2.3.3": true,
     "get-windows@9.3.0": true
+  },
+  "optionalDependencies": {
+    "@napi-rs/wasm-runtime": "1.2.2"
   }
 }
