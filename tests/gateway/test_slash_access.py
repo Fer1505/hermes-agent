@@ -51,6 +51,18 @@ class TestPolicyFromExtra:
         )
         assert p.user_allowed_commands == frozenset({"status", "model", "help"})
 
+    def test_explicit_empty_dm_commands_do_not_inherit_group_commands(self):
+        extra = {
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": [],
+            "group_user_allowed_commands": ["status"],
+        }
+
+        dm = policy_from_extra(extra, "dm")
+
+        assert dm.user_allowed_commands == frozenset()
+        assert dm.can_run("999", "status") is False
+
 
     def test_dm_admin_does_not_imply_group_admin(self):
         # Admin lists are scope-specific. DM admin must not auto-promote in groups.
@@ -125,4 +137,3 @@ class TestPolicyForSource:
         assert dm_p.can_run("999", "stop") is True  # backward compat
         assert grp_p.enabled is True
         assert grp_p.can_run("999", "stop") is False  # gated
-

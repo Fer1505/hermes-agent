@@ -4,6 +4,7 @@ import { useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
 import { DS_BUTTON_OUTLINED_LINK_CN } from "@/lib/page-header-actions";
+import { cn } from "@/lib/utils";
 
 const HERMES_DOCS_URL = "https://hermes-agent.nousresearch.com/docs/";
 

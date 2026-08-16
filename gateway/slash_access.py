@@ -180,7 +180,7 @@ def policy_from_extra(extra: dict, scope: str) -> SlashAccessPolicy:
     admin_ids = _coerce_id_list(extra.get(admin_key))
     cmds = _coerce_command_list(extra.get(cmd_key))
 
-    if scope == "dm" and not cmds:
+    if scope == "dm" and cmd_key not in extra:
         cmds = _coerce_command_list(extra.get("group_user_allowed_commands"))
 
     enabled = bool(admin_ids)
