@@ -31,6 +31,9 @@ the SPA should bootstrap it after login instead.
 from __future__ import annotations
 
 PUBLIC_API_PATHS: frozenset[str] = frozenset({
+    # Minimal token-free liveness route. It returns only {"status":"ok"}
+    # and must remain usable before dashboard login.
+    "/health",
     # Liveness probe target. Returns version, gateway state, active
     # session count, and the dashboard auth-gate shape. No bodies, no
     # session content, no secrets. Documented as the portal's wildcard

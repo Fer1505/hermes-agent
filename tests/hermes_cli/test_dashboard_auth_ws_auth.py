@@ -199,26 +199,25 @@ def _fake_ws(*, query: dict, client_host: str = "127.0.0.1", path: str = "/api/p
 
 
 class TestWsAuthOkLoopback:
-    """Gate OFF — legacy token path."""
+    """Gate OFF — host/peer boundary, no browser bearer credential."""
 
     def test_correct_token_accepted(self, loopback_app):
         ws = _fake_ws(query={"token": web_server._SESSION_TOKEN})
         assert web_server._ws_auth_ok(ws) is True
 
-    def test_wrong_token_rejected(self, loopback_app):
+    def test_wrong_token_is_ignored(self, loopback_app):
         ws = _fake_ws(query={"token": "not-the-real-token"})
-        assert web_server._ws_auth_ok(ws) is False
+        assert web_server._ws_auth_ok(ws) is True
 
-    def test_missing_token_rejected(self, loopback_app):
+    def test_missing_token_is_accepted(self, loopback_app):
         ws = _fake_ws(query={})
-        assert web_server._ws_auth_ok(ws) is False
+        assert web_server._ws_auth_ok(ws) is True
 
     def test_ticket_param_ignored_in_loopback(self, loopback_app):
-        # Even if someone sneaks a ticket through, loopback mode only
-        # cares about ?token=. A naked ticket isn't a token.
+        # Credentials are ignored when auth is disabled.
         ticket = mint_ticket(user_id="u1", provider="stub")
         ws = _fake_ws(query={"ticket": ticket})
-        assert web_server._ws_auth_ok(ws) is False
+        assert web_server._ws_auth_ok(ws) is True
 
 
 class TestWsAuthOkGated:
@@ -295,12 +294,11 @@ class TestWsAuthOkGated:
         ws = _fake_ws(query={"internal": "not-the-internal-credential"})
         assert web_server._ws_auth_ok(ws) is False
 
-    def test_internal_credential_not_accepted_in_loopback(self, loopback_app):
-        """Outside gated mode, ?internal= is meaningless — only ?token= works.
-        A naked internal credential must not authenticate."""
+    def test_credentials_are_ignored_in_loopback(self, loopback_app):
+        """The disabled-auth path relies on host/peer checks, not credentials."""
         cred = internal_ws_credential()
         ws = _fake_ws(query={"internal": cred})
-        assert web_server._ws_auth_ok(ws) is False
+        assert web_server._ws_auth_ok(ws) is True
 
 
 class TestWsRequestIsAllowedGated:
@@ -546,10 +544,11 @@ class TestWsHostOriginGuardOrigins:
 
 
 class TestSidecarUrl:
-    def test_loopback_uses_session_token(self, loopback_app):
+    def test_loopback_uses_no_session_token(self, loopback_app):
         url = web_server._build_sidecar_url("ch-1")
         assert url is not None
-        assert f"token={web_server._SESSION_TOKEN}" in url
+        assert "token=" not in url
+        assert "channel=ch-1" in url
         assert "ticket=" not in url
 
     def test_gated_uses_internal_credential(self, gated_app):
@@ -583,11 +582,11 @@ class TestSidecarUrl:
 
 
 class TestGatewayWsUrl:
-    def test_loopback_uses_session_token(self, loopback_app):
+    def test_loopback_uses_no_session_token(self, loopback_app):
         url = web_server._build_gateway_ws_url()
         assert url is not None
-        assert "/api/ws?" in url
-        assert f"token={web_server._SESSION_TOKEN}" in url
+        assert url.endswith("/api/ws")
+        assert "token=" not in url
         assert "internal=" not in url
 
     def test_gated_uses_internal_credential(self, gated_app):

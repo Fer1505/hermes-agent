@@ -16,8 +16,9 @@ bounded retention). The gateway writes three checkpoints around the send:
     mark_delivered() /    state='delivered'   only on SendResult.success
     mark_failed()         state='failed'      on a definitive rejection
 
-On startup, ``sweep_recoverable()`` claims rows whose owning process is
-dead and hands them to the gateway for redelivery. Crash semantics are
+On startup and at a bounded periodic cadence, ``sweep_recoverable()`` claims
+rows whose owning process is dead or whose live-owner delivery lease/backoff
+expired, then hands them to the gateway for redelivery. Crash semantics are
 explicit about ambiguity (the contract review of the earlier
 delivery-outbox attempt, #61790, closed it for silently resending
 ambiguous sends):
@@ -59,6 +60,9 @@ _DB_LOCK = threading.Lock()
 # only matter in the rare recovery path).
 MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
+LIVE_OWNER_LEASE_SECONDS = 5 * 60
+RETRY_BASE_SECONDS = 60
+RETRY_MAX_SECONDS = 15 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
 
@@ -205,8 +209,7 @@ def sweep_recoverable(
     *,
     deliverable_platforms: Optional[set] = None,
 ) -> List[Dict[str, Any]]:
-    """Claim undelivered rows owned by dead processes; return them for
-    redelivery.
+    """Claim undelivered rows with dead or expired-live owners for redelivery.
 
     Claiming atomically re-stamps the owner to THIS process and increments
     ``attempts``, so a second gateway racing the same sweep cannot
@@ -227,22 +230,41 @@ def sweep_recoverable(
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
-                      content, state, attempts, created_at,
+                      content, state, attempts, created_at, updated_at,
                       owner_pid, owner_started_at
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
-             attempts, created_at, owner_pid, owner_started_at) in rows:
-            if _owner_alive(owner_pid, owner_started_at):
-                continue  # a live gateway still owns this row
+             attempts, created_at, updated_at, owner_pid, owner_started_at) in rows:
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
-                conn.execute(
+                cursor = conn.execute(
                     """UPDATE delivery_obligations
-                       SET state='abandoned', updated_at=? WHERE obligation_id=?""",
-                    (now, oid),
+                       SET state='abandoned', updated_at=?,
+                           last_error=COALESCE(last_error, ?)
+                       WHERE obligation_id=? AND state=? AND updated_at=?""",
+                    (now, "delivery retry budget or age limit exhausted", oid,
+                     state, updated_at),
                 )
+                if cursor.rowcount:
+                    logger.error(
+                        "Delivery obligation %s requires operator attention: "
+                        "retry budget or age limit exhausted (state=%s, attempts=%d)",
+                        oid, state, attempts,
+                    )
                 continue
+            if _owner_alive(owner_pid, owner_started_at):
+                # A healthy gateway can outlive a failed/pending row forever.
+                # Fresh rows remain owned by their in-flight producer; once the
+                # finite lease/backoff expires, this process may safely reclaim
+                # them. Attempting rows retain the visible duplicate marker.
+                retry_delay = (
+                    min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * (2 ** attempts))
+                    if state == "failed"
+                    else LIVE_OWNER_LEASE_SECONDS
+                )
+                if (now - updated_at) < retry_delay:
+                    continue
             if (
                 deliverable_platforms is not None
                 and platform not in deliverable_platforms
@@ -254,8 +276,10 @@ def sweep_recoverable(
                 """UPDATE delivery_obligations
                    SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
                        updated_at=?
-                   WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
-                (pid, started, now, oid, owner_pid, owner_pid),
+                   WHERE obligation_id=? AND state=? AND attempts=?
+                     AND updated_at=? AND (owner_pid IS ? OR owner_pid=?)""",
+                (pid, started, now, oid, state, attempts, updated_at,
+                 owner_pid, owner_pid),
             )
             if cursor.rowcount:
                 claimed.append({

@@ -26,6 +26,54 @@ from typing import Dict, List, Optional, Set, Any
 logger = logging.getLogger(__name__)
 
 
+def _telegram_update_payload(update: Any) -> dict:
+    """Return a JSON-compatible Telegram update without lossy repr coercion."""
+    if isinstance(update, dict):
+        return update
+    to_json = getattr(update, "to_json", None)
+    if callable(to_json):
+        payload = json.loads(to_json())
+    else:
+        to_dict = getattr(update, "to_dict", None)
+        payload = to_dict() if callable(to_dict) else None
+    if not isinstance(payload, dict):
+        raise ValueError("Telegram update must serialize to an object")
+    return payload
+
+
+class _DurableTelegramUpdateQueue(asyncio.Queue):
+    """Persist accepted PTB updates before making them visible to handlers."""
+
+    def __init__(self, adapter: "TelegramAdapter") -> None:
+        super().__init__()
+        self._adapter = adapter
+
+    def _persist(self, update: Any) -> None:
+        # Polling is journaled from the untouched Bot API response before PTB
+        # sees it. Re-serializing a parsed Update here could normalize fields
+        # and falsely look like a payload mutation. Webhooks have no earlier
+        # raw-response boundary, so the authenticated queue is authoritative.
+        if self._adapter._inbound_transport == "polling_tls":  # noqa: SLF001
+            return
+        payload = _telegram_update_payload(update)
+        self._adapter._persist_inbound_payload(  # noqa: SLF001
+            payload,
+            transport=self._adapter._inbound_transport,  # noqa: SLF001
+        )
+
+    async def put(self, item: Any) -> None:
+        self._persist(item)
+        await super().put(item)
+
+    def put_nowait(self, item: Any) -> None:
+        self._persist(item)
+        super().put_nowait(item)
+
+    def put_recovered_nowait(self, item: Any) -> None:
+        """Enqueue a payload already loaded from the durable inbox."""
+        super().put_nowait(item)
+
+
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
     text = "" if error is None else str(error)
@@ -218,6 +266,7 @@ try:
         CommandHandler,
         CallbackQueryHandler,
         MessageHandler as TelegramMessageHandler,
+        TypeHandler,
         ContextTypes,
         filters,
     )
@@ -236,6 +285,7 @@ except ImportError:
     CommandHandler = Any
     CallbackQueryHandler = Any
     TelegramMessageHandler = Any
+    TypeHandler = Any
     HTTPXRequest = Any
     filters = None
     ParseMode = None
@@ -375,7 +425,7 @@ def check_telegram_requirements() -> bool:
     """
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
     global InlineKeyboardMarkup, LinkPreviewOptions, Application
-    global CommandHandler, CallbackQueryHandler, TelegramMessageHandler
+    global CommandHandler, CallbackQueryHandler, TelegramMessageHandler, TypeHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest
     if TELEGRAM_AVAILABLE:
         return True
@@ -395,6 +445,7 @@ def check_telegram_requirements() -> bool:
             Application as _App, CommandHandler as _CH,
             CallbackQueryHandler as _CQH,
             MessageHandler as _MH,
+            TypeHandler as _TH,
             ContextTypes as _CT, filters as _filters,
         )
         from telegram.constants import ParseMode as _PM, ChatType as _CtT
@@ -411,6 +462,7 @@ def check_telegram_requirements() -> bool:
     CommandHandler = _CH
     CallbackQueryHandler = _CQH
     TelegramMessageHandler = _MH
+    TypeHandler = _TH
     ContextTypes = _CT
     filters = _filters
     ParseMode = _PM
@@ -569,6 +621,9 @@ _POLLING_PROGRESS_TIMEOUT = 60.0
 _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar(
     "telegram_polling_generation", default=None
 )
+_INBOX_EFFECT_CONTEXT: ContextVar[Optional[Any]] = ContextVar(
+    "telegram_inbox_effect", default=None
+)
 
 
 class _PollingLifecycleAbort(RuntimeError):
@@ -666,6 +721,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
         self._webhook_mode: bool = False
+        self._telegram_inbox = None
+        self._inbound_transport: str = "polling_tls"
+        self._durable_update_queue: Optional[_DurableTelegramUpdateQueue] = None
+        self._deferred_inbox_update_ids: set[int] = set()
+        self._deferred_inbox_claims: Dict[int, Any] = {}
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
@@ -2341,12 +2401,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._send_path_degraded = False
 
     def _observe_polling_request_result(self, request, generation, result):
-        """Record getUpdates progress from an observed do_request result.
-
-        Purely observational: PTB still parses the untouched payload and owns
-        any resulting exception. Kept as its own method so the observation
-        logic is shared and independently testable.
-        """
+        """Durably journal getUpdates results before PTB may advance offset."""
         status_code, payload = result
         if generation is None or not (200 <= status_code < 300):
             return
@@ -2362,7 +2417,216 @@ class TelegramAdapter(BasePlatformAdapter):
             and envelope.get("ok") is True
             and "result" in envelope
         ):
+            updates = envelope.get("result")
+            if isinstance(updates, list) and updates:
+                # This call is intentionally synchronous and exceptions are
+                # allowed to propagate. PTB must not see a successful Bot API
+                # response (and therefore must not advance its offset) until
+                # every update in that response is durable locally.
+                self._ensure_telegram_inbox().persist_updates(
+                    updates,
+                    transport="polling_tls",
+                    authenticated=True,
+                )
             self._record_polling_progress(generation)
+
+    def _ensure_telegram_inbox(self):
+        if self._telegram_inbox is not None:
+            return self._telegram_inbox
+        import hashlib
+
+        from hermes_constants import get_hermes_home
+        from plugins.platforms.telegram.inbox import TelegramInbox
+
+        profile_home = get_hermes_home()
+        # The resolved profile home is authoritative even in a multiplexed
+        # secondary-profile ContextVar scope. Hash it so the state DB carries
+        # no operator path while still preventing cross-profile collisions.
+        profile_id = hashlib.sha256(
+            str(profile_home.resolve()).encode("utf-8")
+        ).hexdigest()
+        self._telegram_inbox = TelegramInbox.for_profile_home(
+            profile_home,
+            profile_id=profile_id,
+            bot_token=self.config.token,
+        )
+        try:
+            retention_days = float(
+                self.config.extra.get("inbox_archive_retention_days", 30)
+            )
+        except (TypeError, ValueError):
+            retention_days = 30.0
+        self._telegram_inbox.prune_archive(
+            retention_seconds=max(1.0, retention_days) * 86400.0
+        )
+        return self._telegram_inbox
+
+    def _persist_inbound_payload(self, payload: dict, *, transport: str) -> bool:
+        """Persist only updates admitted through an authenticated PTB route."""
+        return self._ensure_telegram_inbox().persist_update(
+            payload,
+            transport=transport,
+            authenticated=True,
+        )
+
+    def _durable_handler(self, callback):
+        """Claim one persisted update before adapter dispatch and archive on success."""
+        async def _wrapped(update, context):
+            update_id = getattr(update, "update_id", None)
+            if update_id is None:
+                update_id = _telegram_update_payload(update).get("update_id")
+            # Agent turns and media downloads can legitimately exceed five
+            # minutes. Process startup explicitly reclaims stale owners, so a
+            # long lease prevents a concurrent provider retry from executing
+            # the same effect while a healthy turn is still active.
+            claim = self._ensure_telegram_inbox().claim(
+                update_id, lease_seconds=6 * 3600
+            )
+            if claim is None:
+                # Duplicate provider delivery, an active lease, or an already
+                # archived/dead-lettered update. All are intentionally no-op.
+                return None
+            # Fence before invoking any Telegram callback. Callback-query ACKs,
+            # downloads, busy-session notices, runner tools, and final sends
+            # may all be externally visible. The later base-runner fence is an
+            # idempotent verification of this same durable receipt.
+            if not self._ensure_telegram_inbox().begin_effects([claim]):
+                return None
+            effect_context_token = _INBOX_EFFECT_CONTEXT.set(claim)
+            try:
+                result = await callback(update, context)
+            except BaseException as exc:
+                disposition = self._ensure_telegram_inbox().fail(
+                    claim,
+                    _redact_telegram_error_text(exc),
+                    max_attempts=5,
+                    retry_delay=1.0,
+                )
+                if disposition == "retry":
+                    self._schedule_inbox_retry()
+                raise
+            finally:
+                _INBOX_EFFECT_CONTEXT.reset(effect_context_token)
+            if int(update_id) in self._deferred_inbox_update_ids:
+                self._deferred_inbox_claims[int(update_id)] = claim
+                return result
+            self._ensure_telegram_inbox().complete(claim)
+            return result
+
+        return _wrapped
+
+    async def _archive_ignored_update(self, update, context) -> None:
+        """Close durable rows for authenticated update types Hermes ignores."""
+        update_id = getattr(update, "update_id", None)
+        logger.debug("[%s] Ignoring unsupported Telegram update %s", self.name, update_id)
+
+    def _schedule_inbox_retry(self) -> None:
+        async def _retry_ready() -> None:
+            await asyncio.sleep(1.0)
+            if not self._app or not self._durable_update_queue:
+                return
+            for payload in self._ensure_telegram_inbox().recoverable():
+                update = Update.de_json(payload, self._app.bot)
+                self._durable_update_queue.put_recovered_nowait(update)
+
+        task = asyncio.create_task(_retry_ready())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    def _mark_event_inbox_deferred(self, event: "MessageEvent") -> None:
+        update_id = getattr(event, "platform_update_id", None)
+        if update_id is None:
+            return
+        update_id = int(update_id)
+        self._deferred_inbox_update_ids.add(update_id)
+        ids = event.metadata.setdefault("telegram_inbox_update_ids", [])
+        if update_id not in ids:
+            ids.append(update_id)
+
+    @staticmethod
+    def _merge_deferred_event_ids(target: "MessageEvent", source: "MessageEvent") -> None:
+        target_ids = target.metadata.setdefault("telegram_inbox_update_ids", [])
+        for update_id in source.metadata.get("telegram_inbox_update_ids", []):
+            if update_id not in target_ids:
+                target_ids.append(update_id)
+        target_keys = target.metadata.setdefault("telegram_inbox_effect_keys", [])
+        for effect_key in source.metadata.get("telegram_inbox_effect_keys", []):
+            if effect_key not in target_keys:
+                target_keys.append(effect_key)
+
+    async def _dispatch_deferred_inbox_event(self, event: "MessageEvent") -> None:
+        # BasePlatformAdapter returns after scheduling/queuing work. The
+        # downstream-effect hooks, not this enqueue boundary, own the durable
+        # receipt and archive transition.
+        await self.handle_message(event)
+
+    def _inbound_effect_claims(self, event: "MessageEvent") -> list[Any]:
+        claims = []
+        seen: set[int] = set()
+        current = _INBOX_EFFECT_CONTEXT.get()
+        if current is not None:
+            claims.append(current)
+            seen.add(int(current.update_id))
+        for update_id in event.metadata.get("telegram_inbox_update_ids", []):
+            update_id = int(update_id)
+            claim = self._deferred_inbox_claims.get(update_id)
+            if claim is not None and update_id not in seen:
+                claims.append(claim)
+                seen.add(update_id)
+        return claims
+
+    async def _begin_inbound_effect(self, event: "MessageEvent") -> bool:
+        claims = self._inbound_effect_claims(event)
+        if not claims:
+            return True
+        # `_durable_handler` fenced every claim before entering the Telegram
+        # callback. Reaching the base runner with those claims is therefore a
+        # verification boundary, not a second database claim attempt.
+        return True
+
+    async def _finish_inbound_effect(
+        self,
+        event: "MessageEvent",
+        *,
+        success: bool,
+        error: object | None = None,
+    ) -> None:
+        claims = self._inbound_effect_claims(event)
+        for claim in claims:
+            try:
+                if success:
+                    self._ensure_telegram_inbox().complete(claim)
+                else:
+                    disposition = self._ensure_telegram_inbox().fail(
+                        claim,
+                        _redact_telegram_error_text(error or "downstream effect failed"),
+                        max_attempts=5,
+                        retry_delay=1.0,
+                    )
+                    if disposition == "retry":
+                        self._schedule_inbox_retry()
+            finally:
+                self._deferred_inbox_claims.pop(int(claim.update_id), None)
+                self._deferred_inbox_update_ids.discard(int(claim.update_id))
+
+    async def handle_message(self, event: "MessageEvent") -> None:
+        # Durable Telegram handlers must not archive merely because the base
+        # adapter queued a background task. Completion belongs to the actual
+        # runner/provider-effect boundary below.
+        self._mark_event_inbox_deferred(event)
+        await super().handle_message(event)
+
+    def _enqueue_recoverable_updates(self) -> int:
+        """Replay local durable rows before opening provider ingress."""
+        if not self._app or not self._durable_update_queue:
+            return 0
+        inbox = self._ensure_telegram_inbox()
+        inbox.requeue_inflight()
+        recovered = inbox.recoverable()
+        for payload in recovered:
+            update = Update.de_json(payload, self._app.bot)
+            self._durable_update_queue.put_recovered_nowait(update)
+        return len(recovered)
 
     def _instrument_polling_request(self, request):
         """Instrument one dedicated PTB getUpdates request with progress tracking.
@@ -3665,13 +3929,9 @@ class TelegramAdapter(BasePlatformAdapter):
         instead.  Webhook mode is useful for cloud deployments (Fly.io,
         Railway) where inbound HTTP can wake a suspended machine.
 
-        ``is_reconnect`` distinguishes a cold first boot (False — drop any
-        stale Bot API queue) from a watcher reconnect after a prolonged
-        outage (True — preserve the updates Telegram queued while the bot
-        was offline, otherwise every message sent during the outage is
-        silently lost). The in-process network-error ladder and the
-        409-conflict handler already pass ``drop_pending_updates=False``
-        for the same reason; bootstrap follows suit on the reconnect path.
+        Cold boots and reconnects both preserve Telegram's provider queue.
+        Every accepted update is journaled locally before provider
+        acknowledgement and then claimed by a durable handler wrapper.
 
         Env vars for webhook mode::
 
@@ -3702,8 +3962,12 @@ class TelegramAdapter(BasePlatformAdapter):
             if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
 
-            # Build the application
+            # PTB's authenticated webhook handler and polling producer both
+            # feed this queue; it persists synchronously before exposing an
+            # update to Application handlers.
+            self._durable_update_queue = _DurableTelegramUpdateQueue(self)
             builder = Application.builder().token(self.config.token)
+            builder.update_queue(self._durable_update_queue)
             custom_base_url = self.config.extra.get("base_url")
             if custom_base_url:
                 builder = builder.base_url(custom_base_url)
@@ -3857,22 +4121,31 @@ class TelegramAdapter(BasePlatformAdapter):
             # Register handlers
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
-                self._handle_text_message
+                self._durable_handler(self._handle_text_message)
             ))
             self._app.add_handler(TelegramMessageHandler(
                 filters.COMMAND,
-                self._handle_command
+                self._durable_handler(self._handle_command)
             ))
             self._app.add_handler(TelegramMessageHandler(
                 filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION),
-                self._handle_location_message
+                self._durable_handler(self._handle_location_message)
             ))
             self._app.add_handler(TelegramMessageHandler(
                 filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
-                self._handle_media_message
+                self._durable_handler(self._handle_media_message)
             ))
             # Handle inline keyboard button callbacks (update prompts)
-            self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+            self._app.add_handler(CallbackQueryHandler(
+                self._durable_handler(self._handle_callback_query)
+            ))
+            # PTB keeps only one matching handler per group. Registered last in
+            # the default group, this closes durable rows for update types that
+            # none of the supported message/callback handlers consume.
+            self._app.add_handler(TypeHandler(
+                Update,
+                self._durable_handler(self._archive_ignored_update),
+            ))
             
             # Start polling — retry initialize() for transient TLS resets.
             # Each attempt is capped by _init_timeout so a single unreachable
@@ -3967,6 +4240,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                 from urllib.parse import urlparse
                 webhook_path = urlparse(webhook_url).path or "/telegram"
+                self._inbound_transport = "webhook_secret"
+
+                recovered_count = self._enqueue_recoverable_updates()
+                if recovered_count:
+                    logger.info(
+                        "[%s] Re-enqueued %d durable Telegram update(s)",
+                        self.name,
+                        recovered_count,
+                    )
 
                 await self._app.updater.start_webhook(
                     listen="0.0.0.0",
@@ -3975,11 +4257,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     webhook_url=webhook_url,
                     secret_token=webhook_secret,
                     allowed_updates=Update.ALL_TYPES,
-                    # Webhooks are push-based — Telegram does not hold a
-                    # server-side getUpdates queue, so this flag is a no-op
-                    # in practice. Mirror the polling path's reconnect
-                    # semantics for consistency.
-                    drop_pending_updates=not is_reconnect,
+                    drop_pending_updates=False,
                 )
                 self._webhook_mode = True
                 self._polling_progress_accepting = False
@@ -3990,6 +4268,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             else:
                 # ── Polling mode (default) ───────────────────────────
+                self._inbound_transport = "polling_tls"
+                recovered_count = self._enqueue_recoverable_updates()
+                if recovered_count:
+                    logger.info(
+                        "[%s] Re-enqueued %d durable Telegram update(s)",
+                        self.name,
+                        recovered_count,
+                    )
                 # Clear any stale webhook first so polling doesn't inherit a
                 # previous webhook registration and silently stop receiving
                 # updates. Best-effort: a transient Bot API network error here
@@ -4028,10 +4314,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._polling_error_callback_ref = _polling_error_callback
 
                 polling_started = await self._start_polling_resilient(
-                    # On a cold first boot drop the stale Bot API queue; on a
-                    # watcher reconnect after an outage preserve it so messages
-                    # sent while the bot was offline are delivered (#46621).
-                    drop_pending_updates=not is_reconnect,
+                    drop_pending_updates=False,
                     error_callback=_polling_error_callback,
                 )
                 if not polling_started:
@@ -8522,6 +8805,7 @@ class TelegramAdapter(BasePlatformAdapter):
         concatenates them and waits for a short quiet period before
         dispatching the combined message.
         """
+        self._mark_event_inbox_deferred(event)
         if self._should_drop_delayed_delivery():
             logger.debug("[Telegram] Dropping text batch enqueue after disconnect started")
             return
@@ -8541,6 +8825,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+            self._merge_deferred_event_ids(existing, event)
 
         # Cancel any pending flush and restart the timer
         prior_task = self._pending_text_batch_tasks.get(key)
@@ -8592,7 +8877,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[Telegram] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
             )
-            await self.handle_message(event)
+            await self._dispatch_deferred_inbox_event(event)
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
@@ -8626,13 +8911,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.debug("[Telegram] Dropping photo batch flush after disconnect started")
                 return
             logger.info("[Telegram] Flushing photo batch %s with %d image(s)", batch_key, len(event.media_urls))
-            await self.handle_message(event)
+            await self._dispatch_deferred_inbox_event(event)
         finally:
             if self._pending_photo_batch_tasks.get(batch_key) is current_task:
                 self._pending_photo_batch_tasks.pop(batch_key, None)
 
     def _enqueue_photo_event(self, batch_key: str, event: MessageEvent) -> None:
         """Merge photo events into a pending batch and schedule flush."""
+        self._mark_event_inbox_deferred(event)
         if self._should_drop_delayed_delivery():
             logger.debug("[Telegram] Dropping photo batch enqueue after disconnect started")
             return
@@ -8645,6 +8931,7 @@ class TelegramAdapter(BasePlatformAdapter):
             existing.media_types.extend(event.media_types)
             if event.text:
                 existing.text = self._merge_caption(existing.text, event.text)
+            self._merge_deferred_event_ids(existing, event)
 
         prior_task = self._pending_photo_batch_tasks.get(batch_key)
         if prior_task and not prior_task.done():
@@ -8941,6 +9228,7 @@ class TelegramAdapter(BasePlatformAdapter):
         new user message and interrupts the first. We debounce briefly and merge the
         attachments into a single MessageEvent.
         """
+        self._mark_event_inbox_deferred(event)
         if self._should_drop_delayed_delivery():
             logger.debug("[Telegram] Dropping media group enqueue after disconnect started")
             return
@@ -8953,6 +9241,7 @@ class TelegramAdapter(BasePlatformAdapter):
             existing.media_types.extend(event.media_types)
             if event.text:
                 existing.text = self._merge_caption(existing.text, event.text)
+            self._merge_deferred_event_ids(existing, event)
 
         prior_task = self._media_group_tasks.get(media_group_id)
         if prior_task:
@@ -8971,7 +9260,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 if self._should_drop_delayed_delivery():
                     logger.debug("[Telegram] Dropping media group flush after disconnect started")
                     return
-                await self.handle_message(event)
+                await self._dispatch_deferred_inbox_event(event)
         except asyncio.CancelledError:
             return
         finally:
@@ -9369,6 +9658,14 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
+        inbox_effect = _INBOX_EFFECT_CONTEXT.get()
+        inbox_metadata = {}
+        if inbox_effect is not None and inbox_effect.update_id == update_id:
+            inbox_metadata = {
+                "telegram_inbox_update_ids": [inbox_effect.update_id],
+                "telegram_inbox_effect_keys": [inbox_effect.effect_key],
+            }
+
         return MessageEvent(
             text=message.text or "",
             message_type=msg_type,
@@ -9381,6 +9678,7 @@ class TelegramAdapter(BasePlatformAdapter):
             auto_skill=topic_skill,
             channel_prompt=_channel_prompt,
             timestamp=message.date,
+            metadata=inbox_metadata,
         )
 
     # ── Message reactions (processing lifecycle) ──────────────────────────

@@ -20,6 +20,7 @@ from tools.environments.base import (
     _load_json_store,
     _popen_bash,
     _save_json_store,
+    ensure_private_directory,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,9 +73,7 @@ def _save_snapshots(data: dict) -> None:
 def _get_scratch_dir() -> Path:
     custom_scratch = os.getenv("TERMINAL_SCRATCH_DIR")
     if custom_scratch:
-        scratch_path = Path(custom_scratch)
-        scratch_path.mkdir(parents=True, exist_ok=True)
-        return scratch_path
+        return ensure_private_directory(Path(custom_scratch))
 
     from tools.environments.base import get_sandbox_dir
     sandbox = get_sandbox_dir() / "singularity"
@@ -82,24 +81,19 @@ def _get_scratch_dir() -> Path:
     scratch = Path("/scratch")
     if scratch.exists() and os.access(scratch, os.W_OK):
         user_scratch = scratch / os.getenv("USER", "hermes") / "hermes-agent"
-        user_scratch.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(user_scratch)
         logger.info("Using /scratch for sandboxes: %s", user_scratch)
         return user_scratch
 
-    sandbox.mkdir(parents=True, exist_ok=True)
-    return sandbox
+    return ensure_private_directory(sandbox)
 
 
 def _get_apptainer_cache_dir() -> Path:
     cache_dir = os.getenv("APPTAINER_CACHEDIR")
     if cache_dir:
-        cache_path = Path(cache_dir)
-        cache_path.mkdir(parents=True, exist_ok=True)
-        return cache_path
+        return ensure_private_directory(Path(cache_dir))
     scratch = _get_scratch_dir()
-    cache_path = scratch / ".apptainer"
-    cache_path.mkdir(parents=True, exist_ok=True)
-    return cache_path
+    return ensure_private_directory(scratch / ".apptainer")
 
 
 _sif_build_lock = threading.Lock()
@@ -126,8 +120,7 @@ def _get_or_build_sif(image: str, executable: str = "apptainer") -> str:
         logger.info("  Source: %s", image)
         logger.info("  Target: %s", sif_path)
 
-        tmp_dir = cache_dir / "tmp"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_dir = ensure_private_directory(cache_dir / "tmp")
 
         env = os.environ.copy()
         env["APPTAINER_TMPDIR"] = str(tmp_dir)
@@ -186,10 +179,8 @@ class SingularityEnvironment(BaseEnvironment):
         self._memory = memory
 
         if self._persistent:
-            overlay_base = _get_scratch_dir() / "hermes-overlays"
-            overlay_base.mkdir(parents=True, exist_ok=True)
-            self._overlay_dir = overlay_base / f"overlay-{task_id}"
-            self._overlay_dir.mkdir(parents=True, exist_ok=True)
+            overlay_base = ensure_private_directory(_get_scratch_dir() / "hermes-overlays")
+            self._overlay_dir = ensure_private_directory(overlay_base / f"overlay-{task_id}")
 
         self._start_instance()
         self.init_session()

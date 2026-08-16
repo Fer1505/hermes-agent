@@ -131,8 +131,8 @@ export function exposePluginSDK() {
     // Handles loopback-token vs gated-cookie auth so plugins never read
     // window.__HERMES_SESSION_TOKEN__ directly.
     authedFetch,
-    // Build a ws(s):// URL with the correct auth param for the active mode
-    // (single-use ticket in gated mode, token in loopback). Use this for any
+    // Build a ws(s):// URL with the correct auth mode (single-use ticket in
+    // gated mode, no bearer in loopback). Use this for any
     // plugin WebSocket instead of hand-assembling the URL.
     buildWsUrl,
     // Lower-level: resolve just the [authParamName, authParamValue] pair, for

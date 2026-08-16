@@ -127,6 +127,50 @@ class TestPluginApiRuntimeGate:
         call_next.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_loopback_no_auth_still_blocks_disabled_user_plugin(self):
+        """Local no-auth mode is authenticated by its host/peer boundary."""
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse
+
+        fake_plugin = {"name": "hot", "source": "user"}
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/plugins/hot/probe",
+            "query_string": b"",
+            "headers": [],
+            "state": {},
+            "app": web_server.app,
+        }
+        request = Request(scope)
+        call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
+
+        prior = getattr(web_server.app.state, "auth_required", None)
+        web_server.app.state.auth_required = False
+        try:
+            with patch.object(
+                web_server, "_get_dashboard_plugins", return_value=[fake_plugin]
+            ), patch(
+                "hermes_cli.plugins_cmd._get_enabled_set", return_value={"hot"}
+            ), patch(
+                "hermes_cli.plugins_cmd._get_disabled_set", return_value={"hot"}
+            ):
+                response = await web_server._plugin_api_runtime_gate(
+                    request, call_next
+                )
+        finally:
+            if prior is None:
+                try:
+                    del web_server.app.state.auth_required
+                except AttributeError:
+                    pass
+            else:
+                web_server.app.state.auth_required = prior
+
+        assert response.status_code == 404
+        call_next.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_middleware_blocks_unenabled_user_plugin(self):
         """Middleware returns 404 when user plugin not in enabled set."""
         from starlette.requests import Request

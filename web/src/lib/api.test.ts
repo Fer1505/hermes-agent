@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { api } from "./api";
+import { api, buildWsAuthParam, buildWsUrl } from "./api";
 
 const SESSION_HEADER = "X-Hermes-Session-Token";
 
@@ -45,6 +45,47 @@ describe("api.getModelOptions", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/model/options?profile=default&refresh=1&include_unconfigured=1",
       expect.objectContaining({ credentials: "include" }),
+    );
+  });
+});
+
+describe("dashboard WebSocket auth boundary", () => {
+  it("builds a tokenless URL only when dashboard auth is disabled", async () => {
+    vi.stubGlobal("window", {
+      __HERMES_AUTH_REQUIRED__: false,
+      location: { host: "127.0.0.1:9119", protocol: "http:" },
+    });
+
+    await expect(buildWsAuthParam()).resolves.toBeUndefined();
+    await expect(buildWsUrl("/api/ws")).resolves.toBe(
+      "ws://127.0.0.1:9119/api/ws",
+    );
+  });
+
+  it("requires a non-empty single-use ticket when auth is enabled", async () => {
+    vi.stubGlobal("window", {
+      __HERMES_AUTH_REQUIRED__: true,
+      location: { host: "dashboard.example", protocol: "https:" },
+    });
+    const fetchMock = jsonFetchMock({ ticket: "", ttl_seconds: 30 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(buildWsAuthParam()).rejects.toThrow(
+      "Dashboard WebSocket ticket was empty",
+    );
+  });
+
+  it("uses a ticket, never a token, when auth is enabled", async () => {
+    vi.stubGlobal("window", {
+      __HERMES_AUTH_REQUIRED__: true,
+      __HERMES_SESSION_TOKEN__: "retired-token",
+      location: { host: "dashboard.example", protocol: "https:" },
+    });
+    const fetchMock = jsonFetchMock({ ticket: "ticket-1", ttl_seconds: 30 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(buildWsUrl("/api/ws")).resolves.toBe(
+      "wss://dashboard.example/api/ws?ticket=ticket-1",
     );
   });
 });

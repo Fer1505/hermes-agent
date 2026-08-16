@@ -132,7 +132,6 @@ _GENERIC_SECRET_ASSIGN_RE = re.compile(
     r"\b(access_token|api[_-]?key|auth[_-]?token|signature|sig)\s*=\s*([^\s,;]+)",
     re.IGNORECASE,
 )
-_PROOF_REQUIRED_PLATFORMS = frozenset({"telegram", "bluebubbles"})
 _SUCCESSFUL_SEND_TTL_SECONDS = 600
 _successful_send_records: dict[str, float] = {}
 
@@ -166,18 +165,58 @@ def _send_result_error(result, platform_name: str) -> str | None:
 
 
 def _has_provider_delivery_proof(result, platform_name: str) -> bool:
-    """Require provider ids for platforms where false positives caused bad receipts."""
-    if not isinstance(result, dict):
-        return False
-    if platform_name not in _PROOF_REQUIRED_PLATFORMS:
-        return True
-    if result.get("skipped"):
-        return True
-    return bool(
-        result.get("message_id")
-        or result.get("message_ids")
-        or result.get("provider_message_id")
+    """Require provider-specific proof where a generic ACK can be misleading."""
+    from gateway.platforms.base import (
+        extract_provider_delivery_proof,
+        provider_delivery_proof_required,
     )
+
+    if not isinstance(result, dict) or result.get("skipped"):
+        return False
+    return (
+        not provider_delivery_proof_required(platform_name)
+        or extract_provider_delivery_proof(result, platform_name) is not None
+    )
+
+
+def _normalize_delivery_envelope(result, platform_name: str) -> dict:
+    """Normalize send outcomes so accepted, skipped, failed and unverified differ."""
+    from gateway.platforms.base import (
+        extract_provider_delivery_proof,
+        provider_delivery_proof_required,
+    )
+
+    if not isinstance(result, dict):
+        return {
+            "success": False,
+            "delivery_state": "failed",
+            "error": f"{platform_name} send returned invalid result: {type(result).__name__}",
+        }
+    normalized = dict(result)
+    result_error = _send_result_error(normalized, platform_name)
+    if result_error:
+        normalized["success"] = False
+        normalized["delivery_state"] = "failed"
+        normalized["error"] = result_error
+        return normalized
+    if normalized.get("skipped"):
+        normalized["delivery_state"] = "skipped"
+        normalized["provider_proof"] = None
+        return normalized
+    if normalized.get("success"):
+        proof = extract_provider_delivery_proof(normalized, platform_name)
+        if provider_delivery_proof_required(platform_name) and proof is None:
+            normalized["success"] = False
+            normalized["delivery_state"] = "attempted_unverified"
+            normalized["delivery_proof_missing"] = True
+            normalized["provider_proof"] = None
+            normalized["error"] = (
+                f"{platform_name} send returned success=true without provider delivery proof"
+            )
+            return normalized
+        normalized["delivery_state"] = "accepted"
+        normalized["provider_proof"] = proof or {"kind": "adapter_ack"}
+    return normalized
 
 
 def _send_duplicate_key(
@@ -674,16 +713,7 @@ def _handle_send(args, **kw):
                 force_document=force_document_attachments,
             )
         )
-        if isinstance(result, dict):
-            result_error = _send_result_error(result, platform_name)
-            if result_error:
-                result["error"] = result_error
-            elif result.get("success") and not _has_provider_delivery_proof(result, platform_name):
-                result["success"] = False
-                result["delivery_proof_missing"] = True
-                result["error"] = (
-                    f"{platform_name} send returned success=true without provider delivery proof"
-                )
+        result = _normalize_delivery_envelope(result, platform_name)
 
         if isinstance(result, dict) and result.get("error"):
             try:
@@ -968,7 +998,12 @@ async def _send_via_adapter(
             except Exception as e:
                 return {"error": f"Plugin platform send failed: {e}"}
             if result.success:
-                return {"success": True, "message_id": result.message_id}
+                from gateway.platforms.base import extract_provider_delivery_proof
+                proof = extract_provider_delivery_proof(result, platform_name)
+                response = {"success": True, "message_id": result.message_id}
+                if proof and proof.get("kind") == "provider_timestamp":
+                    response["provider_timestamps"] = proof.get("values", [])
+                return response
             return {"error": f"Adapter send failed: {result.error}"}
 
     entry = None
@@ -1812,6 +1847,7 @@ async def _send_signal(extra, chat_id, message, media_files=None):
             scheduler.state(), len(attachment_paths), len(att_batches),
         )
         failed_batches: list[int] = []
+        provider_timestamps: list[str] = []
         for idx, att_batch in enumerate(att_batches):
             n = len(att_batch)
             if n > 0:
@@ -1831,6 +1867,9 @@ async def _send_signal(extra, chat_id, message, media_files=None):
                     data = await _post(att_batch, batch_message)
                     _rpc_duration = time.monotonic() - _rpc_t0
                     if "error" not in data:
+                        provider_result = data.get("result")
+                        if isinstance(provider_result, dict) and provider_result.get("timestamp"):
+                            provider_timestamps.append(str(provider_result["timestamp"]))
                         await scheduler.report_rpc_duration(_rpc_duration, n)
                         break
 
@@ -1888,6 +1927,7 @@ async def _send_signal(extra, chat_id, message, media_files=None):
             )
 
         result = {"success": True, "platform": "signal", "chat_id": _display_chat_id("signal", chat_id)}
+        result["provider_timestamps"] = provider_timestamps
         if warnings:
             result["warnings"] = warnings
         return result

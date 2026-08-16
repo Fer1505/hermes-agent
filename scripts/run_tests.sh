@@ -43,7 +43,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # pytest, pytest-asyncio, pytest-timeout, ruff, ty).
 VENV=""
 for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
+  if [ -f "$candidate/bin/activate" ] \
+      && "$candidate/bin/python" -c 'import pytest' 2>/dev/null; then
     VENV="$candidate"
     break
   fi
@@ -82,6 +83,14 @@ echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
 
 cd "$REPO_ROOT"
 
+# Isolate import-time profile resolution as well as test bodies. The autouse
+# pytest fixture runs only after collection, which is too late for modules that
+# resolve HERMES_HOME while importing. Keep both HOME and HERMES_HOME inside one
+# owner-private temporary root and remove it when the runner exits.
+TEST_PROFILE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/hermes-tests.XXXXXX")"
+chmod 700 "$TEST_PROFILE_ROOT"
+trap 'rm -rf -- "$TEST_PROFILE_ROOT"' EXIT
+
 # ── Pre-compile .pyc bytecode cache ─────────────────────────────────────────
 # Each test file runs in its own subprocess via run_tests_parallel.py.
 # Pre-building the bytecode cache once here (instead of each subprocess
@@ -91,9 +100,10 @@ echo "▶ pre-compiling bytecode cache"
 "$PYTHON" -m compileall -q -j 0 -- $(git ls-files '*.py') >/dev/null 2>&1 || true
 
 echo "▶ launching test runner"
-exec env -i \
+env -i \
   PATH="$PATH" \
-  HOME="$HOME" \
+  HOME="$TEST_PROFILE_ROOT" \
+  HERMES_HOME="$TEST_PROFILE_ROOT/.hermes" \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \

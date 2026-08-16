@@ -2819,6 +2819,7 @@ class TestSendSignalChunking:
         assert result["success"] is True
         assert result["platform"] == "signal"
         assert result["chat_id"].endswith("4321")
+        assert result["provider_timestamps"] == ["1"]
         assert len(fake.calls) == 1
         params = fake.calls[0]["payload"]["params"]
         assert params["message"] == "hello"

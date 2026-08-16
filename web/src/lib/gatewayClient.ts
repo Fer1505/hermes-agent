@@ -40,14 +40,17 @@ export class GatewayClient extends JsonRpcGatewayClient {
       return;
     }
 
-    // Gated mode: legacy ``?token=`` is rejected by ``_ws_auth_ok``; the SPA
-    // must fetch a single-use ticket. Explicit ``token`` keeps the test-only
-    // override path.
-    const authParam = token ? (["token", token] as const) : await buildWsAuthParam();
-    if (!authParam[1]) {
-      throw new Error(
-        "Session token not available — page must be served by the Hermes dashboard server",
-      );
+    // Gated mode always mints a single-use ticket and never falls back to a
+    // legacy token. Disabled-auth loopback mode intentionally uses no bearer;
+    // an explicit token remains a compatibility seam only in that mode.
+    const gated = !!window.__HERMES_AUTH_REQUIRED__;
+    const authParam = gated
+      ? await buildWsAuthParam()
+      : token
+        ? (["token", token] as const)
+        : undefined;
+    if (gated && (!authParam || !authParam[1])) {
+      throw new Error("Authenticated dashboard WebSocket ticket unavailable");
     }
 
     await super.connect(

@@ -89,7 +89,8 @@ dependencies = [
   "urllib3>=2.7.0,<3",
   # cryptography is pulled in transitively by PyJWT[crypto]; pin it explicitly
   # so the WeCom/Weixin crypto paths can't drift below the CVE-fixed floor.
-  "cryptography==49.0.0",  # CVE-2026-39892, CVE-2026-34073, GHSA-537c-gmf6-5ccf
+  # 50.0.0 fixes GHSA-g6cj-pr64-35w5 (PKCS#7 Bleichenbacher oracle).
+  "cryptography==50.0.0",  # CVE-2026-69247
   # Windows has no IANA tzdata shipped with the OS, so Python's ``zoneinfo``
   # (PEP 615) raises ``ZoneInfoNotFoundError`` for every non-UTC timezone
   # out of the box.  ``tzdata`` ships the Olson database as a data package
@@ -158,10 +159,24 @@ modal = ["modal==1.3.4"]
 daytona = ["daytona==0.155.0"]
 hindsight = ["hindsight-client==0.6.1"]
 dev = ["debugpy==1.8.20", "pytest==9.0.3", "pytest-asyncio==1.3.0", "mcp==1.26.0", "starlette==1.3.1", "ty==0.0.21", "ruff==0.15.10", "setuptools==81.0.0"]  # starlette 1.3.1: CVE-2026-48710 + 2026 GHSA batch (82w8/jp82/wqp7/x746); setuptools: latest <82 (torch >=2.11 caps setuptools<82)
-messaging = ["python-telegram-bot[webhooks]==22.6", "discord.py[voice]==2.7.1", "aiohttp==3.14.1", "brotlicffi==1.2.0.1", "slack-bolt==1.29.0", "slack-sdk==3.43.0", "qrcode==7.4.2"]  # aiohttp 3.14.1: CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
+messaging = [
+  "python-telegram-bot[webhooks]==22.6",
+  # discord.py 2.7.1's published [voice] extra caps PyNaCl<1.6 even though
+  # upstream main supports PyNaCl>=1.6,<1.7. Declare its two voice components
+  # explicitly until the next release so the patched PyNaCl remains resolvable.
+  "discord.py==2.7.1",
+  "aiohttp==3.14.3",  # GHSA-cq5v-8q36-5273 / CVE-2026-69244
+  # discord.py[voice] permits older PyNaCl releases; pin the libsodium fix.
+  "PyNaCl==1.6.2",  # GHSA-mrfv-m5wm-5w6w / CVE-2025-69277
+  "davey==0.1.4",
+  "brotlicffi==1.2.0.1",
+  "slack-bolt==1.29.0",
+  "slack-sdk==3.43.0",
+  "qrcode==7.4.2",
+]
 cron = []  # croniter is now a core dependency; this extra kept for back-compat
-slack = ["slack-bolt==1.29.0", "slack-sdk==3.43.0", "aiohttp==3.14.1"]
-matrix = ["mautrix[encryption]==0.21.0", "aiosqlite==0.22.1", "asyncpg==0.31.0", "aiohttp-socks==0.11.0", "aiohttp==3.14.1"]  # aiohttp 3.14.1: CVE-2026-34993(RCE)/47265 + 34513/34518/34519/34520/34525 (mautrix/aiohttp-socks only cap aiohttp<4 / >=3.10, so pin the patched floor directly)
+slack = ["slack-bolt==1.29.0", "slack-sdk==3.43.0", "aiohttp==3.14.3"]
+matrix = ["mautrix[encryption]==0.21.0", "aiosqlite==0.22.1", "asyncpg==0.31.0", "aiohttp-socks==0.11.0", "aiohttp==3.14.3"]  # GHSA-cq5v-8q36-5273; mautrix/aiohttp-socks only cap aiohttp<4 / >=3.10, so pin the patched release directly
 # WeCom callback-mode adapter — parses untrusted XML POST bodies from
 # WeCom-controlled callback endpoints, so we use defusedxml (drop-in
 # replacement for stdlib xml.etree.ElementTree) to block billion-laughs
@@ -206,9 +221,9 @@ vision = []
 # a vulnerable pre-1.0.1 transitive. Bump in lockstep with uv.lock.
 mcp = ["mcp==1.26.0", "starlette==1.3.1"]  # starlette 1.3.1: CVE-2026-48710 + 2026 GHSA batch
 nemo-relay = ["nemo-relay>=0.5,<1.0"]
-homeassistant = ["aiohttp==3.14.1"]
-sms = ["aiohttp==3.14.1"]
-teams = ["microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.1"]  # aiohttp 3.14.1: CVE-2026-34993(RCE)/47265 + 34513/34518/34519/34520/34525
+homeassistant = ["aiohttp==3.14.3"]
+sms = ["aiohttp==3.14.3"]
+teams = ["microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.3"]  # GHSA-cq5v-8q36-5273 / CVE-2026-69244
 # Computer use — macOS background desktop control via cua-driver (MCP stdio).
 # The cua-driver binary itself is installed via `hermes tools` post-setup
 # (curl install script); this extra just pins the MCP client used to talk

@@ -173,18 +173,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     setHasActivated((prev) => latchChatActivation(prev, isActive));
   }, [isActive]);
   const [searchParams, setSearchParams] = useSearchParams();
-  // Lazy-init: the missing-token check happens at construction so the effect
-  // body doesn't have to setState (React 19's set-state-in-effect rule).
-  // In gated (OAuth) mode the server intentionally omits the session token —
-  // the dashboard API layer authenticates the WS via a single-use ticket,
-  // so a missing token there is expected, not an error.
-  const [banner, setBanner] = useState<string | null>(() =>
-    typeof window !== "undefined" &&
-    !window.__HERMES_SESSION_TOKEN__ &&
-    !window.__HERMES_AUTH_REQUIRED__
-      ? "Session token unavailable. Open this page through `hermes dashboard`, not directly."
-      : null,
-  );
+  // Gated mode authenticates via a single-use WS ticket. Loopback no-auth
+  // mode intentionally has no browser token, so absence is not an error.
+  const [banner, setBanner] = useState<string | null>(null);
   const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -467,15 +458,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
     const host = hostRef.current;
     if (!host) return;
-
-    const token = window.__HERMES_SESSION_TOKEN__;
-    const gated = !!window.__HERMES_AUTH_REQUIRED__;
-    // Banner already initialised above; just bail before wiring xterm/WS.
-    // In gated mode the token is absent by design — api.buildWsUrl() mints
-    // a WS ticket instead, so don't bail; let the effect reach that path.
-    if (!token && !gated) {
-      return;
-    }
 
     const tierW0 = terminalTierWidthPx(host);
     const term = new Terminal({

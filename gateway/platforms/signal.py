@@ -1091,7 +1091,7 @@ class SignalAdapter(BasePlatformAdapter):
             # Signal has no editable message identifier. Returning None keeps the
             # stream consumer on the non-edit fallback path instead of pretending
             # future edits can remove an in-progress cursor from the chat thread.
-            return SendResult(success=True, message_id=None)
+            return SendResult(success=True, message_id=None, raw_response=result)
         return SendResult(success=False, error="RPC send failed")
 
     def _track_sent_timestamp(self, rpc_result) -> None:

@@ -5,7 +5,8 @@ id stability, and the startup redelivery sweep's contract:
 - pending rows redeliver plainly (send never started, no dup risk)
 - attempting/failed rows carry the recovered-reply marker (honest
   at-least-once; ambiguity is labeled, never silently resent)
-- rows owned by a LIVE process are never claimed
+- fresh rows owned by a LIVE process are not claimed; expired leases are
+  periodically reclaimable
 - poison rows abandon at the attempts cap / stale cutoff
 """
 
@@ -98,9 +99,42 @@ class TestObligationId:
 
 
 class TestSweep:
-    def test_live_owner_rows_never_claimed(self):
+    def test_fresh_live_owner_rows_not_claimed(self):
         _record()  # owner = this (live) process
         assert dl.sweep_recoverable() == []
+
+    def test_live_owner_failed_row_retries_after_backoff(self):
+        _record()
+        dl.mark_failed("ob-1", "temporary rejection")
+        future = time.time() + dl.RETRY_BASE_SECONDS + 1
+
+        claimed = dl.sweep_recoverable(now=future)
+
+        assert len(claimed) == 1
+        assert claimed[0]["needs_marker"] is True
+        assert claimed[0]["attempts"] == 1
+
+    def test_live_owner_pending_row_retries_after_lease(self):
+        _record()
+        future = time.time() + dl.LIVE_OWNER_LEASE_SECONDS + 1
+
+        claimed = dl.sweep_recoverable(now=future)
+
+        assert len(claimed) == 1
+        assert claimed[0]["needs_marker"] is False
+
+    def test_live_owner_attempting_row_waits_for_lease_then_uses_marker(self):
+        _record()
+        dl.mark_attempting("ob-1")
+        assert dl.sweep_recoverable(
+            now=time.time() + dl.LIVE_OWNER_LEASE_SECONDS - 1
+        ) == []
+
+        claimed = dl.sweep_recoverable(
+            now=time.time() + dl.LIVE_OWNER_LEASE_SECONDS + 1
+        )
+        assert len(claimed) == 1
+        assert claimed[0]["needs_marker"] is True
 
     def test_dead_owner_pending_claimed_without_marker(self):
         _record()
@@ -281,6 +315,25 @@ class TestGatewayRedeliverySweep:
             n = await runner._redeliver_pending_obligations()
         assert n == 0
         adapter.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_periodic_watcher_recovers_without_gateway_restart(self):
+        runner = self._runner()
+        runner._running = True
+        calls = 0
+
+        async def sweep_once():
+            nonlocal calls
+            calls += 1
+            runner._running = False
+            return 0
+
+        runner._redeliver_pending_obligations = sweep_once
+        await runner._delivery_obligation_watcher(
+            interval=0.01,
+            initial_delay=0,
+        )
+        assert calls == 1
 
 
 class TestAttemptsOnlySpentOnRealSends:

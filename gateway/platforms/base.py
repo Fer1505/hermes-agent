@@ -1939,6 +1939,58 @@ class SendResult:
     error_kind: Optional[str] = None
 
 
+_PROVIDER_PROOF_REQUIRED_PLATFORMS = frozenset({
+    "bluebubbles",
+    "photon",
+    "signal",
+    "sms",
+    "telegram",
+    "whatsapp",
+})
+
+
+def provider_delivery_proof_required(platform: Any) -> bool:
+    """Whether an adapter success boolean is insufficient delivery proof."""
+    return _platform_name(platform) in _PROVIDER_PROOF_REQUIRED_PLATFORMS
+
+
+def extract_provider_delivery_proof(result: Any, platform: Any) -> Optional[dict]:
+    """Return a small provider-specific delivery proof, never a raw response."""
+    platform_name = _platform_name(platform)
+
+    def _value(name: str):
+        if isinstance(result, dict):
+            return result.get(name)
+        return getattr(result, name, None)
+
+    if not bool(_value("success")):
+        return None
+
+    message_id = _value("message_id") or _value("provider_message_id")
+    if message_id:
+        return {"kind": "message_id", "value": str(message_id)}
+    message_ids = _value("message_ids") or _value("continuation_message_ids")
+    if message_ids:
+        values = [str(value) for value in message_ids if value]
+        if values:
+            return {"kind": "message_ids", "values": values}
+
+    if platform_name == "signal":
+        timestamps = _value("provider_timestamps") or []
+        raw = _value("raw_response")
+        if isinstance(raw, dict):
+            timestamp = raw.get("provider_timestamp") or raw.get("timestamp")
+            nested = raw.get("result")
+            if not timestamp and isinstance(nested, dict):
+                timestamp = nested.get("timestamp")
+            if timestamp:
+                timestamps = [*timestamps, timestamp]
+        values = [str(value) for value in timestamps if value]
+        if values:
+            return {"kind": "provider_timestamp", "values": values}
+    return None
+
+
 # Machine-readable send-failure categories.  Kept platform-neutral so every
 # adapter can populate ``SendResult.error_kind`` from the same vocabulary and
 # the gateway can decide — once, in one place — whether a failure is worth
@@ -4703,6 +4755,20 @@ class BasePlatformAdapter(ABC):
             return
         self._start_session_processing(pending_event, session_key)
 
+    async def _begin_inbound_effect(self, event: MessageEvent) -> bool:
+        """Fence platform-specific durable work before runner/provider effects."""
+        return True
+
+    async def _finish_inbound_effect(
+        self,
+        event: MessageEvent,
+        *,
+        success: bool,
+        error: object | None = None,
+    ) -> None:
+        """Commit or quarantine a platform-specific durable inbound claim."""
+        return None
+
     async def _dispatch_active_session_command(
         self,
         event: MessageEvent,
@@ -4732,10 +4798,16 @@ class BasePlatformAdapter(ABC):
         command_guard = asyncio.Event()
         self._active_sessions[session_key] = command_guard
         thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+        effect_started = False
+        effect_finished = False
 
         try:
+            effect_started = await self._begin_inbound_effect(event)
+            if not effect_started:
+                raise RuntimeError("durable inbound effect claim was refused")
             response = await self._message_handler(event)
             _text, _eph_ttl = self._unwrap_ephemeral(response)
+            effect_success = True
             # Send the response BEFORE cancelling the old task so the send
             # cannot be affected by task-cancellation side effects (race
             # condition fix — issue #18912).  Previously the send happened
@@ -4755,6 +4827,7 @@ class BasePlatformAdapter(ABC):
                     reply_to=_reply_anchor_for_event(event),
                     metadata=_mark_notify_metadata(thread_meta),
                 )
+                effect_success = bool(_r.success)
                 if _eph_ttl > 0 and _r.success and _r.message_id:
                     self._schedule_ephemeral_delete(
                         chat_id=event.source.chat_id,
@@ -4768,7 +4841,14 @@ class BasePlatformAdapter(ABC):
                 release_guard=False,
                 discard_pending=False,
             )
-        except Exception:
+            await self._finish_inbound_effect(
+                event, success=effect_success,
+                error=None if effect_success else "command response delivery failed",
+            )
+            effect_finished = True
+        except Exception as exc:
+            if effect_started and not effect_finished:
+                await self._finish_inbound_effect(event, success=False, error=exc)
             # On failure, restore the original guard if one still exists so
             # we don't leave the session in a half-reset state.
             if self._active_sessions.get(session_key) is command_guard:
@@ -4851,10 +4931,16 @@ class BasePlatformAdapter(ABC):
                     "[%s] Command '/%s' bypassing active-session guard for %s",
                     self.name, cmd, session_key,
                 )
+                effect_started = False
+                effect_finished = False
                 try:
+                    effect_started = await self._begin_inbound_effect(event)
+                    if not effect_started:
+                        return
                     _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
                     response = await self._message_handler(event)
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
+                    effect_success = True
                     if _text:
                         _r = await self._send_with_retry(
                             chat_id=event.source.chat_id,
@@ -4862,13 +4948,21 @@ class BasePlatformAdapter(ABC):
                             reply_to=_reply_anchor_for_event(event),
                             metadata=_mark_notify_metadata(_thread_meta),
                         )
+                        effect_success = bool(_r.success)
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
                                 chat_id=event.source.chat_id,
                                 message_id=_r.message_id,
                                 ttl_seconds=_eph_ttl,
                             )
+                    await self._finish_inbound_effect(
+                        event, success=effect_success,
+                        error=None if effect_success else "command response delivery failed",
+                    )
+                    effect_finished = True
                 except Exception as e:
+                    if effect_started and not effect_finished:
+                        await self._finish_inbound_effect(event, success=False, error=e)
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
                 return
 
@@ -4902,12 +4996,18 @@ class BasePlatformAdapter(ABC):
                         "[%s] Routing message to clarify text-intercept for %s",
                         self.name, session_key,
                     )
+                    effect_started = False
+                    effect_finished = False
                     try:
+                        effect_started = await self._begin_inbound_effect(event)
+                        if not effect_started:
+                            return
                         _thread_meta = _thread_metadata_for_source(
                             event.source, _reply_anchor_for_event(event)
                         )
                         response = await self._message_handler(event)
                         _text, _eph_ttl = self._unwrap_ephemeral(response)
+                        effect_success = True
                         if _text:
                             _r = await self._send_with_retry(
                                 chat_id=event.source.chat_id,
@@ -4915,13 +5015,21 @@ class BasePlatformAdapter(ABC):
                                 reply_to=_reply_anchor_for_event(event),
                                 metadata=_mark_notify_metadata(_thread_meta),
                             )
+                            effect_success = bool(_r.success)
                             if _eph_ttl > 0 and _r.success and _r.message_id:
                                 self._schedule_ephemeral_delete(
                                     chat_id=event.source.chat_id,
                                     message_id=_r.message_id,
                                     ttl_seconds=_eph_ttl,
                                 )
+                        await self._finish_inbound_effect(
+                            event, success=effect_success,
+                            error=None if effect_success else "clarify response delivery failed",
+                        )
+                        effect_finished = True
                     except Exception as e:
+                        if effect_started and not effect_finished:
+                            await self._finish_inbound_effect(event, success=False, error=e)
                         logger.error(
                             "[%s] Clarify text-intercept dispatch failed: %s",
                             self.name, e, exc_info=True,
@@ -5008,6 +5116,8 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        effect_started = False
+        effect_finished = False
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -5053,6 +5163,14 @@ class BasePlatformAdapter(ABC):
 
         try:
             await self._run_processing_hook("on_processing_start", event)
+
+            effect_started = await self._begin_inbound_effect(event)
+            if not effect_started:
+                logger.warning(
+                    "[%s] Refusing replay at an existing durable inbound effect fence",
+                    self.name,
+                )
+                return
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
@@ -5273,12 +5391,25 @@ class BasePlatformAdapter(ABC):
                                 mark_failed,
                             )
 
-                            if getattr(result, "success", False):
+                            _platform = getattr(
+                                event.source.platform, "value", event.source.platform
+                            )
+                            _proof = extract_provider_delivery_proof(result, _platform)
+                            if (
+                                getattr(result, "success", False)
+                                and (
+                                    not provider_delivery_proof_required(_platform)
+                                    or _proof is not None
+                                )
+                            ):
                                 mark_delivered(_obligation_id)
                             else:
                                 mark_failed(
                                     _obligation_id,
-                                    str(getattr(result, "error", "") or ""),
+                                    str(
+                                        getattr(result, "error", "")
+                                        or "provider delivery proof missing"
+                                    ),
                                 )
                         except Exception:
                             logger.debug(
@@ -5443,6 +5574,12 @@ class BasePlatformAdapter(ABC):
                 event,
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
+            await self._finish_inbound_effect(
+                event,
+                success=processing_ok,
+                error=None if processing_ok else "runner or provider delivery failed",
+            )
+            effect_finished = True
 
             # The active drain owns debounce state. If a queue-mode timer has
             # not fired yet, force-flush into _pending_messages here and let
@@ -5494,9 +5631,17 @@ class BasePlatformAdapter(ABC):
             if current_task is None or current_task not in self._expected_cancelled_tasks:
                 outcome = ProcessingOutcome.FAILURE
             await self._run_processing_hook("on_processing_complete", event, outcome)
+            if effect_started and not effect_finished:
+                await self._finish_inbound_effect(
+                    event, success=False, error="message processing cancelled"
+                )
+                effect_finished = True
             raise
         except Exception as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
+            if effect_started and not effect_finished:
+                await self._finish_inbound_effect(event, success=False, error=e)
+                effect_finished = True
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             try:

@@ -12,6 +12,7 @@ import logging
 import os
 import select
 import shlex
+import stat
 import subprocess
 import threading
 import time
@@ -179,6 +180,47 @@ def touch_activity_if_due(
         pass
 
 
+def ensure_private_directory(path: Path) -> Path:
+    """Create or correct an owner-private directory without following a leaf symlink.
+
+    POSIX callers get an exact ``0700`` mode and an owner check through an
+    opened directory descriptor, closing the lstat/chmod race. Windows retains
+    the symlink/type checks while relying on its ACL model.
+    """
+
+    path = Path(path)
+    if path.is_symlink():
+        raise RuntimeError(f"Refusing symlinked sandbox directory: {path}")
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise RuntimeError(f"Refusing symlinked sandbox directory: {path}")
+    if not path.is_dir():
+        raise RuntimeError(f"Sandbox path is not a directory: {path}")
+
+    if os.name != "posix":
+        return path
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RuntimeError(f"Could not securely open sandbox directory: {path}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError(f"Sandbox path is not a directory: {path}")
+        if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
+            raise RuntimeError(f"Sandbox directory is not owned by the current user: {path}")
+        os.fchmod(descriptor, 0o700)
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o700:
+            raise RuntimeError(f"Sandbox directory is not owner-private: {path}")
+    finally:
+        os.close(descriptor)
+    return path
+
+
 def get_sandbox_dir() -> Path:
     """Return the host-side root for all sandbox storage (Docker workspaces,
     Singularity overlays/SIF cache, etc.).
@@ -190,8 +232,7 @@ def get_sandbox_dir() -> Path:
         p = Path(custom)
     else:
         p = get_hermes_home() / "sandboxes"
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    return ensure_private_directory(p)
 
 
 # ---------------------------------------------------------------------------

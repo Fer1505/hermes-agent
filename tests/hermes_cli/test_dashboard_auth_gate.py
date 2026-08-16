@@ -39,15 +39,14 @@ def test_loopback_status_is_public(client_loopback):
     assert "version" in body
 
 
-def test_loopback_protected_route_requires_token(client_loopback):
-    """Any non-public /api/ route must require the session token."""
-    # /api/sessions exists and is auth-gated by auth_middleware.
+def test_loopback_api_uses_host_boundary_without_browser_token(client_loopback):
+    """Loopback no-auth mode must not depend on a browser bearer token."""
     r = client_loopback.get("/api/sessions")
-    assert r.status_code == 401
+    assert r.status_code != 401
 
 
-def test_loopback_protected_route_accepts_session_token(client_loopback):
-    """The injected SPA token unlocks protected /api/ routes."""
+def test_loopback_legacy_session_header_is_harmless(client_loopback):
+    """Older clients may still send the retired header during rollout."""
     r = client_loopback.get(
         "/api/sessions",
         headers={"X-Hermes-Session-Token": web_server._SESSION_TOKEN},
@@ -59,16 +58,22 @@ def test_loopback_protected_route_accepts_session_token(client_loopback):
     )
 
 
-def test_loopback_index_injects_session_token(client_loopback):
-    """Loopback mode keeps injecting the SPA token into index.html.
-
-    This is the property that the new auth gate MUST disable once a gated
-    bind is detected. Phase 3 will add an inverse test for the gated path.
-    """
+def test_loopback_index_never_injects_session_token(client_loopback):
+    """No-auth mode must not disclose an unnecessary bearer credential."""
     r = client_loopback.get("/")
     if r.status_code == 404:
         pytest.skip("WEB_DIST not built in this env")
-    assert "__HERMES_SESSION_TOKEN__" in r.text
+    assert "__HERMES_SESSION_TOKEN__" not in r.text
+    assert web_server._SESSION_TOKEN not in r.text
+
+
+def test_health_is_structured_and_token_free(client_loopback):
+    r = client_loopback.get("/health")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/json")
+    assert r.json() == {"status": "ok"}
+    assert "__HERMES_SESSION_TOKEN__" not in r.text
+    assert web_server._SESSION_TOKEN not in r.text
 
 
 def test_loopback_host_header_validation_still_enforced(client_loopback):

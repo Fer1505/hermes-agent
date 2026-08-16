@@ -7141,7 +7141,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 result = None
             try:
-                if result is not None and getattr(result, "success", False):
+                from gateway.platforms.base import (
+                    extract_provider_delivery_proof,
+                    provider_delivery_proof_required,
+                )
+                _proof = extract_provider_delivery_proof(result, row["platform"])
+                if (
+                    result is not None
+                    and getattr(result, "success", False)
+                    and (
+                        not provider_delivery_proof_required(row["platform"])
+                        or _proof is not None
+                    )
+                ):
                     mark_delivered(row["obligation_id"])
                     redelivered += 1
                     logger.info(
@@ -7153,7 +7165,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     mark_failed(
                         row["obligation_id"],
-                        str(getattr(result, "error", "") or "send failed"),
+                        str(
+                            getattr(result, "error", "")
+                            or "provider delivery proof missing"
+                        ),
                     )
             except Exception:
                 logger.debug("delivery ledger update failed", exc_info=True)
@@ -8042,6 +8057,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Start background session expiry watcher to finalize expired sessions
         self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
 
+        # Startup recovery is not enough for a daemon that stays healthy while
+        # one adapter send fails. Sweep the durable ledger periodically so an
+        # expired same-process lease is retried without waiting for a restart.
+        self._spawn_supervised(
+            self._delivery_obligation_watcher,
+            "delivery_obligation_watcher",
+        )
+
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
         # so human-in-the-loop workflows hear back without polling.
@@ -8601,6 +8624,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if not self._running:
                     break
                 await asyncio.sleep(1)
+
+    async def _delivery_obligation_watcher(
+        self,
+        interval: float = 60.0,
+        *,
+        initial_delay: Optional[float] = None,
+    ) -> None:
+        """Continuously recover expired delivery leases with bounded cadence."""
+        delay = interval if initial_delay is None else initial_delay
+        if delay > 0:
+            await asyncio.sleep(delay)
+        while self._running:
+            try:
+                await self._redeliver_pending_obligations()
+            except Exception:
+                logger.exception("Periodic delivery-obligation recovery failed")
+            if not self._running:
+                return
+            await asyncio.sleep(max(0.01, interval))
 
     def _active_profile_name(self) -> str:
         """Return the profile name this gateway represents."""

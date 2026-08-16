@@ -73,8 +73,8 @@ export type BuildWsUrl = (
   params?: Record<string, string>,
 ) => Promise<string>;
 
-/** Lower-level: just the ``[authParamName, authParamValue]`` pair. */
-export type BuildWsAuthParam = () => Promise<[string, string]>;
+/** Lower-level auth pair; undefined when dashboard auth is disabled. */
+export type BuildWsAuthParam = () => Promise<[string, string] | undefined>;
 
 // ---------------------------------------------------------------------------
 // Registry surface (window.__HERMES_PLUGINS__)

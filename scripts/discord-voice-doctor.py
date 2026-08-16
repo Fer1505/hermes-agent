@@ -28,6 +28,18 @@ WARN = "\033[93m!\033[0m"
 
 # Track whether discord.py is available for later sections
 _discord_available = False
+_PYNACL_SECURITY_FLOOR = (1, 6, 2)
+
+
+def _pynacl_is_security_current(version):
+    """Return whether *version* includes the CVE-2025-69277 fix."""
+    if not isinstance(version, str):
+        return False
+    parts = version.split(".")
+    if not parts or any(not part.isdigit() for part in parts):
+        return False
+    release = tuple(int(part) for part in parts)
+    return release >= _PYNACL_SECURITY_FLOOR
 
 
 def mask(value):
@@ -69,22 +81,30 @@ def check_packages():
         _discord_available = True
         check("discord.py", True, f"v{discord.__version__}")
     except ImportError:
-        check("discord.py", False, "pip install discord.py[voice]")
+        check("discord.py", False, "reinstall hermes-agent[messaging]")
         ok = False
 
     # PyNaCl
     try:
         import nacl
         ver = getattr(nacl, "__version__", "unknown")
-        try:
-            import nacl.secret
-            nacl.secret.Aead(bytes(32))
-            check("PyNaCl", True, f"v{ver}")
-        except (AttributeError, Exception):
-            check("PyNaCl (Aead)", False, f"v{ver} — need >=1.5.0")
+        if not _pynacl_is_security_current(ver):
+            check(
+                "PyNaCl",
+                False,
+                f"v{ver} — need >=1.6.2 (GHSA-mrfv-m5wm-5w6w)",
+            )
             ok = False
+        else:
+            try:
+                import nacl.secret
+                nacl.secret.Aead(bytes(32))
+                check("PyNaCl", True, f"v{ver}")
+            except Exception:
+                check("PyNaCl (Aead)", False, f"v{ver} — voice API unavailable")
+                ok = False
     except ImportError:
-        check("PyNaCl", False, "pip install PyNaCl>=1.5.0")
+        check("PyNaCl", False, "reinstall hermes-agent[messaging] (PyNaCl>=1.6.2)")
         ok = False
 
     # davey (DAVE E2EE)

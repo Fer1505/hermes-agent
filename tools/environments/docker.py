@@ -645,7 +645,7 @@ class DockerEnvironment(BaseEnvironment):
         # Persistent workspace via bind mounts from a configurable host directory
         # (TERMINAL_SANDBOX_DIR, default ~/.hermes/sandboxes/). Non-persistent
         # mode uses tmpfs (ephemeral, fast, gone on cleanup).
-        from tools.environments.base import get_sandbox_dir
+        from tools.environments.base import ensure_private_directory, get_sandbox_dir
 
         # User-configured volume mounts (from config.yaml docker_volumes)
         volume_args = []
@@ -678,15 +678,16 @@ class DockerEnvironment(BaseEnvironment):
         self._home_dir: Optional[str] = None
         writable_args = []
         if self._persistent:
-            sandbox = get_sandbox_dir() / "docker" / task_id
+            docker_root = ensure_private_directory(get_sandbox_dir() / "docker")
+            sandbox = ensure_private_directory(docker_root / task_id)
             self._home_dir = str(sandbox / "home")
-            os.makedirs(self._home_dir, exist_ok=True)
+            ensure_private_directory(Path(self._home_dir))
             writable_args.extend([
                 "-v", f"{self._home_dir}:/root",
             ])
             if not bind_host_cwd and not workspace_explicitly_mounted:
                 self._workspace_dir = str(sandbox / "workspace")
-                os.makedirs(self._workspace_dir, exist_ok=True)
+                ensure_private_directory(Path(self._workspace_dir))
                 writable_args.extend([
                     "-v", f"{self._workspace_dir}:/workspace",
                 ])

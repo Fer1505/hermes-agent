@@ -159,18 +159,24 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # uploaded to the Discord gateway fails to decode at att.read() with
     # "Can not decode content-encoding: br" — see #12511 / #15744.
     "platform.discord": (
-        "discord.py[voice]==2.7.1",
+        # Released discord.py 2.7.1 caps its [voice] extra at PyNaCl<1.6.
+        # Express the same voice stack directly until upstream releases its
+        # PyNaCl>=1.6,<1.7 metadata so the security-fixed pin can resolve.
+        "discord.py==2.7.1",
         "brotlicffi==1.2.0.1",
         # discord.py pulls aiohttp transitively (>=3.7.4,<4) as its HTTP
         # backbone. Pin the patched floor here too so the lazy Discord path
         # can't keep an already-installed vulnerable aiohttp satisfying that
         # range — mirrors the messaging extra and platform.slack.
-        "aiohttp==3.14.1",  # CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
+        "aiohttp==3.14.3",  # GHSA-cq5v-8q36-5273 / CVE-2026-69244
+        # discord.py[voice] allows vulnerable PyNaCl 1.5.x; pin libsodium fix.
+        "PyNaCl==1.6.2",  # GHSA-mrfv-m5wm-5w6w / CVE-2025-69277
+        "davey==0.1.4",
     ),
     "platform.slack": (
         "slack-bolt==1.29.0",
         "slack-sdk==3.43.0",
-        "aiohttp==3.14.1",  # CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
+        "aiohttp==3.14.3",  # GHSA-cq5v-8q36-5273 / CVE-2026-69244
     ),
     "platform.matrix": (
         "mautrix[encryption]==0.21.0",
@@ -180,7 +186,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         # mautrix (aiohttp>=3,<4) and aiohttp-socks (aiohttp>=3.10.0) only cap
         # aiohttp transitively, so a vulnerable already-installed aiohttp still
         # satisfies both — pin the patched floor here too, like platform.discord.
-        "aiohttp==3.14.1",  # CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
+        "aiohttp==3.14.3",  # GHSA-cq5v-8q36-5273 / CVE-2026-69244
     ),
     "platform.dingtalk": (
         "dingtalk-stream==0.24.3",
@@ -199,7 +205,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # (microsoft-teams-api/cards/common, dependency-injector, msal). Lazy-
     # installed on demand like every other messaging platform; also exposed
     # as the `teams` extra in pyproject for packagers / explicit installs.
-    "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.1"),  # aiohttp 3.14.1: CVE-2026-34993(RCE)/47265 + 34513/34518/34519/34520/34525
+    "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.3"),  # GHSA-cq5v-8q36-5273 / CVE-2026-69244
 
     # ─── Terminal backends ─────────────────────────────────────────────────
     "terminal.modal": ("modal==1.3.4",),

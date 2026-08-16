@@ -77,6 +77,13 @@ def test_gated_status_is_public(gated_app):
     assert "gateway_state" in body
 
 
+def test_health_is_public_and_minimal_in_gated_mode(gated_app):
+    r = gated_app.get("/health")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
+    assert web_server._SESSION_TOKEN not in r.text
+
+
 @pytest.mark.parametrize("path", [
     "/api/config/defaults",
     "/api/config/schema",

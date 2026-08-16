@@ -220,17 +220,18 @@ export async function getWsTicket(): Promise<{ ticket: string; ttl_seconds: numb
 }
 
 /**
- * Resolve the auth query-param pair (``[name, value]``) for a WebSocket
- * connect. In gated mode mints a fresh single-use ticket; in loopback
- * mode returns the injected session token.
+ * Resolve the optional auth query-param pair for a WebSocket connect. Gated
+ * mode mints a fresh single-use ticket; loopback no-auth mode has no bearer.
  */
-export async function buildWsAuthParam(): Promise<[string, string]> {
+export async function buildWsAuthParam(): Promise<[string, string] | undefined> {
   if (window.__HERMES_AUTH_REQUIRED__) {
     const { ticket } = await getWsTicket();
+    if (!ticket) {
+      throw new Error("Dashboard WebSocket ticket was empty");
+    }
     return ["ticket", ticket];
   }
-  const token = window.__HERMES_SESSION_TOKEN__ ?? "";
-  return ["token", token];
+  return undefined;
 }
 
 /**
@@ -269,7 +270,7 @@ export async function authedFetch(
 /**
  * Build an absolute ``ws(s)://`` URL for a dashboard WebSocket endpoint,
  * with the correct auth query param appended for the active mode (fresh
- * single-use ``ticket`` in gated mode, ``token`` in loopback). Plugins and
+ * single-use ``ticket`` in gated mode, none in loopback no-auth mode). Plugins and
  * the SPA should use this instead of hand-assembling a WS URL + reading
  * ``window.__HERMES_SESSION_TOKEN__`` directly, so the gated-mode ticket
  * path can never be forgotten.

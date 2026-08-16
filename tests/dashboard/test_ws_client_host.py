@@ -216,17 +216,14 @@ class TestGatewayWsUrlHost:
         assert url is not None
         assert url.startswith("ws://10.0.0.7:9120/api/ws")
 
-    def test_wildcard_keeps_query_string(
+    def test_wildcard_no_auth_uses_no_query_credential(
         self, saved_app_state, clear_ws_host_env
     ):
-        """Regression-guard: rewriting the host must not drop the
-        ``?token=`` or ``?internal=`` credential."""
+        """Rewriting the host must not introduce a disabled-auth token."""
         _set_bound(saved_app_state, "0.0.0.0", port=9119)
         url = web_server._build_gateway_ws_url()
         assert url is not None
-        assert "?" in url
-        # Loopback / ``--insecure`` path uses the session token.
-        assert f"token={web_server._SESSION_TOKEN}" in url
+        assert url == "ws://127.0.0.1:9119/api/ws"
 
     def test_no_bound_host_returns_none(
         self, saved_app_state, clear_ws_host_env
