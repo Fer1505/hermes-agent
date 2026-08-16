@@ -591,7 +591,7 @@ async def test_durable_busy_draining_rejection_is_fenced_and_archived(tmp_path):
 
     runner, adapter, event, session_key = _durable_busy_fixture(tmp_path, 64)
     runner._draining = True
-    runner._queue_during_drain_enabled = lambda: False
+    runner._queue_during_drain_enabled = lambda _mode=None: False
 
     disposition = await _dispatch_durable_busy(
         adapter, runner, event, session_key

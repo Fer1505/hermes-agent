@@ -11,8 +11,10 @@ Hermes Agent includes a full browser automation toolset with multiple backend op
 
 - **Browserbase cloud mode** via [Browserbase](https://browserbase.com) for managed cloud browsers and anti-bot tooling
 - **Browser Use cloud mode** via [Browser Use](https://browser-use.com) as an alternative cloud browser provider
+- **Browser Use mode** via the [Browser Use CLI 3.0](https://github.com/browser-use/browser-use) — a new browser harness that is SOTA for web tasks; automates your local Chrome or Browser Use cloud browsers
 - **Firecrawl cloud mode** via [Firecrawl](https://firecrawl.dev) for cloud browsers with built-in scraping
-- **Camofox self-hosted mode** via [Camofox](https://github.com/jo-inc/camofox-browser) for anti-detection browsing (Firefox-based fingerprint spoofing)
+- **Camofox local mode** via [Camofox](https://github.com/jo-inc/camofox-browser) for local anti-detection browsing (Firefox-based fingerprint spoofing)
+- **Lightpanda local engine** via [Lightpanda](https://lightpanda.io) — a headless browser built from scratch in Zig for machines; instant start up, 16x lower memory and 9x faster than Chrome, with automatic Chrome fallback for actions it doesn't support yet
 - **Local Chromium-family CDP** — connect browser tools to your own Chrome, Brave, Chromium, or Edge instance using `/browser connect`
 - **Local browser mode** via the `agent-browser` CLI and a local Chromium installation
 
@@ -58,7 +60,34 @@ To use Browser Use as your cloud browser provider, add:
 BROWSER_USE_API_KEY=***
 ```
 
-Get your API key at [browser-use.com](https://browser-use.com). Browser Use provides a cloud browser via its REST API. If both Browserbase and Browser Use credentials are set, Browserbase takes priority.
+Get your API key at [browser-use.com](https://browser-use.com).
+
+### Browser Use mode (default)
+
+Browser Use mode uses the [Browser Use CLI 3.0](https://github.com/browser-use/browser-use) — a new browser harness that is state-of-the-art at web tasks — instead of the built-in browser tools. The agent writes and executes Python in the browser to click, type, drag, scrape, and interact with webpages.
+
+**This is the default browser mode**: when `browser.backend` is unset and the `browser-use` CLI is runnable (installed, or available through `uvx`), the agent gets the single `browser_exec` tool. If the CLI can't run, Hermes falls back to the built-in browser tools automatically.
+
+The mode is a **driver** that composes with your configured browser backend: it drives your local Chrome, a Nous-subscription cloud browser, Browserbase, Firecrawl, or Browser Use cloud browsers — whichever browser source is selected in `hermes tools` → Browser Automation. The one exception is Camofox, which has no CDP endpoint for the harness to attach to; Camofox setups automatically keep the built-in browser tools.
+
+To opt out and force the built-in browser tools, use `/browser use off`, or:
+
+```yaml
+# Add to ~/.hermes/config.yaml
+browser:
+  backend: "off"
+```
+
+(`backend: "browser-use"` remains valid to force the mode explicitly.)
+
+Browser Use's own cloud browsers need `browser-use auth login` or `BROWSER_USE_API_KEY`; other browser sources use their existing credentials unchanged.
+
+:::note
+Because Browser Use mode executes model-written Python on your machine, the
+`browser_exec` tool is only offered to sessions that also have terminal
+access. Platforms configured without the terminal toolset (e.g. a locked-down
+messaging surface) keep the default browser tools instead.
+:::
 
 ### Firecrawl cloud mode
 
@@ -120,9 +149,9 @@ auto-installs it). Post-navigation redirects from a public URL onto a private
 address are still blocked (you can't use a redirect-to-internal trick to reach
 your LAN through the public path).
 
-### Camofox self-hosted mode
+### Camofox local mode
 
-[Camofox](https://github.com/jo-inc/camofox-browser) is a self-hosted Node.js server wrapping Camoufox (a Firefox fork with C++ fingerprint spoofing). It provides anti-detection browsing without a managed browser provider.
+[Camofox](https://github.com/jo-inc/camofox-browser) is a self-hosted Node.js server wrapping Camoufox (a Firefox fork with C++ fingerprint spoofing). It provides local anti-detection browsing without cloud dependencies.
 
 ```bash
 # Clone the Camofox browser server first
@@ -207,14 +236,6 @@ The rewrite only applies to page navigation URLs with loopback hosts (`localhost
 Or configure via `hermes tools` → Browser Automation → Camofox.
 
 When `CAMOFOX_URL` is set, all browser tools automatically route through Camofox instead of Browserbase or agent-browser.
-
-#### Network boundary and private URLs
-
-Hermes treats Camofox as co-resident only when the `CAMOFOX_URL` control authority is loopback (`localhost`, `127.0.0.0/8`, or `::1`). A Docker service name such as `camofox`, `host.docker.internal`, a LAN address, or a remote hostname is classified as an **external-uncontrolled** browser boundary. External Camofox therefore receives the same private/internal URL preflight as other externally positioned browsers; `browser.allow_private_urls: true` remains the explicit opt-out for ordinary private targets. Cloud metadata endpoints remain blocked in every mode.
-
-Navigate, click, key press, and back responses must contain the final main-frame URL. Hermes validates that returned URL before exposing page content. Unsafe landings are moved to `about:blank` on a best-effort basis and quarantined; later snapshots, images, screenshots, typing, and scrolling remain blocked until a verified navigation succeeds. If the Camofox REST response omits the final URL, Hermes reports `final_url_state: unknown` instead of substituting the requested URL.
-
-Tool results expose `browser_boundary` metadata including execution location, network boundary, control transport, and the current enforcement limits. This is observability, not browser-process isolation: the REST integration cannot police page subresources or WebSockets, pin DNS answers, or enforce Camofox process egress. Deploy external Camofox behind an outbound proxy, firewall, or egress relay when those guarantees are required.
 
 #### Persistent browser sessions
 
@@ -312,6 +333,28 @@ Adoption only fires until `tab_id` is populated for the session. If the external
 
 When Camofox runs in headed mode (with a visible browser window), it exposes a VNC port in its health check response. Hermes automatically discovers this and includes the VNC URL in navigation responses, so the agent can share a link for you to watch the browser live.
 
+### Lightpanda local engine
+
+[Lightpanda](https://lightpanda.io) is an open-source headless browser written from scratch. It starts instantly, runs 9x faster and uses 16x less memory than Chrome, which matters for agents that live on small VMs for long stretches.
+
+Lightpanda is a **local engine**, selected under the local `agent-browser` path (not a cloud provider). Install the binary and put it on your `PATH` (see the [Lightpanda installation guide](https://lightpanda.io/docs)), then set:
+
+```yaml
+# Add to ~/.hermes/config.yaml
+browser:
+  engine: lightpanda
+```
+
+Or via environment variable:
+
+```bash
+AGENT_BROWSER_ENGINE=lightpanda
+```
+
+Hermes drives Lightpanda through `agent-browser` over CDP, the same way it drives local Chrome.
+
+**Automatic Chrome fallback.** Lightpanda doesn't yet cover everything Chrome does, so the integration is non-disruptive: Lightpanda handles the actions it supports, and Hermes transparently retries on Chrome for anything it doesn't. The supported set covers the core agent workflow — navigate, snapshot, click, type, scroll, back, press, and eval. Screenshots also fall back to Chrome because Lightpanda has no graphical renderer; `browser_vision` is pre-routed straight to Chrome for the same reason.
+
 ### Local Chromium-family browser via CDP (`/browser connect`)
 
 Instead of a cloud provider, you can attach Hermes browser tools to your own running Chrome, Brave, Chromium, or Edge instance via the Chrome DevTools Protocol (CDP). This is useful when you want to see what the agent is doing in real-time, interact with pages that require your own cookies/sessions, or avoid cloud browser costs.
@@ -367,6 +410,8 @@ google-chrome \
 Then launch the Hermes CLI and run `/browser connect`.
 
 **Why `--user-data-dir`?** Without it, launching a Chromium-family browser while a regular instance is already running typically opens a new window on the existing process — and that existing process was not started with `--remote-debugging-port`, so port 9222 never opens. A dedicated user-data-dir forces a fresh browser process where the debug port actually listens. `--no-first-run --no-default-browser-check` skips the first-launch wizard for the fresh profile.
+
+**Chrome 136+ makes the dedicated profile mandatory.** As a security hardening change, Chrome 136 and later silently refuse to open the remote debugging port when `--remote-debugging-port` is combined with the *default* user-data-dir — even from a cold start with no other Chrome running. The browser launches normally but nothing ever listens on 9222, so `/browser connect` (and any manual `curl http://127.0.0.1:9222/json/version`) fails with connection refused. There is no error message. The fix is exactly the commands above: always pass a `--user-data-dir` pointing somewhere other than your default profile directory (e.g. `$HOME/.hermes/chrome-debug`). This applies to Chrome, Chromium, Edge, and Brave builds that have picked up the change.
 :::
 
 When connected via CDP, all browser tools (`browser_navigate`, `browser_click`, etc.) operate on your live browser instance instead of spinning up a cloud session.
@@ -410,6 +455,13 @@ BROWSERBASE_SESSION_TIMEOUT=1800
 # Inactivity timeout before auto-cleanup in seconds (default: 120)
 BROWSER_INACTIVITY_TIMEOUT=120
 
+# Local browser engine. Applies to the built-in browser tools
+# (agent-browser path). Equivalent to browser.engine in config.yaml.
+#   auto       — agent-browser's default (currently Chrome)
+#   lightpanda — Lightpanda
+#   chrome     — force Chrome explicitly
+AGENT_BROWSER_ENGINE=auto
+
 # Extra Chromium launch flags (comma- or newline-separated). Hermes auto-injects
 # `--no-sandbox,--disable-dev-shm-usage` when it detects root or AppArmor-restricted
 # unprivileged user namespaces (Ubuntu 23.10+, DGX Spark, many container images),
@@ -420,10 +472,12 @@ AGENT_BROWSER_ARGS=--no-sandbox
 
 ### Install agent-browser CLI
 
+You don't need to install anything — `agent-browser` resolves automatically via
+`npx agent-browser` on first browser-tool use. To avoid the one-time npx fetch,
+you can install it globally ahead of time (optional):
+
 ```bash
 npm install -g agent-browser
-# Or install locally in the repo:
-npm install
 ```
 
 :::info
@@ -532,14 +586,7 @@ Evaluation is unrestricted by default — the agent can use `fetch`, read storag
 
 Raw Chrome DevTools Protocol passthrough — the escape hatch for browser operations not covered by the other tools. Use for native dialog handling, iframe-scoped evaluation, cookie/network control, or any CDP verb the agent needs.
 
-**Disabled by default.** Raw CDP can read cookies and storage, evaluate arbitrary JavaScript, change network behavior, and invoke any protocol method. Enable it only for trusted sessions:
-
-```yaml
-browser:
-  allow_raw_cdp: true
-```
-
-The tool is available only when that opt-in is set and a CDP endpoint is reachable at session start — meaning `/browser connect` has attached to a running Chrome, Brave, Chromium, or Edge browser, or `browser.cdp_url` is set in `config.yaml`. The opt-in controls only the generic raw model-facing tool; `/browser connect`, the supervisor, dialog handling, snapshots, and normal high-level browser tools continue to work when it is false. The default local agent-browser mode and Camofox do not expose a raw CDP endpoint.
+**Only available when a CDP endpoint is reachable at session start** — meaning `/browser connect` has attached to a running Chrome, Brave, Chromium, or Edge browser, or `browser.cdp_url` is set in `config.yaml`. The default local agent-browser mode, Camofox, and cloud providers (Browserbase, Browser Use, Firecrawl) do not currently expose CDP to this tool — cloud providers have per-session CDP URLs but live-session routing is a follow-up.
 
 **CDP method reference:** https://chromedevtools.github.io/devtools-protocol/ — the agent can `web_extract` a specific method's page to look up parameters and return shape.
 

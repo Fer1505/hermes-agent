@@ -31,7 +31,54 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_document_from_bytes,
 )
-from gateway.platforms.helpers import strip_markdown
+from .media_cache import ext_for_mime
+from gateway.platforms.helpers import compile_mention_patterns, strip_markdown
+
+# Historical BlueBubbles mime→ext maps, preserved verbatim as overrides for
+# the shared dispatch in gateway.platforms.media_cache. Both maps are
+# CLOSED: unlisted mimes fall back to .jpg / .mp3 (never mimetypes).
+_BLUEBUBBLES_IMAGE_EXT_OVERRIDES = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/heic": ".jpg",  # preserves historical bluebubbles mapping
+    "image/heif": ".jpg",  # preserves historical bluebubbles mapping
+    "image/tiff": ".jpg",  # preserves historical bluebubbles mapping
+}
+_BLUEBUBBLES_AUDIO_EXT_OVERRIDES = {
+    "audio/mp3": ".mp3",
+    "audio/mpeg": ".mp3",
+    "audio/ogg": ".ogg",
+    "audio/wav": ".wav",
+    "audio/x-caf": ".mp3",  # preserves historical bluebubbles mapping
+    "audio/mp4": ".m4a",
+    "audio/aac": ".m4a",  # preserves historical bluebubbles mapping (shared table says .aac)
+}
+
+from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
+from agent.secret_scope import get_secret as _scoped_get_secret
+
+
+def _get_scoped_secret(name, default=None):
+    """Scope-aware credential read with the default-profile startup fallback.
+
+    Secondary profiles construct their adapters under a profile secret
+    scope -- the scope is authoritative and a scoped miss returns ``default``
+    (no cross-profile borrow from ``os.environ``, which may hold another
+    profile's value). The DEFAULT profile's adapter constructs and sends
+    *unscoped* under multiplexing, where a bare ``get_secret`` would raise
+    ``UnscopedSecretError`` and crash this path; there ``os.environ`` is that
+    profile's own value, so fall back to it. Same pattern as the Slack
+    ``SLACK_APP_TOKEN`` read (#59739) and
+    ``gateway/platforms/whatsapp_common.py::_get_wsecret``.
+    """
+    try:
+        val = _scoped_get_secret(name, default)
+    except _UnscopedSecretError:
+        val = os.getenv(name)
+    return val if val is not None else default
+
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +173,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self.server_url = _normalize_server_url(
             extra.get("server_url") or os.getenv("BLUEBUBBLES_SERVER_URL", "")
         )
-        self.password = extra.get("password") or os.getenv("BLUEBUBBLES_PASSWORD", "")
+        self.password = extra.get("password") or _get_scoped_secret("BLUEBUBBLES_PASSWORD", "")
         self.webhook_host = (
             extra.get("webhook_host")
             or os.getenv("BLUEBUBBLES_WEBHOOK_HOST", DEFAULT_WEBHOOK_HOST)
@@ -155,7 +202,6 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._runner = None
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
-        self._webhook_active: bool = False
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
 
     # ------------------------------------------------------------------
@@ -166,21 +212,6 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         sep = "&" if "?" in path else "?"
         return f"{self.server_url}{path}{sep}password={quote(self.password, safe='')}"
 
-    @property
-    def _server_url_for_log(self) -> str:
-        """Safe display form for the configured BlueBubbles server URL."""
-        return "[REDACTED BLUEBUBBLES SERVER URL]" if self.server_url else ""
-
-    @property
-    def _webhook_url_for_log(self) -> str:
-        """Safe display form for the local webhook listener URL."""
-        host = self.webhook_host
-        if host in {"0.0.0.0", "localhost", "::"}:
-            host = "127.0.0.1"
-        elif ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        return f"http://{host}:{self.webhook_port}/[REDACTED BLUEBUBBLES WEBHOOK PATH]"
-
     @staticmethod
     def _compile_mention_patterns(raw: Any) -> List[re.Pattern]:
         """Compile group-mention wake words from config/env.
@@ -188,34 +219,12 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         ``raw`` is a list (from config or env JSON), a string (raw env var:
         JSON list, or comma/newline-separated), or None (use Hermes defaults).
         """
-        if raw is None:
-            patterns = list(DEFAULT_MENTION_PATTERNS)
-        elif isinstance(raw, str):
-            text = raw.strip()
-            try:
-                loaded = json.loads(text) if text else []
-            except Exception:
-                loaded = None
-            patterns = loaded if isinstance(loaded, list) else [
-                part.strip()
-                for line in text.splitlines()
-                for part in line.split(",")
-            ]
-        elif isinstance(raw, list):
-            patterns = raw
-        else:
-            patterns = [raw]
-
-        compiled: List["re.Pattern"] = []
-        for pattern in patterns:
-            text = str(pattern).strip()
-            if not text:
-                continue
-            try:
-                compiled.append(re.compile(text, re.IGNORECASE))
-            except re.error as exc:
-                logger.warning("[bluebubbles] Invalid mention pattern %r: %s", text, exc)
-        return compiled
+        return compile_mention_patterns(
+            raw,
+            log_prefix="bluebubbles",
+            defaults=DEFAULT_MENTION_PATTERNS,
+            logger_=logger,
+        )
 
     def _message_matches_mention_patterns(self, text: str) -> bool:
         if not text or not self._mention_patterns:
@@ -253,17 +262,13 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(
-        self,
-        *,
-        start_webhook: bool = True,
-        is_reconnect: bool = False,
-    ) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.server_url or not self.password:
             logger.error(
                 "[bluebubbles] BLUEBUBBLES_SERVER_URL and BLUEBUBBLES_PASSWORD are required"
             )
             return False
+        from aiohttp import web
 
         # Tighter keepalive so idle CLOSE_WAIT drains promptly (#18451).
         from gateway.platforms._http_client_limits import platform_httpx_limits
@@ -276,24 +281,18 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             self._helper_connected = bool(server_data.get("helper_connected"))
             logger.info(
                 "[bluebubbles] connected to %s (private_api=%s, helper=%s)",
-                self._server_url_for_log,
+                self.server_url,
                 self._private_api_enabled,
                 self._helper_connected,
             )
         except Exception as exc:
             logger.error(
-                "[bluebubbles] cannot reach server at %s: %s", self._server_url_for_log, exc
+                "[bluebubbles] cannot reach server at %s: %s", self.server_url, exc
             )
             if self.client:
                 await self.client.aclose()
                 self.client = None
             return False
-
-        if not start_webhook:
-            self._mark_connected()
-            return True
-
-        from aiohttp import web
 
         # Explicit body cap: BlueBubbles webhook events are small JSON (or
         # form-encoded) payloads. client_max_size makes aiohttp enforce the
@@ -314,21 +313,18 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             "[bluebubbles] webhook listening on http://%s:%s%s",
             self.webhook_host,
             self.webhook_port,
-            "/[REDACTED BLUEBUBBLES WEBHOOK PATH]",
+            self.webhook_path,
         )
 
         # Register webhook with BlueBubbles server
         # This is required for the server to know where to send events
         await self._register_webhook()
-        self._webhook_active = True
 
         return True
 
     async def disconnect(self) -> None:
         # Unregister webhook before cleaning up
-        if self._webhook_active:
-            await self._unregister_webhook()
-            self._webhook_active = False
+        await self._unregister_webhook()
 
         if self.client:
             await self.client.aclose()
@@ -342,13 +338,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     def _webhook_url(self) -> str:
         """Compute the external webhook URL for BlueBubbles registration."""
         host = self.webhook_host
-        if host in {"0.0.0.0", "localhost", "::"}:
-            # BlueBubbles runs in Electron/Node on macOS and may resolve
-            # "localhost" to ::1 first.  The gateway listener defaults to
-            # IPv4 loopback, so register the reachable address explicitly.
-            host = "127.0.0.1"
-        elif ":" in host and not host.startswith("["):
-            host = f"[{host}]"
+        if host in {"0.0.0.0", "127.0.0.1", "localhost", "::"}:
+            host = "localhost"
         return f"http://{host}:{self.webhook_port}{self.webhook_path}"
 
     @property
@@ -368,8 +359,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
 
     @property
     def _webhook_register_url_for_log(self) -> str:
-        """Safe display form for the registered webhook URL."""
-        base = self._webhook_url_for_log
+        """Webhook registration URL safe for logs."""
+        base = self._webhook_url
         if self.password:
             return f"{base}?password=***"
         return base
@@ -876,29 +867,27 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             transfer_name = att_meta.get("transferName", "")
 
             if mime.startswith("image/"):
-                ext_map = {
-                    "image/jpeg": ".jpg",
-                    "image/png": ".png",
-                    "image/gif": ".gif",
-                    "image/webp": ".webp",
-                    "image/heic": ".jpg",
-                    "image/heif": ".jpg",
-                    "image/tiff": ".jpg",
-                }
-                ext = ext_map.get(mime, ".jpg")
+                ext = ext_for_mime(
+                    mime,
+                    overrides=_BLUEBUBBLES_IMAGE_EXT_OVERRIDES,
+                    # Historical map was closed: any unlisted image mime
+                    # fell back to .jpg without consulting mimetypes.
+                    use_defaults=False,
+                    use_mimetypes=False,
+                    fallback=".jpg",
+                ) or ".jpg"
                 return cache_image_from_bytes(data, ext)
 
             if mime.startswith("audio/"):
-                ext_map = {
-                    "audio/mp3": ".mp3",
-                    "audio/mpeg": ".mp3",
-                    "audio/ogg": ".ogg",
-                    "audio/wav": ".wav",
-                    "audio/x-caf": ".mp3",
-                    "audio/mp4": ".m4a",
-                    "audio/aac": ".m4a",
-                }
-                ext = ext_map.get(mime, ".mp3")
+                ext = ext_for_mime(
+                    mime,
+                    overrides=_BLUEBUBBLES_AUDIO_EXT_OVERRIDES,
+                    # Historical map was closed: any unlisted audio mime
+                    # fell back to .mp3 without consulting mimetypes.
+                    use_defaults=False,
+                    use_mimetypes=False,
+                    fallback=".mp3",
+                ) or ".mp3"
                 return cache_audio_from_bytes(data, ext)
 
             # Videos, documents, and everything else

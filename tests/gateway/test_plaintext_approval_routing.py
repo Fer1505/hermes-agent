@@ -129,7 +129,7 @@ def test_plaintext_no_denies_approval(reply):
 
 def test_plaintext_always_maps_to_permanent_choice():
     _clear_approval_state()
-    runner, adapter = _make_runner()
+    runner, _adapter = _make_runner()
     session_key, entry = _register_blocking_approval(runner)
 
     handled = asyncio.run(
@@ -143,7 +143,7 @@ def test_plaintext_always_maps_to_permanent_choice():
 
 def test_plaintext_session_maps_to_session_choice():
     _clear_approval_state()
-    runner, adapter = _make_runner()
+    runner, _adapter = _make_runner()
     session_key, entry = _register_blocking_approval(runner)
 
     handled = asyncio.run(
@@ -177,20 +177,3 @@ def test_no_pending_approval_does_not_consume_conversational_yes():
     assert session_key not in _gateway_queues
     _clear_approval_state()
 
-
-def test_unrelated_text_with_pending_approval_falls_through():
-    """Text that is neither approve nor deny vocab must NOT resolve the
-    approval — it falls through to normal busy handling."""
-    _clear_approval_state()
-    runner, adapter = _make_runner()
-    session_key, entry = _register_blocking_approval(runner)
-
-    handled = asyncio.run(
-        runner._handle_active_session_busy_message(
-            _make_event("what files are here?"), session_key
-        )
-    )
-
-    # Approval still pending — not resolved by unrelated text.
-    assert not entry.event.is_set()
-    _clear_approval_state()

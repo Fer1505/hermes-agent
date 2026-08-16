@@ -31,6 +31,11 @@ the SPA should bootstrap it after login instead.
 from __future__ import annotations
 
 PUBLIC_API_PATHS: frozenset[str] = frozenset({
+    # Minimal process liveness probe for desktop/backend boot handshakes. It
+    # intentionally avoids gateway config, platform discovery, MCP setup, and
+    # host-local detail so readiness checks cannot spend their budget inside
+    # cold plugin imports.
+    "/api/health",
     # Minimal token-free liveness route. It returns only {"status":"ok"}
     # and must remain usable before dashboard login.
     "/health",

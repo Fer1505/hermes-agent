@@ -4,34 +4,30 @@ Backup and import commands for hermes CLI.
 `hermes backup` creates a zip archive of the entire ~/.hermes/ directory
 (excluding the hermes-agent repo and transient files).
 
-`hermes import` restores a prevalidated backup zip into an empty HERMES_HOME
-root. Overlay imports are contained until a transactional merge design exists.
+`hermes import` restores from a backup zip, overlaying onto the current
+HERMES_HOME root.
 """
 
-import ctypes
-import hashlib
 import json
 import logging
 import os
-import secrets
 import shutil
 import sqlite3
-import stat
 import sys
 import tempfile
+import threading
 import time
 import zipfile
-from dataclasses import dataclass
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_constants import get_default_hermes_root, get_hermes_home, display_hermes_home
-from agent.file_safety import (
-    ProtectedFileCapability,
-    ProtectedFileOperation,
-    require_protected_control_file_capability,
-)
+
+# Shared formatter; the private alias is kept because claw.py and the backup
+# tests import ``_format_size`` from this module.
+from hermes_cli.sizefmt import format_bytes as _format_size
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +90,7 @@ _EXCLUDED_SUFFIXES = (
 
 # File names to skip (runtime state that's meaningless on another machine)
 _EXCLUDED_NAMES = {
+    ".backup.lock",
     "gateway.pid",
     "cron.pid",
 }
@@ -130,136 +127,95 @@ _IMPORT_SKIP_NAMES = {
     "gateway.lock",
     "processes.json",
 }
-_IMPORT_SKIP_NAMES_FOLDED = {name.casefold() for name in _IMPORT_SKIP_NAMES}
+
+# zipfile.open() drops Unix mode bits on extract; restore tightens these to 0600.
+_SECRET_FILE_NAMES = {".env", "auth.json", "state.db"}
 
 # Reserved archive subtree for provider state that lives OUTSIDE HERMES_HOME
 # (e.g. ~/.honcho, ~/.hindsight). The active memory provider declares these via
 # MemoryProvider.backup_paths(); they're stored under this prefix encoded
 # relative to the user's home directory, and restored to their original
-# home-relative location only when the currently active provider still
-# declares that exact file/directory root. Anything not under home is skipped.
+# home-relative location on import. Anything not under home is skipped.
 _EXTERNAL_PREFIX = "_external/"
 
-# Current full-backup archive contract. The manifest intentionally does not
-# hash itself; every other regular member must appear exactly once with its
-# uncompressed size and SHA-256 digest. New writers also bind the normalized
-# restored mode (0600 or 0700). Older v1 manifests without ``mode`` remain
-# readable, but restore conservatively as 0600 instead of trusting ZIP metadata.
-_BACKUP_MANIFEST_NAME = "_hermes_backup_manifest.json"
-_BACKUP_FORMAT = "hermes-backup"
-_BACKUP_FORMAT_VERSION = 1
 
-# Extraction quotas are deliberately constants rather than user-configurable
-# knobs: an archive must be safe to inspect before any user configuration is
-# trusted. They bound member count, per-file expansion, aggregate expansion,
-# and highly-compressible zip bombs.
-_MAX_BACKUP_MEMBERS = 100_000
-_MAX_BACKUP_MEMBER_BYTES = 2 * 1024 * 1024 * 1024
-_MAX_BACKUP_TOTAL_BYTES = 20 * 1024 * 1024 * 1024
-_MAX_BACKUP_COMPRESSION_RATIO = 500
-_COMPRESSION_RATIO_MIN_BYTES = 1024 * 1024
-_MAX_BACKUP_MANIFEST_BYTES = 8 * 1024 * 1024
-_COPY_CHUNK_BYTES = 1024 * 1024
+class BackupInProgressError(RuntimeError):
+    """Raised when another process already owns the Hermes backup slot."""
 
 
-class BackupError(RuntimeError):
-    """A fail-closed full backup or import validation error."""
+class _SQLiteSnapshotError(RuntimeError):
+    pass
 
 
-class BackupPromotedDurabilityError(BackupError):
-    """Archive was promoted but its directory entry could not be confirmed durable."""
-
-
-class RestoreActivatedDurabilityError(BackupError):
-    """Restored root is active but its directory entry durability is unknown."""
-
-
-class RestoreActivatedCleanupError(BackupError):
-    """Restored root is active but displaced-target cleanup was not confirmed."""
-
-
-class RestoreRolledBackError(BackupError):
-    """Restore activation failed and the original empty-target state was restored."""
-
-
-class RestoreRollbackError(BackupError):
-    """Restore activation failed and rollback could not be confirmed."""
-
-
-@dataclass(frozen=True)
-class _RestoreMember:
-    info: zipfile.ZipInfo
-    relative_path: str
-    target: Path
-    external: bool
-    skip_runtime: bool
-    expected_sha256: Optional[str]
-    verified_sha256: str
-    expected_mode: Optional[int]
-
-
-@dataclass(frozen=True)
-class _PrevalidatedMember:
-    info: zipfile.ZipInfo
-    effective_path: str
-    expected_sha256: Optional[str]
-    verified_sha256: str
-    expected_mode: Optional[int]
-
-
-def _collect_memory_provider_declared_paths() -> List[Path]:
-    """Return the active provider's declared backup paths, existing or not.
-
-    Provider discovery is config-only and does not initialize the provider or
-    perform network I/O. Once an external provider is explicitly active, a
-    load/backup_paths failure is a backup failure rather than permission to
-    silently omit the provider's durable state.
-    """
+@contextmanager
+def _backup_operation_lock(hermes_home: Path, timeout_seconds: float = 0.25):
+    """Acquire one cross-process backup slot for full and quick snapshots."""
+    lock_path = hermes_home / ".backup.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    acquired = False
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
     try:
-        from plugins.memory import _get_active_memory_provider, load_memory_provider
-    except Exception as exc:
-        raise BackupError(f"could not load memory-provider backup support: {exc}") from exc
+        if os.name == "nt":
+            import msvcrt
 
+            if lock_path.stat().st_size == 0:
+                handle.write(b" ")
+                handle.flush()
+            while True:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                    break
+                except (OSError, PermissionError):
+                    if time.monotonic() >= deadline:
+                        raise BackupInProgressError("another Hermes backup is already running")
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except (BlockingIOError, OSError):
+                    if time.monotonic() >= deadline:
+                        raise BackupInProgressError("another Hermes backup is already running")
+                    time.sleep(0.05)
+
+        yield
+    finally:
+        if acquired:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except (OSError, PermissionError):
+                pass
+        handle.close()
+
+
+@contextmanager
+def _atomic_output_path(final_path: Path):
+    """Yield a hidden sibling path and publish it only after a clean close."""
+    partial_path = final_path.with_name(
+        f".{final_path.name}.{os.getpid()}-{threading.get_ident()}.partial"
+    )
+    partial_path.unlink(missing_ok=True)
     try:
-        active = _get_active_memory_provider()
-    except Exception as exc:
-        raise BackupError(f"could not resolve the active memory provider: {exc}") from exc
-    if not active:
-        return []
-
-    try:
-        provider = load_memory_provider(active)
-    except Exception as exc:
-        raise BackupError(f"could not load active memory provider {active!r}: {exc}") from exc
-    if provider is None:
-        raise BackupError(f"could not load active memory provider {active!r}")
-
-    try:
-        declared = provider.backup_paths() or []
-    except Exception as exc:
-        raise BackupError(
-            f"backup_paths() failed for active memory provider {active!r}: {exc}"
-        ) from exc
-
-    out: List[Path] = []
-    seen: set[Path] = set()
-    for raw in declared:
-        try:
-            path = Path(raw).expanduser()
-        except Exception as exc:
-            raise BackupError(
-                f"active memory provider {active!r} declared an invalid backup path"
-            ) from exc
-        if not path.is_absolute():
-            raise BackupError(
-                f"active memory provider {active!r} declared a non-absolute backup path: {path}"
-            )
-        lexical = Path(os.path.abspath(path))
-        if lexical in seen:
-            continue
-        seen.add(lexical)
-        out.append(lexical)
-    return out
+        yield partial_path
+        os.replace(partial_path, final_path)
+    except BaseException:
+        partial_path.unlink(missing_ok=True)
+        raise
 
 
 def _collect_memory_provider_external_paths() -> List[Path]:
@@ -267,15 +223,52 @@ def _collect_memory_provider_external_paths() -> List[Path]:
     outside HERMES_HOME, resolved from config only (no network, no init).
 
     Reads ``memory.provider`` from config, loads just that provider, and asks
-    it for ``backup_paths()``. Missing declared paths are skipped because
-    there is no state to archive; provider discovery failures are surfaced by
-    :func:`_collect_memory_provider_declared_paths`.
+    it for ``backup_paths()``. Returns an empty list when no external provider
+    is active or the provider can't be loaded — backup must never fail because
+    of a flaky plugin.
     """
+    try:
+        from plugins.memory import _get_active_memory_provider, load_memory_provider
+    except Exception:
+        return []
+
+    try:
+        active = _get_active_memory_provider()
+    except Exception:
+        active = None
+    if not active:
+        return []
+
+    try:
+        provider = load_memory_provider(active)
+    except Exception:
+        provider = None
+    if provider is None:
+        return []
+
+    try:
+        declared = provider.backup_paths() or []
+    except Exception as exc:
+        logger.warning("backup_paths() failed for memory provider %r: %s", active, exc)
+        return []
+
     out: List[Path] = []
-    for path in _collect_memory_provider_declared_paths():
-        if not path.exists():
+    seen: set = set()
+    for raw in declared:
+        try:
+            p = Path(raw).expanduser()
+        except Exception:
             continue
-        out.append(path)
+        if not p.exists():
+            continue
+        try:
+            resolved = p.resolve()
+        except (OSError, ValueError):
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        out.append(p)
     return out
 
 
@@ -290,11 +283,7 @@ def _iter_external_files(base: Path) -> List[Path]:
         return files
     for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
         dp = Path(dirpath)
-        dirnames[:] = [
-            d
-            for d in dirnames
-            if d not in _EXCLUDED_DIRS and not (dp / d).is_symlink()
-        ]
+        dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIRS]
         for fname in filenames:
             fpath = dp / fname
             if fpath.is_symlink():
@@ -353,9 +342,9 @@ def _should_skip_backup_file(abs_path: Path, rel_path: Path, out_path: Path) -> 
 def _safe_copy_db(src: Path, dst: Path) -> bool:
     """Copy a SQLite database safely using the backup() API.
 
-    Handles WAL mode — produces a consistent snapshot even while the DB is
-    being written to. Fail closed if a consistent snapshot cannot be created:
-    copying only the live main file can omit committed WAL data.
+    Handles WAL mode — produces a consistent snapshot even while
+    the DB is being written to. Fail closed if a consistent snapshot cannot
+    be created: copying only the live main file can omit committed WAL data.
     """
     conn = None
     backup_conn = None
@@ -365,7 +354,7 @@ def _safe_copy_db(src: Path, dst: Path) -> bool:
         conn.backup(backup_conn)
         return True
     except Exception as exc:
-        logger.error("SQLite safe copy failed for %s: %s", src, exc)
+        logger.warning("SQLite safe copy failed for %s: %s", src, exc)
         try:
             dst.unlink(missing_ok=True)
         except OSError:
@@ -380,316 +369,214 @@ def _safe_copy_db(src: Path, dst: Path) -> bool:
                     pass
 
 
+def is_zeroed_sqlite_file(
+    path: Path, *, probe_bytes: int = 100, force: bool = False
+) -> bool:
+    """True when *path* looks like the #68474 zeroed-state.db signature.
+
+    Signature: size > 0, first *probe_bytes* are all NUL (no ``SQLite format 3``
+    header). Used at SessionDB open and for snapshot diagnostics so a silent
+    all-zero file becomes a guided recovery instead of a generic failure.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size <= 0:
+        return False
+    from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
+
+    head = read_header_bytes_preopen(
+        path, length=max(16, probe_bytes), force=force
+    )
+    if not head:
+        return False
+    if head.startswith(b"SQLite format 3"):
+        return False
+    return all(byte == 0 for byte in head)
+
+
+
+# ---------------------------------------------------------------------------
+# SQLite integrity verification
+# ---------------------------------------------------------------------------
+
+_SQLITE_HEADER = b"SQLite format 3\0"
+
+# Default ceiling above which ``PRAGMA integrity_check`` is skipped in favour
+# of the (O(1)) header + structural probe. ``integrity_check`` walks every
+# b-tree page in the file, so its cost scales with database size: on a 30 GB
+# state.db it runs for many minutes of pegged CPU with no output, which reads
+# to the user as a hung `hermes update` (#70553 follow-up). Sessions databases
+# in the tens of GB are normal for heavy users, so the size-unbounded check is
+# never an acceptable default on the update path.
+DEFAULT_INTEGRITY_CHECK_MAX_BYTES = 2 << 30  # 2 GiB
+
+
+def verify_sqlite_integrity(
+    path: Path,
+    *,
+    check_header: bool = True,
+    run_pragma: bool = True,
+    max_bytes: int = DEFAULT_INTEGRITY_CHECK_MAX_BYTES,
+) -> dict:
+    """Verify that a SQLite database at *path* is intact.
+
+    Checks, in order:
+      1. File exists and has an expected minimum size.
+      2. SQLite header magic bytes are present.
+      3. For files at or under ``max_bytes``, a read-only
+         ``PRAGMA integrity_check``. For larger files, a cheap structural
+         probe (schema read) instead — see ``max_bytes``.
+
+    Args:
+        path: Path to the database file.
+        check_header: When true (default), verify the SQLite header magic.
+        run_pragma: When true (default), run ``PRAGMA integrity_check`` via
+            a read-only connection and verify the result is ``"ok"``.
+        max_bytes: Size ceiling for the full ``PRAGMA integrity_check``.
+            Files larger than this fall back to the header check plus a
+            cheap structural probe, because ``integrity_check`` pages
+            through the ENTIRE file — minutes of silent pegged CPU on a
+            multi-GB database. Defaults to
+            :data:`DEFAULT_INTEGRITY_CHECK_MAX_BYTES` (2 GiB); pass ``0``
+            to force the full check regardless of size.
+
+    Returns:
+        A dict with keys:
+          - ``valid`` (bool): true when all requested checks passed.
+          - ``message`` (str): human-readable outcome or error detail.
+          - ``size`` (int | None): file size in bytes, or None if stat failed.
+    """
+    result: dict = {"valid": False, "message": "", "size": None}
+
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        result["message"] = f"not found: {path}"
+        return result
+    except OSError as exc:
+        result["message"] = f"cannot stat: {exc}"
+        return result
+
+    result["size"] = st.st_size
+
+    if st.st_size < 100:  # SQLite minimum viable size (header + 1 page)
+        result["message"] = f"too small ({st.st_size} bytes) to be a valid SQLite database"
+        return result
+
+    oversized = max_bytes > 0 and st.st_size > max_bytes
+
+    if check_header:
+        # Byte-level read: refused when a live connection exists, because
+        # close() would cancel this process's POSIX locks on the file (see
+        # hermes_cli.sqlite_safe_read). Verification targets snapshots and
+        # backup artifacts, which are offline by construction.
+        from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
+
+        head = read_header_bytes_preopen(path, length=len(_SQLITE_HEADER))
+        if head is None:
+            result["valid"] = False
+            result["message"] = "cannot read header"
+            return result
+        if head != _SQLITE_HEADER:
+            result["valid"] = False
+            result["message"] = (
+                f"missing SQLite header magic (got {head[:16].hex()!r})"
+            )
+            return result
+
+    if oversized:
+        # Too large to page through PRAGMA integrity_check (which is O(file
+        # size) and would peg a CPU for minutes on a multi-GB state.db).
+        # Fall back to a cheap O(1) structural probe: the header check above
+        # catches the #68474 zeroed signature, and opening the DB read-only
+        # plus reading sqlite_master + the page geometry catches the
+        # malformed-schema and truncated-header-page classes. Both are
+        # constant-time — they parse the schema, they do not walk the data.
+        run_pragma = False
+        probe = None
+        try:
+            probe = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+            probe.execute("PRAGMA schema_version").fetchone()
+            probe.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            result["valid"] = True
+            result["message"] = (
+                f"size {st.st_size:,} bytes exceeds max_bytes {max_bytes:,}; "
+                "skipped PRAGMA integrity_check (header + schema probe passed)"
+            )
+        except sqlite3.DatabaseError as exc:
+            result["valid"] = False
+            result["message"] = f"schema probe failed: {exc}"
+            return result
+        except Exception as exc:
+            result["valid"] = False
+            result["message"] = f"schema probe error: {exc}"
+            return result
+        finally:
+            if probe is not None:
+                try:
+                    probe.close()
+                except Exception:
+                    pass
+
+    if run_pragma:
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+            cursor = conn.execute("PRAGMA integrity_check")
+            rows = cursor.fetchall()
+            if len(rows) == 1 and rows[0][0] == "ok":
+                result["valid"] = True
+                result["message"] = "integrity check passed"
+                return result
+            errors = [str(r[0]) for r in rows]
+            result["message"] = f"integrity check failed: {'; '.join(errors[:5])}"
+            return result
+        except sqlite3.DatabaseError as exc:
+            result["message"] = f"cannot open database: {exc}"
+            return result
+        except Exception as exc:
+            result["message"] = f"integrity check error: {exc}"
+            return result
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    result["valid"] = True
+    if not result["message"]:
+        result["message"] = "header check passed"
+    return result
+
+
+def copy_db_and_verify(src: Path, dst: Path) -> bool:
+    """Like :func:`_safe_copy_db` but verifies the destination after copy.
+
+    Returns True only when the copy succeeded AND the destination is valid
+    SQLite (header + integrity check). Verification honours the default
+    size ceiling — a multi-GB destination gets the header + schema probe
+    rather than a full ``PRAGMA integrity_check`` that would page through
+    the whole file.
+    """
+    if not _safe_copy_db(src, dst):
+        return False
+    integrity = verify_sqlite_integrity(dst, run_pragma=True)
+    if not integrity.get("valid"):
+        try:
+            dst.unlink(missing_ok=True)
+        except OSError:
+            pass
+        logger.warning("Backup of %s failed integrity verification: %s", src, integrity.get("message"))
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Backup
 # ---------------------------------------------------------------------------
-
-def _format_size(nbytes: int) -> str:
-    """Human-readable file size."""
-    for unit in ("B", "KB", "MB", "GB"):
-        if nbytes < 1024:
-            return f"{nbytes:.1f} {unit}" if unit != "B" else f"{nbytes} {unit}"
-        nbytes /= 1024
-    return f"{nbytes:.1f} TB"
-
-
-def _normalized_archive_path(value: str, *, allow_directory: bool = False) -> str:
-    """Return a safe canonical POSIX archive path or raise ``BackupError``."""
-    if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
-        raise BackupError(f"unsafe archive member path: {value!r}")
-    if value.startswith("/"):
-        raise BackupError(f"absolute archive member path is not allowed: {value!r}")
-    raw = value[:-1] if allow_directory and value.endswith("/") else value
-    parts = raw.split("/")
-    if not raw or any(part in {"", ".", ".."} for part in parts):
-        raise BackupError(f"archive member path traversal is not allowed: {value!r}")
-    if parts[0].endswith(":"):
-        raise BackupError(f"drive-qualified archive member path is not allowed: {value!r}")
-    normalized = PurePosixPath(*parts).as_posix()
-    if normalized != raw:
-        raise BackupError(f"non-canonical archive member path is not allowed: {value!r}")
-    return normalized
-
-
-def _ensure_safe_filesystem_path(
-    anchor: Path,
-    target: Path,
-    *,
-    final_may_be_file: bool,
-    final_may_be_directory: bool,
-    allow_missing: bool,
-) -> Path:
-    """Validate containment and reject symlink/special-file components."""
-    anchor = anchor.resolve()
-    lexical = Path(os.path.abspath(target))
-    try:
-        relative = lexical.relative_to(anchor)
-    except ValueError as exc:
-        raise BackupError(f"path escapes its governed root: {target}") from exc
-
-    cursor = anchor
-    for index, part in enumerate(relative.parts):
-        cursor = cursor / part
-        is_final = index == len(relative.parts) - 1
-        try:
-            mode = cursor.lstat().st_mode
-        except FileNotFoundError:
-            if allow_missing:
-                continue
-            raise BackupError(f"declared backup path does not exist: {target}")
-        except OSError as exc:
-            raise BackupError(f"could not inspect governed path {cursor}: {exc}") from exc
-        if stat.S_ISLNK(mode):
-            raise BackupError(f"symlink path component is not allowed: {cursor}")
-        if is_final:
-            if stat.S_ISREG(mode) and final_may_be_file:
-                continue
-            if stat.S_ISDIR(mode) and final_may_be_directory:
-                continue
-            raise BackupError(f"special or unexpected target type is not allowed: {cursor}")
-        if not stat.S_ISDIR(mode):
-            raise BackupError(f"non-directory path component is not allowed: {cursor}")
-    return lexical
-
-
-def _zip_member_is_special(info: zipfile.ZipInfo) -> bool:
-    mode = (info.external_attr >> 16) & 0xFFFF
-    file_type = stat.S_IFMT(mode)
-    if info.is_dir():
-        return file_type not in {0, stat.S_IFDIR}
-    return file_type not in {0, stat.S_IFREG}
-
-
-def _enforce_member_quota(info: zipfile.ZipInfo) -> None:
-    if info.file_size < 0 or info.file_size > _MAX_BACKUP_MEMBER_BYTES:
-        raise BackupError(
-            f"archive member exceeds the {_format_size(_MAX_BACKUP_MEMBER_BYTES)} limit: "
-            f"{info.filename}"
-        )
-    if info.file_size >= _COMPRESSION_RATIO_MIN_BYTES:
-        if info.compress_size <= 0:
-            raise BackupError(f"archive member has an invalid compressed size: {info.filename}")
-        if info.file_size > info.compress_size * _MAX_BACKUP_COMPRESSION_RATIO:
-            raise BackupError(
-                f"archive member exceeds the {_MAX_BACKUP_COMPRESSION_RATIO}:1 "
-                f"compression-ratio limit: {info.filename}"
-            )
-
-
-def _checked_regular_source_stat(source: Path) -> os.stat_result:
-    try:
-        source_stat = source.lstat()
-    except OSError as exc:
-        raise BackupError(f"could not inspect backup source {source}: {exc}") from exc
-    if not stat.S_ISREG(source_stat.st_mode):
-        raise BackupError(f"backup source is not a regular non-symlink file: {source}")
-    if source_stat.st_nlink != 1:
-        raise BackupError(f"hard-linked backup source is not allowed: {source}")
-    return source_stat
-
-
-def _write_source_member(
-    zf: zipfile.ZipFile,
-    source: Path,
-    arcname: str,
-    *,
-    scope: str,
-) -> dict[str, object]:
-    arcname = _normalized_archive_path(arcname)
-    source_stat = _checked_regular_source_stat(source)
-    if source_stat.st_size > _MAX_BACKUP_MEMBER_BYTES:
-        raise BackupError(
-            f"backup source exceeds the per-member size limit: {source}"
-        )
-
-    timestamp = max(source_stat.st_mtime, 315532800.0)  # ZIP epoch: 1980-01-01
-    date_time = time.localtime(timestamp)[:6]
-    info = zipfile.ZipInfo(arcname, date_time=date_time)
-    info.compress_type = zipfile.ZIP_DEFLATED
-    info.create_system = 3
-    normalized_mode = 0o700 if source_stat.st_mode & 0o111 else 0o600
-    info.external_attr = (stat.S_IFREG | normalized_mode) << 16
-
-    digest = hashlib.sha256()
-    written = 0
-    source_fd: Optional[int] = None
-    try:
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        flags |= getattr(os, "O_BINARY", 0)
-        source_fd = os.open(source, flags)
-        opened_stat = os.fstat(source_fd)
-        if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink != 1:
-            raise BackupError(
-                f"backup source changed to an unsafe file type: {source}"
-            )
-        if (opened_stat.st_dev, opened_stat.st_ino) != (
-            source_stat.st_dev,
-            source_stat.st_ino,
-        ):
-            raise BackupError(f"backup source changed during secure open: {source}")
-
-        src = os.fdopen(source_fd, "rb")
-        source_fd = None
-        with src, zf.open(info, "w", force_zip64=True) as dst:
-            while True:
-                chunk = src.read(_COPY_CHUNK_BYTES)
-                if not chunk:
-                    break
-                written += len(chunk)
-                if written > _MAX_BACKUP_MEMBER_BYTES:
-                    raise BackupError(
-                        f"backup source exceeds the per-member size limit: {source}"
-                    )
-                digest.update(chunk)
-                dst.write(chunk)
-            final_stat = os.fstat(src.fileno())
-            if written != opened_stat.st_size or (
-                final_stat.st_size,
-                final_stat.st_mtime_ns,
-                final_stat.st_ctime_ns,
-            ) != (
-                opened_stat.st_size,
-                opened_stat.st_mtime_ns,
-                opened_stat.st_ctime_ns,
-            ):
-                raise BackupError(f"backup source changed while being archived: {source}")
-    except BackupError:
-        raise
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise BackupError(f"could not archive {source}: {exc}") from exc
-    finally:
-        if source_fd is not None:
-            os.close(source_fd)
-
-    archived = zf.getinfo(arcname)
-    _enforce_member_quota(archived)
-    if archived.file_size != written:
-        raise BackupError(f"archive size mismatch while writing {arcname}")
-    return {
-        "path": arcname,
-        "scope": scope,
-        "size": written,
-        "sha256": digest.hexdigest(),
-        "mode": normalized_mode,
-    }
-
-
-def _write_backup_archive(
-    out_path: Path,
-    sources: list[tuple[Path, str, str]],
-    *,
-    external_roots: list[str],
-) -> tuple[int, int]:
-    """Write, verify, and atomically promote a current-format backup."""
-    if len(sources) > _MAX_BACKUP_MEMBERS:
-        raise BackupError(
-            f"backup contains {len(sources)} files; limit is {_MAX_BACKUP_MEMBERS}"
-        )
-    canonical_names: set[str] = set()
-    for _source, arcname, _scope in sources:
-        canonical = _normalized_archive_path(arcname)
-        folded = canonical.casefold()
-        if folded == _BACKUP_MANIFEST_NAME.casefold() or folded in canonical_names:
-            raise BackupError(f"duplicate or reserved archive member path: {arcname}")
-        canonical_names.add(folded)
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        suffix=".zip.part",
-        prefix=f".{out_path.name}.",
-        delete=False,
-        dir=str(out_path.parent),
-    ) as tmp:
-        temp_archive = Path(tmp.name)
-
-    total_bytes = 0
-    manifest_members: list[dict[str, object]] = []
-    try:
-        with zipfile.ZipFile(
-            temp_archive,
-            "w",
-            zipfile.ZIP_DEFLATED,
-            compresslevel=6,
-            allowZip64=True,
-        ) as zf:
-            for source, arcname, scope in sources:
-                staged_db: Optional[Path] = None
-                archive_source = source
-                try:
-                    if source.suffix.lower() == ".db":
-                        source_stat = _checked_regular_source_stat(source)
-                        with tempfile.NamedTemporaryFile(
-                            suffix=".db",
-                            delete=False,
-                            dir=str(out_path.parent),
-                        ) as db_tmp:
-                            staged_db = Path(db_tmp.name)
-                        if not _safe_copy_db(source, staged_db):
-                            raise BackupError(f"SQLite snapshot failed: {source}")
-                        source_after = _checked_regular_source_stat(source)
-                        if (source_after.st_dev, source_after.st_ino) != (
-                            source_stat.st_dev,
-                            source_stat.st_ino,
-                        ):
-                            raise BackupError(
-                                f"SQLite source changed during snapshot: {source}"
-                            )
-                        archive_source = staged_db
-                    member = _write_source_member(
-                        zf,
-                        archive_source,
-                        arcname,
-                        scope=scope,
-                    )
-                finally:
-                    if staged_db is not None:
-                        staged_db.unlink(missing_ok=True)
-                total_bytes += int(member["size"])
-                if total_bytes > _MAX_BACKUP_TOTAL_BYTES:
-                    raise BackupError(
-                        "backup exceeds the aggregate uncompressed-size limit of "
-                        f"{_format_size(_MAX_BACKUP_TOTAL_BYTES)}"
-                    )
-                manifest_members.append(member)
-
-            manifest = {
-                "format": _BACKUP_FORMAT,
-                "version": _BACKUP_FORMAT_VERSION,
-                "createdAt": datetime.now(timezone.utc).isoformat(),
-                "members": manifest_members,
-                "externalRoots": sorted(set(external_roots)),
-            }
-            manifest_bytes = json.dumps(
-                manifest,
-                indent=2,
-                sort_keys=True,
-            ).encode("utf-8")
-            if len(manifest_bytes) > _MAX_BACKUP_MANIFEST_BYTES:
-                raise BackupError("backup manifest exceeds its size limit")
-            zf.writestr(
-                _BACKUP_MANIFEST_NAME,
-                manifest_bytes,
-                compress_type=zipfile.ZIP_DEFLATED,
-                compresslevel=6,
-            )
-
-        with zipfile.ZipFile(temp_archive, "r") as zf:
-            _prevalidate_archive_contents(zf)
-        with temp_archive.open("rb") as archive_file:
-            os.fsync(archive_file.fileno())
-        os.replace(temp_archive, out_path)
-        try:
-            _fsync_directory(out_path.parent)
-        except BaseException as exc:
-            raise BackupPromotedDurabilityError(
-                "backup archive was promoted, but output-directory durability "
-                f"could not be confirmed: {exc}"
-            ) from exc
-        return len(manifest_members), total_bytes
-    except BaseException:
-        temp_archive.unlink(missing_ok=True)
-        raise
-
 
 def run_backup(args) -> None:
     """Create a zip backup of the Hermes home directory."""
@@ -698,6 +585,17 @@ def run_backup(args) -> None:
     if not hermes_root.is_dir():
         print(f"Error: Hermes home directory not found at {hermes_root}")
         sys.exit(1)
+
+    try:
+        with _backup_operation_lock(hermes_root):
+            _run_backup_locked(args, hermes_root)
+    except BackupInProgressError as exc:
+        print(f"Error: {exc}")
+        raise SystemExit(2) from exc
+
+
+def _run_backup_locked(args, hermes_root: Path) -> None:
+    """Write a full backup while the cross-process backup slot is held."""
 
     # Determine output path
     if args.output:
@@ -714,133 +612,162 @@ def run_backup(args) -> None:
     if out_path.suffix.lower() != ".zip":
         out_path = out_path.with_suffix(out_path.suffix + ".zip")
 
-    require_protected_control_file_capability(
-        ProtectedFileOperation.ARCHIVE,
-        (hermes_root, out_path),
-        capability=ProtectedFileCapability.BACKUP_RESTORE,
-    )
-
     # Ensure parent directory exists
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Collect files
+    scan_started = time.monotonic()
+    logger.info("backup phase=scan status=started")
     print(f"Scanning {display_hermes_home()} ...")
-    sources: list[tuple[Path, str, str]] = []
-    skipped_dirs: set[str] = set()
-    skipped_external: list[str] = []
-    external_roots: list[str] = []
-    walk_errors: list[OSError] = []
+    files_to_add: list[tuple[Path, Path]] = []  # (absolute, relative)
+    skipped_dirs = set()
 
-    try:
-        for dirpath, dirnames, filenames in os.walk(
-            hermes_root,
-            followlinks=False,
-            onerror=walk_errors.append,
-        ):
-            dp = Path(dirpath)
-            rel_dir = dp.relative_to(hermes_root)
-            is_root = rel_dir == Path(".")
-            orig_dirnames = dirnames[:]
-            dirnames[:] = [
-                d
-                for d in dirnames
-                if not (dp / d).is_symlink()
-                and (d not in _EXCLUDED_DIRS or (d == "hermes-agent" and not is_root))
-            ]
-            for removed in set(orig_dirnames) - set(dirnames):
-                skipped_dirs.add(str(rel_dir / removed))
-            for fname in filenames:
-                fpath = dp / fname
-                rel = fpath.relative_to(hermes_root)
-                if _should_skip_backup_file(fpath, rel, out_path):
-                    continue
-                sources.append((fpath, rel.as_posix(), "hermes_home"))
-        if walk_errors:
-            raise BackupError(f"could not scan Hermes home: {walk_errors[0]}")
+    for dirpath, dirnames, filenames in os.walk(hermes_root, followlinks=False):
+        dp = Path(dirpath)
+        rel_dir = dp.relative_to(hermes_root)
 
-        home_dir = Path.home().resolve()
-        external_names: dict[str, Path] = {}
-        for base in _collect_memory_provider_external_paths():
-            lexical_base = Path(os.path.abspath(base))
-            try:
-                rel_base = lexical_base.relative_to(home_dir)
-            except ValueError:
-                skipped_external.append(str(base))
+        # Prune excluded directories in-place so os.walk doesn't descend
+        # ``hermes-agent`` is only pruned at the root level; nested dirs
+        # with the same name (e.g. in skills/) must be preserved.
+        is_root = rel_dir == Path(".")
+        orig_dirnames = dirnames[:]
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in _EXCLUDED_DIRS or (d == "hermes-agent" and not is_root)
+        ]
+        for removed in set(orig_dirnames) - set(dirnames):
+            skipped_dirs.add(str(rel_dir / removed))
+
+        for fname in filenames:
+            fpath = dp / fname
+            rel = fpath.relative_to(hermes_root)
+
+            if _should_skip_backup_file(fpath, rel, out_path):
                 continue
-            if not rel_base.parts or _path_is_within(
-                lexical_base,
-                hermes_root.resolve(),
-            ):
-                raise BackupError(
-                    "memory-provider external backup paths must be outside "
-                    f"Hermes home and narrower than the user home: {base}"
-                )
-            _ensure_safe_filesystem_path(
-                home_dir,
-                lexical_base,
-                final_may_be_file=True,
-                final_may_be_directory=True,
-                allow_missing=False,
-            )
-            external_roots.append(rel_base.as_posix())
-            for fpath in _iter_external_files(lexical_base):
-                safe_file = _ensure_safe_filesystem_path(
-                    home_dir,
-                    fpath,
-                    final_may_be_file=True,
-                    final_may_be_directory=False,
-                    allow_missing=False,
-                )
-                rel_to_home = safe_file.relative_to(home_dir).as_posix()
-                arcname = _EXTERNAL_PREFIX + rel_to_home
-                prior = external_names.get(arcname.casefold())
-                if prior is not None and prior != safe_file:
-                    raise BackupError(f"colliding external backup paths: {prior} and {safe_file}")
-                if prior is None:
-                    external_names[arcname.casefold()] = safe_file
-                    sources.append((safe_file, arcname, "external"))
-    except (BackupError, OSError, ValueError) as exc:
-        print(f"Error: Backup scan failed: {exc}")
-        raise SystemExit(1) from exc
 
-    if not sources:
+            files_to_add.append((fpath, rel))
+
+    # External memory-provider state (e.g. ~/.honcho, ~/.hindsight) lives
+    # outside HERMES_HOME, so the walk above never sees it. Ask the active
+    # provider for its declared paths and stage them under the reserved
+    # ``_external/`` arc prefix, encoded relative to the user's home dir.
+    # Only paths under home are captured (security + portability); anything
+    # else is skipped with a note.
+    home_dir = Path.home().resolve()
+    external_to_add: list[tuple[Path, str]] = []  # (absolute, arcname)
+    skipped_external: list[str] = []
+    for base in _collect_memory_provider_external_paths():
+        try:
+            base_resolved = base.resolve()
+            base_resolved.relative_to(home_dir)
+        except (ValueError, OSError):
+            skipped_external.append(str(base))
+            continue
+        for fpath in _iter_external_files(base):
+            try:
+                rel_to_home = fpath.resolve().relative_to(home_dir)
+            except (ValueError, OSError):
+                continue
+            arcname = _EXTERNAL_PREFIX + rel_to_home.as_posix()
+            external_to_add.append((fpath, arcname))
+
+    if not files_to_add and not external_to_add:
+        logger.info(
+            "backup phase=scan status=empty duration_ms=%.1f",
+            (time.monotonic() - scan_started) * 1000,
+        )
         print("No files to back up.")
         return
 
-    print(f"Backing up {len(sources)} files ...")
+    # Create the zip
+    file_count = len(files_to_add) + len(external_to_add)
+    logger.info(
+        "backup phase=scan status=complete duration_ms=%.1f files=%d",
+        (time.monotonic() - scan_started) * 1000,
+        file_count,
+    )
+    logger.info("backup phase=archive status=started files=%d", file_count)
+    print(f"Backing up {file_count} files ...")
+
+    total_bytes = 0
+    errors = []
     t0 = time.monotonic()
-    try:
-        file_count, total_bytes = _write_backup_archive(
-            out_path,
-            sources,
-            external_roots=external_roots,
-        )
-    except BackupPromotedDurabilityError as exc:
-        print(f"Error: {exc}")
-        raise SystemExit(1) from exc
-    except (BackupError, OSError, ValueError, zipfile.BadZipFile) as exc:
-        print(f"Error: Backup failed: {exc}")
-        raise SystemExit(1) from exc
+
+    with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
+        archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6
+    ) as zf:
+        for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
+            try:
+                # Safe copy for SQLite databases (handles WAL mode)
+                if abs_path.suffix == ".db":
+                    # Stage the snapshot alongside the output zip so that the
+                    # temp file lives on the same filesystem.  The system
+                    # default (/tmp) may be a small tmpfs that cannot hold
+                    # large databases, causing silent backup incompleteness.
+                    with tempfile.NamedTemporaryFile(
+                        suffix=".db", delete=False, dir=str(out_path.parent)
+                    ) as tmp:
+                        tmp_db = Path(tmp.name)
+                    if _safe_copy_db(abs_path, tmp_db):
+                        zf.write(tmp_db, arcname=str(rel_path))
+                        total_bytes += tmp_db.stat().st_size
+                        tmp_db.unlink(missing_ok=True)
+                    else:
+                        tmp_db.unlink(missing_ok=True)
+                        errors.append(f"  {rel_path}: SQLite safe copy failed")
+                        continue
+                else:
+                    zf.write(abs_path, arcname=str(rel_path))
+                    total_bytes += abs_path.stat().st_size
+            except (PermissionError, OSError, ValueError) as exc:
+                errors.append(f"  {rel_path}: {exc}")
+                continue
+
+            # Progress every 500 files
+            if i % 500 == 0:
+                print(f"  {i}/{file_count} files ...")
+                logger.info(
+                    "backup phase=archive status=progress completed=%d total=%d",
+                    i,
+                    file_count,
+                )
+
+        # External memory-provider state, stored under the ``_external/`` arc
+        # prefix. These never include ``.db`` files in practice (config/env
+        # blobs), so a straight zf.write is fine.
+        for abs_path, arcname in external_to_add:
+            try:
+                zf.write(abs_path, arcname=arcname)
+                total_bytes += abs_path.stat().st_size
+            except (PermissionError, OSError, ValueError) as exc:
+                errors.append(f"  {arcname}: {exc}")
+                continue
 
     elapsed = time.monotonic() - t0
     zip_size = out_path.stat().st_size
+    logger.info(
+        "backup phase=archive status=complete duration_ms=%.1f files=%d errors=%d bytes=%d",
+        elapsed * 1000,
+        file_count,
+        len(errors),
+        zip_size,
+    )
 
     # Summary
     print()
-    print(f"Backup complete: {out_path}")
+    if errors:
+        print(f"Backup incomplete: {out_path}")
+    else:
+        print(f"Backup complete: {out_path}")
     print(f"  Files:       {file_count}")
     print(f"  Original:    {_format_size(total_bytes)}")
     print(f"  Compressed:  {_format_size(zip_size)}")
     print(f"  Time:        {elapsed:.1f}s")
 
-    external_count = sum(1 for _path, _arcname, scope in sources if scope == "external")
-    if external_count:
+    if external_to_add:
         print(
-            f"\n  Included {external_count} memory-provider file(s) "
+            f"\n  Included {len(external_to_add)} memory-provider file(s) "
             f"stored outside {display_hermes_home()}."
-        )
-        print(
-            "  Automatic restore of _external members is disabled until a "
-            "provider-bound, typed manifest and explicit operator grant exist."
         )
 
     if skipped_external:
@@ -856,13 +783,14 @@ def run_backup(args) -> None:
         for d in sorted(skipped_dirs):
             print(f"    {d}/")
 
-    if external_count:
-        print(
-            "\nPreservation-only archive: this v1 ZIP contains _external state, "
-            "so `hermes import` will reject the entire archive until the "
-            "provider-bound restore format is implemented."
-        )
-    else:
+    if errors:
+        print(f"\n  Warnings ({len(errors)} files skipped):")
+        for e in errors[:10]:
+            print(e)
+        if len(errors) > 10:
+            print(f"  ... and {len(errors) - 10} more")
+
+    if not errors:
         print(f"\nRestore with: hermes import {out_path.name}")
 
 
@@ -879,15 +807,7 @@ def _validate_backup_zip(zf: zipfile.ZipFile) -> tuple[bool, str]:
     if not names:
         return False, "zip archive is empty"
 
-    if _BACKUP_MANIFEST_NAME in names:
-        try:
-            manifest = _read_backup_manifest(zf)
-        except BackupError as exc:
-            return False, str(exc)
-        if manifest is not None:
-            return True, ""
-
-    # Legacy archives have no manifest, so require telltale in-home files.
+    # Look for telltale files that a hermes home would have
     markers = {"config.yaml", ".env", "state.db"}
     found = set()
     for n in names:
@@ -929,1072 +849,8 @@ def _detect_prefix(zf: zipfile.ZipFile) -> str:
     return ""
 
 
-def _read_backup_manifest(zf: zipfile.ZipFile) -> Optional[dict[str, object]]:
-    infos = [info for info in zf.infolist() if info.filename == _BACKUP_MANIFEST_NAME]
-    if not infos:
-        return None
-    if len(infos) != 1:
-        raise BackupError("backup contains duplicate manifest members")
-    info = infos[0]
-    if info.is_dir() or _zip_member_is_special(info):
-        raise BackupError("backup manifest is not a regular file")
-    if info.file_size > _MAX_BACKUP_MANIFEST_BYTES:
-        raise BackupError("backup manifest exceeds its size limit")
-    _enforce_member_quota(info)
-    try:
-        raw = zf.read(info)
-        manifest = json.loads(raw.decode("utf-8"))
-    except (OSError, RuntimeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise BackupError(f"backup manifest is unreadable: {exc}") from exc
-    if not isinstance(manifest, dict):
-        raise BackupError("backup manifest must be a JSON object")
-    if manifest.get("format") != _BACKUP_FORMAT:
-        raise BackupError("backup manifest format is not recognized")
-    version = manifest.get("version")
-    if isinstance(version, bool) or not isinstance(version, int) or version != _BACKUP_FORMAT_VERSION:
-        raise BackupError(
-            f"unsupported backup manifest version: {version!r}"
-        )
-    if not isinstance(manifest.get("members"), list) or not manifest["members"]:
-        raise BackupError("backup manifest members must be a list")
-    if not isinstance(manifest.get("externalRoots", []), list):
-        raise BackupError("backup manifest externalRoots must be a list")
-    return manifest
-
-
-def _hash_zip_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo) -> tuple[str, int]:
-    digest = hashlib.sha256()
-    total = 0
-    try:
-        with zf.open(info, "r") as src:
-            while True:
-                chunk = src.read(_COPY_CHUNK_BYTES)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > _MAX_BACKUP_MEMBER_BYTES:
-                    raise BackupError(
-                        f"archive member exceeds the per-member size limit: {info.filename}"
-                    )
-                digest.update(chunk)
-    except BackupError:
-        raise
-    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
-        raise BackupError(f"could not verify archive member {info.filename}: {exc}") from exc
-    if total != info.file_size:
-        raise BackupError(f"archive member size changed while reading: {info.filename}")
-    return digest.hexdigest(), total
-
-
-def _prevalidate_archive_contents(
-    zf: zipfile.ZipFile,
-) -> tuple[Optional[dict[str, object]], list[_PrevalidatedMember], str]:
-    """Validate every member, quota, manifest entry, size, hash, and CRC."""
-    manifest = _read_backup_manifest(zf)
-    prefix = "" if manifest is not None else _detect_prefix(zf)
-    file_infos: list[tuple[zipfile.ZipInfo, str]] = []
-    seen_paths: set[str] = set()
-
-    archive_infos = zf.infolist()
-    # Count directory records too. Otherwise an archive can stay below the
-    # file-member quota while forcing us to inspect an unbounded number of
-    # directory entries before any extraction begins. Current archives have
-    # at most one additional manifest member.
-    if len(archive_infos) > _MAX_BACKUP_MEMBERS + 1:
-        raise BackupError(
-            "archive contains too many entries; limit is "
-            f"{_MAX_BACKUP_MEMBERS + 1} including the manifest"
-        )
-
-    for info in archive_infos:
-        if info.filename == _BACKUP_MANIFEST_NAME:
-            continue
-        if info.flag_bits & 0x1:
-            raise BackupError(f"encrypted archive members are not supported: {info.filename}")
-        if info.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
-            raise BackupError(f"unsupported archive compression method: {info.filename}")
-        if _zip_member_is_special(info):
-            raise BackupError(f"symlink or special archive member is not allowed: {info.filename}")
-
-        member_name = info.filename
-        if prefix and member_name.startswith(prefix):
-            member_name = member_name[len(prefix):]
-        if info.is_dir() and not member_name:
-            # A legacy archive may include the explicit `.hermes/` wrapper
-            # directory in addition to its children.
-            continue
-        effective = _normalized_archive_path(
-            member_name,
-            allow_directory=info.is_dir(),
-        )
-        folded = effective.casefold()
-        if folded in seen_paths:
-            raise BackupError(f"duplicate archive member path: {effective}")
-        seen_paths.add(folded)
-        if info.is_dir():
-            continue
-        _enforce_member_quota(info)
-        file_infos.append((info, effective))
-
-    if len(file_infos) > _MAX_BACKUP_MEMBERS:
-        raise BackupError(
-            f"archive contains {len(file_infos)} files; limit is {_MAX_BACKUP_MEMBERS}"
-        )
-
-    manifest_members: dict[str, dict[str, object]] = {}
-    manifest_paths_folded: set[str] = set()
-    if manifest is not None:
-        if len(manifest["members"]) > _MAX_BACKUP_MEMBERS:
-            raise BackupError(
-                f"backup manifest contains too many members; limit is {_MAX_BACKUP_MEMBERS}"
-            )
-        for item in manifest["members"]:
-            if not isinstance(item, dict):
-                raise BackupError("backup manifest member entries must be objects")
-            raw_path = item.get("path")
-            if not isinstance(raw_path, str):
-                raise BackupError("backup manifest member path must be a string")
-            path = _normalized_archive_path(raw_path)
-            if path.casefold() in manifest_paths_folded:
-                raise BackupError(f"duplicate backup manifest member: {path}")
-            manifest_paths_folded.add(path.casefold())
-            scope = item.get("scope")
-            if scope not in {"hermes_home", "external"}:
-                raise BackupError(f"invalid backup manifest scope for {path}")
-            if (scope == "external") != path.startswith(_EXTERNAL_PREFIX):
-                raise BackupError(f"backup manifest scope/path mismatch for {path}")
-            size = item.get("size")
-            digest = item.get("sha256")
-            mode = item.get("mode")
-            if isinstance(size, bool) or not isinstance(size, int) or size < 0:
-                raise BackupError(f"invalid backup manifest size for {path}")
-            if (
-                not isinstance(digest, str)
-                or len(digest) != 64
-                or any(ch not in "0123456789abcdef" for ch in digest)
-            ):
-                raise BackupError(f"invalid backup manifest SHA-256 for {path}")
-            if mode is not None and (
-                isinstance(mode, bool)
-                or not isinstance(mode, int)
-                or mode not in {0o600, 0o700}
-            ):
-                raise BackupError(f"invalid backup manifest mode for {path}")
-            manifest_members[path] = item
-
-        archive_paths = {effective for _info, effective in file_infos}
-        if archive_paths != set(manifest_members):
-            missing = sorted(set(manifest_members) - archive_paths)
-            extra = sorted(archive_paths - set(manifest_members))
-            raise BackupError(
-                "backup manifest/member mismatch"
-                + (f"; missing={missing[:3]}" if missing else "")
-                + (f"; undeclared={extra[:3]}" if extra else "")
-            )
-        for root in manifest.get("externalRoots", []):
-            if not isinstance(root, str):
-                raise BackupError("backup manifest external root must be a string")
-            _normalized_archive_path(root)
-
-    total_size = 0
-    total_compressed = 0
-    validated: list[_PrevalidatedMember] = []
-    for info, effective in file_infos:
-        actual_sha256, actual_size = _hash_zip_member(zf, info)
-        total_size += actual_size
-        total_compressed += info.compress_size
-        if total_size > _MAX_BACKUP_TOTAL_BYTES:
-            raise BackupError(
-                "archive exceeds the aggregate uncompressed-size limit of "
-                f"{_format_size(_MAX_BACKUP_TOTAL_BYTES)}"
-            )
-        expected_sha256: Optional[str] = None
-        expected_mode: Optional[int] = None
-        if manifest is not None:
-            item = manifest_members[effective]
-            if item["size"] != actual_size:
-                raise BackupError(f"backup manifest size mismatch for {effective}")
-            expected_sha256 = str(item["sha256"])
-            if expected_sha256 != actual_sha256:
-                raise BackupError(f"backup manifest hash mismatch for {effective}")
-            raw_mode = item.get("mode")
-            if raw_mode is not None:
-                expected_mode = int(raw_mode)
-                archived_mode = (info.external_attr >> 16) & 0o777
-                normalized_archived_mode = 0o700 if archived_mode & 0o111 else 0o600
-                if normalized_archived_mode != expected_mode:
-                    raise BackupError(f"backup manifest mode mismatch for {effective}")
-        validated.append(
-            _PrevalidatedMember(
-                info=info,
-                effective_path=effective,
-                expected_sha256=expected_sha256,
-                verified_sha256=actual_sha256,
-                expected_mode=expected_mode,
-            )
-        )
-
-    if (
-        total_size >= _COMPRESSION_RATIO_MIN_BYTES
-        and total_size > max(total_compressed, 1) * _MAX_BACKUP_COMPRESSION_RATIO
-    ):
-        raise BackupError(
-            f"archive exceeds the {_MAX_BACKUP_COMPRESSION_RATIO}:1 aggregate "
-            "compression-ratio limit"
-        )
-    return manifest, validated, prefix
-
-
-def _path_is_within(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False
-
-
-def _build_restore_plan(
-    zf: zipfile.ZipFile,
-    hermes_root: Path,
-) -> tuple[list[_RestoreMember], Optional[dict[str, object]], str]:
-    manifest, members, prefix = _prevalidate_archive_contents(zf)
-    has_external = any(
-        member.effective_path.startswith(_EXTERNAL_PREFIX) for member in members
-    )
-    if has_external:
-        raise BackupError(
-            "automatic _external restore is disabled. Manifest v1 does not bind "
-            "provider/profile identity or root type, and an empty staged target "
-            "has no independently active provider policy. Preserve this archive "
-            "for a future provider-bound restore workflow."
-        )
-
-    if not any(
-        PurePosixPath(member.effective_path).name.casefold()
-        not in _IMPORT_SKIP_NAMES_FOLDED
-        for member in members
-    ):
-        raise BackupError(
-            "backup contains no restorable Hermes state after runtime-only "
-            "members are removed"
-        )
-
-    hermes_root_lexical = Path(os.path.abspath(hermes_root))
-    plan: list[_RestoreMember] = []
-    for member in members:
-        effective = member.effective_path
-        target = hermes_root_lexical / Path(*PurePosixPath(effective).parts)
-        _ensure_safe_filesystem_path(
-            hermes_root_lexical,
-            target,
-            final_may_be_file=True,
-            final_may_be_directory=False,
-            allow_missing=True,
-        )
-        skip_runtime = (
-            PurePosixPath(effective).name.casefold() in _IMPORT_SKIP_NAMES_FOLDED
-        )
-        plan.append(
-            _RestoreMember(
-                info=member.info,
-                relative_path=effective,
-                target=target,
-                external=False,
-                skip_runtime=skip_runtime,
-                expected_sha256=member.expected_sha256,
-                verified_sha256=member.verified_sha256,
-                expected_mode=member.expected_mode,
-            )
-        )
-    return plan, manifest, prefix
-
-
-@dataclass
-class _AnchoredDirectory:
-    """An absolute directory chain pinned by descriptor and (device, inode)."""
-
-    path: Path
-    fd: int
-    identities: tuple[tuple[int, int], ...]
-
-    def close(self) -> None:
-        if self.fd >= 0:
-            os.close(self.fd)
-            self.fd = -1
-
-
-def _identity(info: os.stat_result) -> tuple[int, int]:
-    return (info.st_dev, info.st_ino)
-
-
-def _directory_open_flags() -> int:
-    return (
-        os.O_RDONLY
-        | os.O_DIRECTORY
-        | os.O_NOFOLLOW
-        | getattr(os, "O_CLOEXEC", 0)
-    )
-
-
-def _require_secure_restore_primitives() -> None:
-    """Fail closed unless descriptor-relative, no-follow restore is available."""
-    required_flags = ("O_DIRECTORY", "O_NOFOLLOW")
-    missing_flags = [name for name in required_flags if not getattr(os, name, 0)]
-    required_dir_fd = (os.open, os.mkdir, os.rename, os.stat, os.unlink, os.rmdir)
-    missing_dir_fd = [
-        function.__name__
-        for function in required_dir_fd
-        if function not in os.supports_dir_fd
-    ]
-    if (
-        os.name != "posix"
-        or missing_flags
-        or missing_dir_fd
-        or os.stat not in os.supports_follow_symlinks
-        or not hasattr(os, "fchmod")
-    ):
-        details = ", ".join(missing_flags + missing_dir_fd) or "POSIX no-follow support"
-        raise BackupError(
-            "secure restore is unavailable on this platform; missing required "
-            f"descriptor-relative primitive(s): {details}"
-        )
-    _load_atomic_exchange()
-
-
-def _load_atomic_exchange():
-    """Return the native atomic directory-exchange function or fail closed."""
-    library = ctypes.CDLL(None, use_errno=True)
-    if sys.platform == "darwin":
-        function = getattr(library, "renameatx_np", None)
-    elif sys.platform.startswith("linux"):
-        function = getattr(library, "renameat2", None)
-    else:
-        function = None
-    if function is None:
-        raise BackupError(
-            "secure restore is unavailable: atomic directory exchange is unsupported"
-        )
-    function.argtypes = [
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    ]
-    function.restype = ctypes.c_int
-    return function
-
-
-def _exchange_directories_at(
-    source_parent_fd: int,
-    source_name: str,
-    target_parent_fd: int,
-    target_name: str,
-) -> None:
-    """Atomically swap two directory entries relative to pinned parents."""
-    function = _load_atomic_exchange()
-    result = function(
-        source_parent_fd,
-        os.fsencode(source_name),
-        target_parent_fd,
-        os.fsencode(target_name),
-        0x00000002,  # RENAME_SWAP (Darwin) / RENAME_EXCHANGE (Linux)
-    )
-    if result != 0:
-        error_number = ctypes.get_errno()
-        raise OSError(error_number, os.strerror(error_number))
-
-
-def _open_anchored_directory(path: Path, *, create: bool) -> _AnchoredDirectory:
-    absolute = Path(os.path.abspath(path))
-    descriptor = os.open("/", _directory_open_flags())
-    identities = [_identity(os.fstat(descriptor))]
-    try:
-        for component in absolute.parts[1:]:
-            try:
-                child = os.open(component, _directory_open_flags(), dir_fd=descriptor)
-            except FileNotFoundError:
-                if not create:
-                    raise
-                os.mkdir(component, mode=0o700, dir_fd=descriptor)
-                child = os.open(component, _directory_open_flags(), dir_fd=descriptor)
-            except OSError as exc:
-                raise BackupError(
-                    f"restore ancestor is not a stable real directory: {absolute}"
-                ) from exc
-            identities.append(_identity(os.fstat(child)))
-            os.close(descriptor)
-            descriptor = child
-    except BaseException:
-        os.close(descriptor)
-        raise
-    return _AnchoredDirectory(absolute, descriptor, tuple(identities))
-
-
-def _revalidate_restore_anchor(anchor: _AnchoredDirectory) -> None:
-    """Confirm the lexical path still names the exact pinned directory chain."""
-    try:
-        current = _open_anchored_directory(anchor.path, create=False)
-    except (FileNotFoundError, BackupError, OSError) as exc:
-        raise BackupError("restore ancestor identity changed during import") from exc
-    try:
-        if (
-            current.identities != anchor.identities
-            or _identity(os.fstat(anchor.fd)) != anchor.identities[-1]
-        ):
-            raise BackupError("restore ancestor identity changed during import")
-    finally:
-        current.close()
-
-
-def _open_child_directory(parent_fd: int, name: str) -> int:
-    try:
-        return os.open(name, _directory_open_flags(), dir_fd=parent_fd)
-    except OSError as exc:
-        raise BackupError(f"restore path component is not a real directory: {name}") from exc
-
-
-def _prepare_empty_restore_target(
-    parent_fd: int,
-    name: str,
-) -> tuple[int, tuple[int, int], bool]:
-    created = False
-    try:
-        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
-        created = True
-        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    if not stat.S_ISDIR(before.st_mode):
-        raise BackupError("import target is not a real directory")
-    target_fd = -1
-    identity = _identity(before)
-    try:
-        target_fd = _open_child_directory(parent_fd, name)
-        identity = _identity(os.fstat(target_fd))
-        if identity != _identity(before) or os.listdir(target_fd):
-            raise BackupError("import target is not the selected empty directory")
-    except BaseException:
-        if target_fd >= 0:
-            os.close(target_fd)
-        if created:
-            try:
-                _remove_directory_if_identity(parent_fd, name, identity)
-            except OSError:
-                pass
-        raise
-    return target_fd, identity, created
-
-
-def _revalidate_empty_restore_target(
-    parent_fd: int,
-    name: str,
-    target_fd: int,
-    target_identity: tuple[int, int],
-) -> None:
-    try:
-        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError as exc:
-        raise BackupError("import target identity changed during staging") from exc
-    if (
-        not stat.S_ISDIR(current.st_mode)
-        or _identity(current) != target_identity
-        or _identity(os.fstat(target_fd)) != target_identity
-        or os.listdir(target_fd)
-    ):
-        raise BackupError("import target identity changed or is no longer empty")
-
-
-def _create_staging_directory(parent_fd: int) -> tuple[str, int, int]:
-    for _attempt in range(20):
-        name = f".hermes-import-{secrets.token_hex(8)}"
-        try:
-            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
-        except FileExistsError:
-            continue
-        temp_identity = _identity(
-            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        )
-        temp_fd = -1
-        staged_fd = -1
-        try:
-            temp_fd = _open_child_directory(parent_fd, name)
-            os.mkdir("hermes-home", mode=0o700, dir_fd=temp_fd)
-            staged_fd = _open_child_directory(temp_fd, "hermes-home")
-            return name, temp_fd, staged_fd
-        except BaseException:
-            if staged_fd >= 0:
-                os.close(staged_fd)
-            if temp_fd >= 0:
-                os.close(temp_fd)
-            try:
-                _remove_directory_if_identity(parent_fd, name, temp_identity)
-            except OSError:
-                pass
-            raise
-    raise BackupError("could not allocate a private restore staging directory")
-
-
-def _open_relative_directory_at(
-    root_fd: int,
-    parts: tuple[str, ...],
-    *,
-    create: bool,
-    expected_identities: dict[str, tuple[int, int]],
-) -> int:
-    descriptor = os.dup(root_fd)
-    try:
-        for index, component in enumerate(parts):
-            try:
-                child = os.open(component, _directory_open_flags(), dir_fd=descriptor)
-            except FileNotFoundError:
-                if not create:
-                    raise BackupError(
-                        f"staged directory disappeared: {'/'.join(parts[:index + 1])}"
-                    )
-                os.mkdir(component, mode=0o700, dir_fd=descriptor)
-                child = os.open(component, _directory_open_flags(), dir_fd=descriptor)
-            relative = "/".join(parts[:index + 1])
-            child_identity = _identity(os.fstat(child))
-            expected = expected_identities.get(relative)
-            if expected is None:
-                if not create:
-                    os.close(child)
-                    raise BackupError(f"unexpected staged directory: {relative}")
-                expected_identities[relative] = child_identity
-            elif child_identity != expected:
-                os.close(child)
-                raise BackupError(f"staged directory identity changed: {relative}")
-            os.close(descriptor)
-            descriptor = child
-        return descriptor
-    except BaseException:
-        os.close(descriptor)
-        raise
-
-
-def _copy_validated_member_at(
-    zf: zipfile.ZipFile,
-    member: _RestoreMember,
-    staged_fd: int,
-    directory_identities: dict[str, tuple[int, int]],
-    file_identities: dict[str, tuple[int, int]],
-) -> None:
-    parts = tuple(PurePosixPath(member.relative_path).parts)
-    parent_fd = _open_relative_directory_at(
-        staged_fd,
-        parts[:-1],
-        create=True,
-        expected_identities=directory_identities,
-    )
-    file_fd = -1
-    digest = hashlib.sha256()
-    total = 0
-    try:
-        file_fd = os.open(
-            parts[-1],
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-            dir_fd=parent_fd,
-        )
-        initial_identity = _identity(os.fstat(file_fd))
-        with zf.open(member.info, "r") as src, os.fdopen(file_fd, "wb") as dst:
-            file_fd = -1
-            while True:
-                chunk = src.read(_COPY_CHUNK_BYTES)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > _MAX_BACKUP_MEMBER_BYTES:
-                    raise BackupError(
-                        f"archive member exceeds the per-member size limit: {member.relative_path}"
-                    )
-                digest.update(chunk)
-                dst.write(chunk)
-            os.fchmod(dst.fileno(), member.expected_mode or 0o600)
-            dst.flush()
-            os.fsync(dst.fileno())
-            final = os.fstat(dst.fileno())
-            if (
-                not stat.S_ISREG(final.st_mode)
-                or final.st_nlink != 1
-                or _identity(final) != initial_identity
-            ):
-                raise BackupError(f"staged member identity changed: {member.relative_path}")
-            file_identities[member.relative_path] = initial_identity
-        os.fsync(parent_fd)
-    except BackupError:
-        raise
-    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
-        raise BackupError(f"could not stage {member.relative_path}: {exc}") from exc
-    finally:
-        if file_fd >= 0:
-            os.close(file_fd)
-        os.close(parent_fd)
-    if total != member.info.file_size:
-        raise BackupError(f"archive member size changed during staging: {member.relative_path}")
-    if digest.hexdigest() != member.verified_sha256:
-        raise BackupError(f"archive member hash changed during staging: {member.relative_path}")
-
-
-def _open_staged_regular_file(
-    staged_fd: int,
-    relative_path: str,
-    directory_identities: dict[str, tuple[int, int]],
-    file_identities: dict[str, tuple[int, int]],
-) -> int:
-    parts = tuple(PurePosixPath(relative_path).parts)
-    parent_fd = _open_relative_directory_at(
-        staged_fd,
-        parts[:-1],
-        create=False,
-        expected_identities=directory_identities,
-    )
-    try:
-        descriptor = os.open(
-            parts[-1],
-            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-            dir_fd=parent_fd,
-        )
-    except BaseException:
-        os.close(parent_fd)
-        raise
-    os.close(parent_fd)
-    info = os.fstat(descriptor)
-    if (
-        not stat.S_ISREG(info.st_mode)
-        or info.st_nlink != 1
-        or _identity(info) != file_identities.get(relative_path)
-    ):
-        os.close(descriptor)
-        raise BackupError(f"staged member is not a private regular file: {relative_path}")
-    return descriptor
-
-
-def _verify_staged_members(
-    staged_fd: int,
-    plan: list[_RestoreMember],
-    directory_identities: dict[str, tuple[int, int]],
-    file_identities: dict[str, tuple[int, int]],
-) -> None:
-    for member in plan:
-        if member.skip_runtime:
-            continue
-        descriptor = _open_staged_regular_file(
-            staged_fd,
-            member.relative_path,
-            directory_identities,
-            file_identities,
-        )
-        digest = hashlib.sha256()
-        total = 0
-        try:
-            before = os.fstat(descriptor)
-            while True:
-                chunk = os.read(descriptor, _COPY_CHUNK_BYTES)
-                if not chunk:
-                    break
-                total += len(chunk)
-                digest.update(chunk)
-            after = os.fstat(descriptor)
-        finally:
-            os.close(descriptor)
-        if (
-            _identity(before) != _identity(after)
-            or after.st_nlink != 1
-            or total != member.info.file_size
-            or digest.hexdigest() != member.verified_sha256
-            or stat.S_IMODE(after.st_mode) != (member.expected_mode or 0o600)
-        ):
-            raise BackupError(f"staged member changed before promotion: {member.relative_path}")
-
-
-def _validate_staged_databases_at(
-    staged_fd: int,
-    plan: list[_RestoreMember],
-    directory_identities: dict[str, tuple[int, int]],
-    file_identities: dict[str, tuple[int, int]],
-) -> None:
-    """Reject corrupt SQLite members through an already-open, no-follow fd."""
-    descriptor_prefix = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
-    if not os.path.isdir(descriptor_prefix):
-        raise BackupError("secure SQLite validation requires a descriptor filesystem")
-    for member in plan:
-        if member.skip_runtime or PurePosixPath(member.relative_path).suffix.casefold() != ".db":
-            continue
-        descriptor = _open_staged_regular_file(
-            staged_fd,
-            member.relative_path,
-            directory_identities,
-            file_identities,
-        )
-        connection = None
-        before = os.fstat(descriptor)
-        try:
-            uri = f"file:{descriptor_prefix}/{descriptor}?mode=ro&immutable=1"
-            connection = sqlite3.connect(uri, uri=True)
-            rows = connection.execute("PRAGMA quick_check").fetchall()
-        except sqlite3.Error as exc:
-            database_name = PurePosixPath(member.relative_path).name
-            raise BackupError(
-                f"restored SQLite integrity check failed for {database_name}: {exc}"
-            ) from exc
-        finally:
-            if connection is not None:
-                connection.close()
-            after = os.fstat(descriptor)
-            os.close(descriptor)
-        if _identity(before) != _identity(after) or rows != [("ok",)]:
-            raise BackupError(
-                "restored SQLite integrity check failed for "
-                f"{PurePosixPath(member.relative_path).name}: {rows[:3]}"
-            )
-
-
-def _fsync_directory(path: Path) -> None:
-    if os.name != "posix":
-        return
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
-    )
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _verify_tree_shape_at(
-    directory_fd: int,
-    directory_identities: dict[str, tuple[int, int]],
-    file_identities: dict[str, tuple[int, int]],
-    prefix: str = "",
-) -> None:
-    for name in os.listdir(directory_fd):
-        relative = f"{prefix}/{name}" if prefix else name
-        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if stat.S_ISDIR(info.st_mode):
-            if _identity(info) != directory_identities.get(relative):
-                raise BackupError(
-                    f"unexpected or identity-changed staged directory: {relative}"
-                )
-            child_fd = _open_child_directory(directory_fd, name)
-            try:
-                _verify_tree_shape_at(
-                    child_fd,
-                    directory_identities,
-                    file_identities,
-                    relative,
-                )
-            finally:
-                os.close(child_fd)
-        elif (
-            not stat.S_ISREG(info.st_mode)
-            or _identity(info) != file_identities.get(relative)
-        ):
-            raise BackupError(
-                f"unexpected or identity-changed staged filesystem object: {relative}"
-            )
-
-
-def _fsync_tree_at(
-    directory_fd: int,
-    directory_identities: dict[str, tuple[int, int]],
-    file_identities: dict[str, tuple[int, int]],
-    prefix: str = "",
-) -> None:
-    for name in os.listdir(directory_fd):
-        relative = f"{prefix}/{name}" if prefix else name
-        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if stat.S_ISDIR(info.st_mode):
-            if _identity(info) != directory_identities.get(relative):
-                raise BackupError(
-                    f"unexpected or identity-changed staged directory: {relative}"
-                )
-            child_fd = _open_child_directory(directory_fd, name)
-            try:
-                _fsync_tree_at(
-                    child_fd,
-                    directory_identities,
-                    file_identities,
-                    relative,
-                )
-            finally:
-                os.close(child_fd)
-        elif (
-            not stat.S_ISREG(info.st_mode)
-            or _identity(info) != file_identities.get(relative)
-        ):
-            raise BackupError(
-                f"unexpected or identity-changed staged filesystem object: {relative}"
-            )
-    os.fsync(directory_fd)
-
-
-def _empty_directory_at(directory_fd: int) -> None:
-    """Remove descendants without following any staged or attacker link."""
-    for name in os.listdir(directory_fd):
-        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if stat.S_ISDIR(info.st_mode):
-            child_fd = _open_child_directory(directory_fd, name)
-            try:
-                _empty_directory_at(child_fd)
-            finally:
-                os.close(child_fd)
-            os.rmdir(name, dir_fd=directory_fd)
-        else:
-            os.unlink(name, dir_fd=directory_fd)
-
-
-def _remove_directory_if_identity(
-    parent_fd: int,
-    name: str,
-    expected_identity: tuple[int, int],
-) -> bool:
-    try:
-        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return False
-    if not stat.S_ISDIR(info.st_mode) or _identity(info) != expected_identity:
-        return False
-    directory_fd = _open_child_directory(parent_fd, name)
-    try:
-        if _identity(os.fstat(directory_fd)) != expected_identity:
-            return False
-        _empty_directory_at(directory_fd)
-    finally:
-        os.close(directory_fd)
-    os.rmdir(name, dir_fd=parent_fd)
-    return True
-
-
-def _cleanup_staging_directory(
-    parent_fd: int,
-    name: str,
-    directory_fd: int,
-) -> None:
-    _empty_directory_at(directory_fd)
-    os.rmdir(name, dir_fd=parent_fd)
-
-
-def _verify_promoted_target(
-    parent_fd: int,
-    target_name: str,
-    staged_identity: tuple[int, int],
-    staging_parent_fd: int,
-    original_target_identity: tuple[int, int],
-) -> None:
-    promoted = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
-    if not stat.S_ISDIR(promoted.st_mode) or _identity(promoted) != staged_identity:
-        raise BackupError("promoted restore target identity could not be confirmed")
-    displaced = os.stat(
-        "hermes-home", dir_fd=staging_parent_fd, follow_symlinks=False
-    )
-    if not stat.S_ISDIR(displaced.st_mode) or _identity(displaced) != original_target_identity:
-        raise BackupError("import target was substituted during atomic promotion")
-    promoted_fd = _open_child_directory(parent_fd, target_name)
-    try:
-        if _identity(os.fstat(promoted_fd)) != staged_identity:
-            raise BackupError("promoted restore target identity changed")
-    finally:
-        os.close(promoted_fd)
-
-
-def _fsync_restore_parent(parent_fd: int) -> None:
-    os.fsync(parent_fd)
-
-
-def _stage_and_activate_restore(
-    zf: zipfile.ZipFile,
-    plan: list[_RestoreMember],
-    hermes_root: Path,
-) -> tuple[int, int, list[str]]:
-    """Stage and atomically activate using only pinned, no-follow descriptors."""
-    _require_secure_restore_primitives()
-    hermes_root = Path(os.path.abspath(hermes_root))
-    parent = _open_anchored_directory(hermes_root.parent, create=True)
-    target_name = hermes_root.name
-    target_fd = -1
-    temp_fd = -1
-    staged_fd = -1
-    temp_name = ""
-    target_created = False
-    promoted = False
-    staged_identity: Optional[tuple[int, int]] = None
-    target_identity: Optional[tuple[int, int]] = None
-    promotion_attempted = False
-    directory_identities: dict[str, tuple[int, int]] = {}
-    file_identities: dict[str, tuple[int, int]] = {}
-    try:
-        (
-            target_fd,
-            target_identity,
-            target_created,
-        ) = _prepare_empty_restore_target(parent.fd, target_name)
-        temp_name, temp_fd, staged_fd = _create_staging_directory(parent.fd)
-        staged_identity = _identity(os.fstat(staged_fd))
-        directory_identities[""] = staged_identity
-
-        skipped_runtime: list[str] = []
-        for member in plan:
-            if member.skip_runtime:
-                skipped_runtime.append(member.relative_path)
-                continue
-            _copy_validated_member_at(
-                zf,
-                member,
-                staged_fd,
-                directory_identities,
-                file_identities,
-            )
-
-        _verify_staged_members(
-            staged_fd, plan, directory_identities, file_identities
-        )
-        _validate_staged_databases_at(
-            staged_fd, plan, directory_identities, file_identities
-        )
-        _fsync_tree_at(
-            staged_fd, directory_identities, file_identities
-        )
-        os.fsync(temp_fd)
-        _revalidate_restore_anchor(parent)
-        _revalidate_empty_restore_target(
-            parent.fd, target_name, target_fd, target_identity
-        )
-
-        promotion_attempted = True
-        _exchange_directories_at(temp_fd, "hermes-home", parent.fd, target_name)
-        promoted = True
-        _verify_promoted_target(
-            parent.fd,
-            target_name,
-            staged_identity,
-            temp_fd,
-            target_identity,
-        )
-        promoted_fd = _open_child_directory(parent.fd, target_name)
-        try:
-            _verify_staged_members(
-                promoted_fd, plan, directory_identities, file_identities
-            )
-            _verify_tree_shape_at(
-                promoted_fd, directory_identities, file_identities
-            )
-        finally:
-            os.close(promoted_fd)
-        _revalidate_restore_anchor(parent)
-        try:
-            _fsync_restore_parent(parent.fd)
-        except BaseException as exc:
-            raise RestoreActivatedDurabilityError(
-                "restore root was activated, but parent-directory durability "
-                f"could not be confirmed: {exc}"
-            ) from exc
-
-        try:
-            _cleanup_staging_directory(parent.fd, temp_name, temp_fd)
-            temp_name = ""
-            _fsync_restore_parent(parent.fd)
-        except BaseException as exc:
-            raise RestoreActivatedCleanupError(
-                "restore root is active, but displaced empty-target cleanup "
-                f"could not be confirmed: {exc}"
-            ) from exc
-
-        restored = sum(1 for member in plan if not member.skip_runtime)
-        return restored, 0, skipped_runtime
-    except (RestoreActivatedDurabilityError, RestoreActivatedCleanupError):
-        raise
-    except BaseException as exc:
-        if promotion_attempted and staged_identity is not None:
-            try:
-                current = os.stat(
-                    target_name, dir_fd=parent.fd, follow_symlinks=False
-                )
-                promoted = stat.S_ISDIR(current.st_mode) and _identity(current) == staged_identity
-            except OSError:
-                promoted = False
-        if promoted:
-            rollback_error: Optional[BaseException] = None
-            try:
-                _exchange_directories_at(temp_fd, "hermes-home", parent.fd, target_name)
-                promoted = False
-                restored_target = os.stat(
-                    target_name, dir_fd=parent.fd, follow_symlinks=False
-                )
-                if _identity(restored_target) != target_identity:
-                    raise BackupError("original empty target identity was not restored")
-                if target_created and not _remove_directory_if_identity(
-                    parent.fd, target_name, target_identity
-                ):
-                    raise BackupError("temporary empty target could not be removed")
-                target_created = False
-                _cleanup_staging_directory(parent.fd, temp_name, temp_fd)
-                temp_name = ""
-                _fsync_restore_parent(parent.fd)
-            except BaseException as rollback_exc:
-                rollback_error = rollback_exc
-            if rollback_error is not None:
-                raise RestoreRollbackError(
-                    "restore activation failed and rollback could not be confirmed: "
-                    f"{rollback_error}"
-                ) from exc
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                raise
-            raise RestoreRolledBackError(
-                f"restore activation failed; empty-target state was restored: {exc}"
-            ) from exc
-        cleanup_error: Optional[BaseException] = None
-        try:
-            if temp_name:
-                _cleanup_staging_directory(parent.fd, temp_name, temp_fd)
-                temp_name = ""
-            if target_created and target_identity is not None:
-                if not _remove_directory_if_identity(
-                    parent.fd, target_name, target_identity
-                ):
-                    raise BackupError("temporary empty target could not be removed")
-                target_created = False
-            _fsync_restore_parent(parent.fd)
-        except BaseException as cleanup_exc:
-            cleanup_error = cleanup_exc
-        if cleanup_error is not None:
-            raise RestoreRollbackError(
-                "restore failed before activation and cleanup could not be confirmed: "
-                f"{cleanup_error}"
-            ) from exc
-        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-            raise
-        if isinstance(exc, BackupError):
-            raise
-        raise BackupError(f"could not stage or activate import: {exc}") from exc
-    finally:
-        if staged_fd >= 0:
-            os.close(staged_fd)
-        if temp_fd >= 0:
-            try:
-                _empty_directory_at(temp_fd)
-            except OSError:
-                pass
-            os.close(temp_fd)
-        if temp_name:
-            try:
-                os.rmdir(temp_name, dir_fd=parent.fd)
-            except OSError:
-                pass
-        if not promoted and target_created and target_identity is not None:
-            try:
-                _remove_directory_if_identity(parent.fd, target_name, target_identity)
-            except OSError:
-                pass
-        if target_fd >= 0:
-            os.close(target_fd)
-        parent.close()
-
-
 def run_import(args) -> None:
-    """Restore a fully prevalidated Hermes backup into an empty root."""
+    """Restore a Hermes backup from a zip file."""
     zip_path = Path(args.zipfile).expanduser().resolve()
 
     if not zip_path.is_file():
@@ -2005,104 +861,228 @@ def run_import(args) -> None:
         print(f"Error: Not a valid zip file: {zip_path}")
         sys.exit(1)
 
-    hermes_root = Path(os.path.abspath(get_default_hermes_root()))
-    require_protected_control_file_capability(
-        ProtectedFileOperation.IMPORT,
-        (zip_path, hermes_root),
-        capability=ProtectedFileCapability.BACKUP_RESTORE,
-    )
-    if hermes_root.is_symlink():
-        print(f"Error: Import target cannot be a symlink: {hermes_root}")
-        raise SystemExit(1)
-    if hermes_root.exists() and not hermes_root.is_dir():
-        print(f"Error: Import target is not a directory: {hermes_root}")
-        raise SystemExit(1)
-    if hermes_root.exists() and any(hermes_root.iterdir()):
-        print(
-            "Error: Import into an existing nonempty Hermes home is disabled. "
-            "--force cannot safely provide all-or-nothing overlay semantics; "
-            "import into an empty profile/root instead."
-        )
-        raise SystemExit(1)
+    hermes_root = get_default_hermes_root()
 
-    try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            ok, reason = _validate_backup_zip(zf)
-            if not ok:
-                raise BackupError(reason)
-            plan, manifest, prefix = _build_restore_plan(
-                zf,
-                hermes_root,
-            )
-            print(f"Backup contains {len(plan)} files")
-            print(f"Target: {display_hermes_home()}")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        # Validate
+        ok, reason = _validate_backup_zip(zf)
+        if not ok:
+            print(f"Error: {reason}")
+            sys.exit(1)
+
+        prefix = _detect_prefix(zf)
+        members = [n for n in zf.namelist() if not n.endswith("/")]
+        file_count = len(members)
+
+        print(f"Backup contains {file_count} files")
+        print(f"Target: {display_hermes_home()}")
+
+        if prefix:
+            print(f"Detected archive prefix: {prefix!r} (will be stripped)")
+
+        # Check for existing installation
+        has_config = (hermes_root / "config.yaml").exists()
+        has_env = (hermes_root / ".env").exists()
+
+        if (has_config or has_env) and not args.force:
+            print()
+            print("Warning: Target directory already has Hermes configuration.")
+            print("Importing will overwrite existing files with backup contents.")
+            print()
+            try:
+                answer = input("Continue? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\nAborted.")
+                sys.exit(1)
+            if answer not in {"y", "yes"}:
+                print("Aborted.")
+                return
+
+        # Extract
+        print(f"\nImporting {file_count} files ...")
+        hermes_root.mkdir(parents=True, exist_ok=True)
+
+        errors = []
+        restored = 0
+        restored_external = 0
+        skipped_runtime: list[str] = []
+        home_dir = Path.home().resolve()
+        t0 = time.monotonic()
+
+        for member in members:
+            # External memory-provider state captured under the reserved
+            # ``_external/`` arc prefix restores to its original home-relative
+            # location (e.g. ~/.honcho/config.json), NOT under HERMES_HOME.
+            if member.startswith(_EXTERNAL_PREFIX):
+                ext_rel = member[len(_EXTERNAL_PREFIX):]
+                if not ext_rel:
+                    continue
+                target = home_dir / ext_rel
+                # Security: the resolved target must stay under the home dir.
+                try:
+                    target.resolve().relative_to(home_dir)
+                except ValueError:
+                    errors.append(f"  {member}: path traversal blocked")
+                    continue
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(member) as src, open(target, "wb") as dst:
+                        dst.write(src.read())
+                    # External provider configs commonly hold credentials.
+                    if target.suffix in {".json", ".env", ".conf"} or target.name in _SECRET_FILE_NAMES:
+                        try:
+                            os.chmod(target, 0o600)
+                        except OSError:
+                            pass
+                    restored += 1
+                    restored_external += 1
+                except (PermissionError, OSError) as exc:
+                    errors.append(f"  {member}: {exc}")
+                if restored % 500 == 0:
+                    print(f"  {restored}/{file_count} files ...")
+                continue
+
+            # Strip prefix if detected
+            if prefix and member.startswith(prefix):
+                rel = member[len(prefix):]
+            else:
+                rel = member
+
+            if not rel:
+                continue
+
+            # Never overwrite volatile gateway/process runtime state. These are
+            # namespaced to the machine/container the backup was taken on;
+            # clobbering them (especially gateway_state.json) breaks the gateway
+            # reconciler on the target and disconnects hosted instances from the
+            # Nous portal. Matched by basename so both the root profile and
+            # named profiles (profiles/<name>/gateway_state.json) are covered.
+            if Path(rel).name in _IMPORT_SKIP_NAMES:
+                skipped_runtime.append(rel)
+                continue
+
+            target = hermes_root / rel
+
+            # Security: reject absolute paths and traversals
+            try:
+                target.resolve().relative_to(hermes_root.resolve())
+            except ValueError:
+                errors.append(f"  {rel}: path traversal blocked")
+                continue
+
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(member) as src, open(target, "wb") as dst:
+                    dst.write(src.read())
+                if target.name in _SECRET_FILE_NAMES:
+                    os.chmod(target, 0o600)
+                restored += 1
+            except (PermissionError, OSError) as exc:
+                errors.append(f"  {rel}: {exc}")
+
+            if restored % 500 == 0:
+                print(f"  {restored}/{file_count} files ...")
+
+        elapsed = time.monotonic() - t0
+
+        # Summary
+        print()
+        print(f"Import complete: {restored} files restored in {elapsed:.1f}s")
+        print(f"  Target: {display_hermes_home()}")
+
+        if restored_external:
             print(
-                "Format: manifest v1"
-                if manifest is not None
-                else "Format: legacy marker-only archive (in-home restore only)"
+                f"\n  Restored {restored_external} memory-provider file(s) to "
+                f"their original location(s) outside {display_hermes_home()}."
             )
-            if prefix:
-                print(f"Detected archive prefix: {prefix!r} (will be stripped)")
-            print(f"\nImporting {len(plan)} files ...")
-            t0 = time.monotonic()
-            restored, restored_external, skipped_runtime = _stage_and_activate_restore(
-                zf,
-                plan,
-                hermes_root,
-            )
-            elapsed = time.monotonic() - t0
-    except RestoreActivatedDurabilityError as exc:
-        print(f"Error: Restore activated with durability unknown: {exc}")
-        raise SystemExit(1) from exc
-    except RestoreActivatedCleanupError as exc:
-        print(f"Error: Restore activated but cleanup is incomplete: {exc}")
-        raise SystemExit(1) from exc
-    except (BackupError, OSError, RuntimeError, ValueError, zipfile.BadZipFile) as exc:
-        print(f"Error: Import failed: {exc}")
-        raise SystemExit(1) from exc
 
-    restored_profiles: list[str] = []
-    profiles_dir = hermes_root / "profiles"
-    if profiles_dir.is_dir():
-        for entry in sorted(profiles_dir.iterdir()):
-            if not entry.is_dir() or entry.is_symlink():
-                continue
-            if not (entry / "config.yaml").exists() and not (entry / ".env").exists():
-                continue
-            restored_profiles.append(entry.name)
+        if errors:
+            print(f"\n  Warnings ({len(errors)} files skipped):")
+            for e in errors[:10]:
+                print(e)
+            if len(errors) > 10:
+                print(f"  ... and {len(errors) - 10} more")
+
+        if skipped_runtime:
+            print(
+                f"\n  Preserved {len(skipped_runtime)} runtime state "
+                f"file(s) (kept this machine's, not the backup's):"
+            )
+            for rel in sorted(skipped_runtime)[:10]:
+                print(f"    {rel}")
+            if len(skipped_runtime) > 10:
+                print(f"    ... and {len(skipped_runtime) - 10} more")
+
+        # Post-import: restore profile wrapper scripts
+        profiles_dir = hermes_root / "profiles"
+        restored_profiles = []
+        if profiles_dir.is_dir():
+            try:
+                from hermes_cli.profiles import (
+                    create_wrapper_script, check_alias_collision,
+                    _is_wrapper_dir_in_path, _get_wrapper_dir,
+                )
+                for entry in sorted(profiles_dir.iterdir()):
+                    if not entry.is_dir():
+                        continue
+                    profile_name = entry.name
+                    # Only create wrappers for directories with config
+                    if not (entry / "config.yaml").exists() and not (entry / ".env").exists():
+                        continue
+                    collision = check_alias_collision(profile_name)
+                    if collision:
+                        print(f"  Skipped alias '{profile_name}': {collision}")
+                        restored_profiles.append((profile_name, False))
+                    else:
+                        wrapper = create_wrapper_script(profile_name)
+                        restored_profiles.append((profile_name, wrapper is not None))
+
+                if restored_profiles:
+                    created = [n for n, ok in restored_profiles if ok]
+                    skipped = [n for n, ok in restored_profiles if not ok]
+                    if created:
+                        print(f"\n  Profile aliases restored: {', '.join(created)}")
+                    if skipped:
+                        print(f"  Profile aliases skipped:  {', '.join(skipped)}")
+                    if not _is_wrapper_dir_in_path():
+                        print(f"\n  Note: {_get_wrapper_dir()} is not in your PATH.")
+                        print('  Add to your shell config (~/.bashrc or ~/.zshrc):')
+                        print('    export PATH="$HOME/.local/bin:$PATH"')
+            except ImportError:
+                # hermes_cli.profiles might not be available (fresh install)
+                if any(profiles_dir.iterdir()):
+                    print("\n  Profiles detected but aliases could not be created.")
+                    print("  Run: hermes profile list  (after installing hermes)")
+
+        # Guidance
+        print()
+        if not (hermes_root / "hermes-agent").is_dir():
+            print("Note: The hermes-agent codebase was not included in the backup.")
+            print("  If this is a fresh install, run: hermes update")
+
         if restored_profiles:
-            print(
-                "\n  Profile configuration restored; automatic writes to "
-                "~/.local/bin are disabled during import."
-            )
-            print("  Review profiles, then recreate aliases with the profile command.")
+            gw_profiles = [n for n, _ in restored_profiles]
+            print("\nTo re-enable gateway services for profiles:")
+            for pname in gw_profiles:
+                print(f"  hermes -p {pname} gateway install")
 
-    print()
-    print(f"Import complete: {restored} files restored in {elapsed:.1f}s")
-    print(f"  Target: {display_hermes_home()}")
-    if restored_external:
-        print(
-            f"\n  Restored {restored_external} memory-provider file(s) to "
-            f"their currently declared location(s) outside {display_hermes_home()}."
-        )
-    if skipped_runtime:
-        print(
-            f"\n  Dropped {len(skipped_runtime)} source-machine runtime state file(s):"
-        )
-        for rel in sorted(skipped_runtime)[:10]:
-            print(f"    {rel}")
-        if len(skipped_runtime) > 10:
-            print(f"    ... and {len(skipped_runtime) - 10} more")
+        # Bring the restored install to life: the backup may contain bot
+        # tokens and registered cron jobs, but they're inert without a
+        # gateway process. Install/start the service automatically (a
+        # platform-less gateway is a supported mode, so this is safe even
+        # for backups with no messaging config). Best-effort and prompt-free;
+        # failures print a manual fallback and never fail the import.
+        try:
+            from hermes_cli.gateway import ensure_gateway_service, _is_service_running
 
-    print()
-    if not (hermes_root / "hermes-agent").is_dir():
-        print("Note: The hermes-agent codebase was not included in the backup.")
-        print("  If this is a fresh install, run: hermes update")
-    if restored_profiles:
-        print("\nTo re-enable gateway services for profiles:")
-        for profile_name in restored_profiles:
-            print(f"  hermes -p {profile_name} gateway install")
-    print("Done. The validated Hermes state has been restored.")
+            if not _is_service_running():
+                print()
+                ensure_gateway_service(context="import")
+        except Exception:
+            print("\nStart the gateway to activate cron jobs and messaging:")
+            print("  hermes gateway install")
+
+        print("Done. Your Hermes configuration has been restored.")
 
 
 # ---------------------------------------------------------------------------
@@ -2164,6 +1144,23 @@ def create_quick_snapshot(
     keep: Optional[int] = None,
     max_file_size: Optional[int] = None,
 ) -> Optional[str]:
+    """Create one atomic quick snapshot while holding the shared backup slot."""
+    home = hermes_home or get_hermes_home()
+    with _backup_operation_lock(home):
+        return _create_quick_snapshot_locked(
+            label=label,
+            hermes_home=home,
+            keep=keep,
+            max_file_size=max_file_size,
+        )
+
+
+def _create_quick_snapshot_locked(
+    label: Optional[str] = None,
+    hermes_home: Optional[Path] = None,
+    keep: Optional[int] = None,
+    max_file_size: Optional[int] = None,
+) -> Optional[str]:
     """Create a quick state snapshot of critical files.
 
     Copies STATE_FILES to a timestamped directory under state-snapshots/.
@@ -2208,11 +1205,25 @@ def create_quick_snapshot(
         return True
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    snap_id = f"{ts}-{label}" if label else ts
+    base_snap_id = f"{ts}-{label}" if label else ts
+    snap_id = base_snap_id
+    suffix = 2
+    while (root / snap_id).exists():
+        snap_id = f"{base_snap_id}-{suffix}"
+        suffix += 1
     snap_dir = root / snap_id
-    snap_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir = root / f".{snap_id}.{os.getpid()}.partial"
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    staging_dir.mkdir(parents=True, exist_ok=False)
+    logger.info("quick snapshot phase=copy status=started id=%s", snap_id)
 
     manifest: Dict[str, int] = {}  # rel_path -> file size
+    failed_dbs: list[str] = []  # present *.db that could not be snapshotted
+    # #68805: track protected DB files skipped for size — they are snapshot
+    # incompleteness just like a failed copy, so pruning must be suppressed
+    # to preserve the older complete snapshot that may contain the only
+    # recoverable database.
+    oversized_skipped: list[str] = []
 
     for rel in _QUICK_STATE_FILES:
         src = home / rel
@@ -2233,8 +1244,10 @@ def create_quick_snapshot(
                 if "/workspaces/" in f"/{sub_rel}/" or "/attachments/" in f"/{sub_rel}/":
                     continue
                 if _too_large(sub, sub_rel):
+                    if sub.suffix == ".db":
+                        oversized_skipped.append(sub_rel)
                     continue
-                dst = snap_dir / sub_rel
+                dst = staging_dir / sub_rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     # Route SQLite DBs through the WAL-safe backup() path so a
@@ -2242,6 +1255,16 @@ def create_quick_snapshot(
                     # snapshot time) is captured consistently.
                     if sub.suffix == ".db":
                         if not _safe_copy_db(sub, dst):
+                            failed_dbs.append(sub_rel)
+                            print(
+                                f"  ⚠ Snapshot: SQLite safe copy FAILED for {sub_rel} "
+                                f"— file may be locked or corrupted"
+                            )
+                            if is_zeroed_sqlite_file(sub):
+                                print(
+                                    f"  ⚠ Snapshot: {sub_rel} looks ZEROED "
+                                    f"(no SQLite header; {sub.stat().st_size} bytes of NULs?)"
+                                )
                             continue
                     else:
                         shutil.copy2(sub, dst)
@@ -2254,14 +1277,26 @@ def create_quick_snapshot(
             continue
 
         if _too_large(src, rel):
+            if src.suffix == ".db":
+                oversized_skipped.append(rel)
             continue
 
-        dst = snap_dir / rel
+        dst = staging_dir / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
 
         try:
             if src.suffix == ".db":
                 if not _safe_copy_db(src, dst):
+                    failed_dbs.append(rel)
+                    print(
+                        f"  ⚠ Snapshot: SQLite safe copy FAILED for {rel} "
+                        f"— file may be locked or corrupted"
+                    )
+                    if is_zeroed_sqlite_file(src):
+                        print(
+                            f"  ⚠ Snapshot: {rel} looks ZEROED "
+                            f"(no SQLite header; {src.stat().st_size} bytes)"
+                        )
                     continue
             else:
                 shutil.copy2(src, dst)
@@ -2269,8 +1304,31 @@ def create_quick_snapshot(
         except (OSError, PermissionError) as exc:
             logger.warning("Could not snapshot %s: %s", rel, exc)
 
+    if failed_dbs:
+        # Critical: update path used to log-and-continue with exit 0, so a
+        # missing state.db backup looked like a successful pre-update snapshot
+        # (#68474). Surface this on stdout where operators actually look.
+        print(
+            "  ⚠ CRITICAL: could not snapshot DB file(s): "
+            + ", ".join(failed_dbs)
+        )
+        print(
+            "  ⚠ If sessions disappear after update, check "
+            f"{root} and run: hermes snapshot list"
+        )
+        logger.error(
+            "Quick snapshot failed to capture DB file(s): %s",
+            ", ".join(failed_dbs),
+        )
+
     if not manifest:
-        shutil.rmtree(snap_dir, ignore_errors=True)
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        if failed_dbs:
+            # Distinguish "nothing to snapshot" from "state.db present but unreadable"
+            print(
+                "  ⚠ Snapshot aborted: no files captured "
+                f"(failed DBs: {', '.join(failed_dbs)})"
+            )
         return None
 
     # Write manifest
@@ -2281,16 +1339,46 @@ def create_quick_snapshot(
         "file_count": len(manifest),
         "total_size": sum(manifest.values()),
         "files": manifest,
+        "failed_dbs": failed_dbs,
+        "oversized_skipped": oversized_skipped,
     }
-    with open(snap_dir / "manifest.json", "w", encoding="utf-8") as f:
+    with open(staging_dir / "manifest.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
+
+    os.replace(staging_dir, snap_dir)
 
     # Auto-prune. Defaults preserve historical manual /snapshot behavior; callers
     # with known high-churn safety snapshots (for example pre-update) can pass a
     # smaller keep value so large state.db copies do not accumulate indefinitely.
-    _prune_quick_snapshots(root, keep=_QUICK_DEFAULT_KEEP if keep is None else keep)
+    # #68805 review: skip pruning when a present DB failed to capture OR was
+    # skipped for size — either way the snapshot is incomplete and the older
+    # snapshot may contain the only recoverable database.
+    incomplete = failed_dbs or oversized_skipped
+    if not incomplete:
+        _prune_quick_snapshots(root, keep=_QUICK_DEFAULT_KEEP if keep is None else keep)
+    else:
+        if oversized_skipped:
+            print(
+                "  ⚠ Skipping snapshot prune: DB file(s) skipped for size: "
+                + ", ".join(oversized_skipped)
+            )
+            logger.warning(
+                "Quick snapshot skipped oversized DB file(s): %s",
+                ", ".join(oversized_skipped),
+            )
+        logger.warning(
+            "Skipping snapshot prune because %d DB(s) failed to capture "
+            "and/or %d were oversized — preserving older snapshots as "
+            "recovery source",
+            len(failed_dbs), len(oversized_skipped),
+        )
 
-    logger.info("State snapshot created: %s (%d files)", snap_id, len(manifest))
+    logger.info(
+        "quick snapshot phase=copy status=complete id=%s files=%d bytes=%d",
+        snap_id,
+        len(manifest),
+        sum(manifest.values()),
+    )
     return snap_id
 
 
@@ -2305,7 +1393,7 @@ def list_quick_snapshots(
 
     results = []
     for d in sorted(root.iterdir(), reverse=True):
-        if not d.is_dir():
+        if not d.is_dir() or d.name.startswith(".") or d.name.endswith(".partial"):
             continue
         manifest_path = d / "manifest.json"
         if manifest_path.exists():
@@ -2514,7 +1602,11 @@ def _prune_quick_snapshots(root: Path, keep: int = _QUICK_DEFAULT_KEEP) -> int:
         return 0
 
     dirs = sorted(
-        (d for d in root.iterdir() if d.is_dir()),
+        (
+            d
+            for d in root.iterdir()
+            if d.is_dir() and not d.name.startswith(".") and not d.name.endswith(".partial")
+        ),
         key=lambda d: d.name,
         reverse=True,
     )
@@ -2556,36 +1648,30 @@ def run_quick_backup(args) -> None:
 # ---------------------------------------------------------------------------
 
 def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
+    """Single-flight wrapper for automatic full zip backups."""
+    try:
+        with _backup_operation_lock(hermes_root):
+            return _write_full_zip_backup_locked(out_path, hermes_root)
+    except BackupInProgressError as exc:
+        logger.warning("Full-zip backup skipped: %s", exc)
+        return None
+
+
+def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional[Path]:
     """Write a full zip snapshot of ``hermes_root`` to ``out_path``.
 
     Uses the same exclusion rules and SQLite safe-copy as :func:`run_backup`.
-    Returns the output path on success and ``None`` when there is nothing to
-    back up or promotion did not occur. If promotion occurred but parent-
-    directory durability could not be confirmed, the distinct
-    :class:`BackupPromotedDurabilityError` receipt is preserved for the caller.
+    Returns the output path on success, None on failure (nothing to back up,
+    or write error — caller should surface the outcome but not raise).
     """
-    require_protected_control_file_capability(
-        ProtectedFileOperation.ARCHIVE,
-        (hermes_root, out_path),
-        capability=ProtectedFileCapability.BACKUP_RESTORE,
-    )
-    sources: list[tuple[Path, str, str]] = []
-    walk_errors: list[OSError] = []
+    scan_started = time.monotonic()
+    logger.info("automatic backup phase=scan status=started")
+    files_to_add: list[tuple[Path, Path]] = []
     try:
-        for dirpath, dirnames, filenames in os.walk(
-            hermes_root,
-            followlinks=False,
-            onerror=walk_errors.append,
-        ):
+        for dirpath, dirnames, filenames in os.walk(hermes_root, followlinks=False):
             dp = Path(dirpath)
-            rel_dir = dp.relative_to(hermes_root)
-            is_root = rel_dir == Path(".")
-            dirnames[:] = [
-                d
-                for d in dirnames
-                if not (dp / d).is_symlink()
-                and (d not in _EXCLUDED_DIRS or (d == "hermes-agent" and not is_root))
-            ]
+            # Prune excluded directories in-place so os.walk doesn't descend
+            dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIRS]
 
             for fname in filenames:
                 fpath = dp / fname
@@ -2597,26 +1683,70 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
                 if _should_skip_backup_file(fpath, rel, out_path):
                     continue
 
-                sources.append((fpath, rel.as_posix(), "hermes_home"))
-        if walk_errors:
-            raise BackupError(f"walk failed: {walk_errors[0]}")
-    except (BackupError, OSError, ValueError) as exc:
+                files_to_add.append((fpath, rel))
+    except OSError as exc:
         logger.warning("Full-zip backup: walk failed: %s", exc)
         return None
 
-    if not sources:
+    if not files_to_add:
         return None
 
+    logger.info(
+        "automatic backup phase=scan status=complete duration_ms=%.1f files=%d",
+        (time.monotonic() - scan_started) * 1000,
+        len(files_to_add),
+    )
+
+    archive_started = time.monotonic()
     try:
-        _write_backup_archive(out_path, sources, external_roots=[])
-    except BackupPromotedDurabilityError as exc:
-        raise BackupPromotedDurabilityError(
-            f"pre-update archive was promoted to {out_path}, but its directory "
-            f"entry durability is unknown: {exc}"
-        ) from exc
-    except (BackupError, OSError, ValueError, zipfile.BadZipFile) as exc:
-        logger.warning("Full-zip backup failed without promoting a partial archive: %s", exc)
+        with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
+            archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6
+        ) as zf:
+            for index, (abs_path, rel_path) in enumerate(files_to_add, 1):
+                try:
+                    if abs_path.suffix == ".db":
+                        # Stage the snapshot alongside the output zip so that the
+                        # temp file lives on the same filesystem.  The system
+                        # default (/tmp) may be a small tmpfs that cannot hold
+                        # large databases, causing silent backup incompleteness.
+                        with tempfile.NamedTemporaryFile(
+                            suffix=".db", delete=False, dir=str(out_path.parent)
+                        ) as tmp:
+                            tmp_db = Path(tmp.name)
+                        try:
+                            if not _safe_copy_db(abs_path, tmp_db):
+                                logger.warning(
+                                    "Full-zip backup aborted: SQLite snapshot failed for %s",
+                                    rel_path,
+                                )
+                                raise _SQLiteSnapshotError(str(rel_path))
+                            zf.write(tmp_db, arcname=str(rel_path))
+                        finally:
+                            tmp_db.unlink(missing_ok=True)
+                    else:
+                        zf.write(abs_path, arcname=str(rel_path))
+                except (PermissionError, OSError, ValueError) as exc:
+                    logger.debug("Skipping %s in zip backup: %s", rel_path, exc)
+                    continue
+                if index % 500 == 0:
+                    logger.info(
+                        "automatic backup phase=archive status=progress completed=%d total=%d",
+                        index,
+                        len(files_to_add),
+                    )
+    except (OSError, _SQLiteSnapshotError) as exc:
+        logger.warning("Full-zip backup: zip write failed: %s", exc)
+        # ``_atomic_output_path`` already removed the hidden partial.  Do not
+        # unlink ``out_path`` here: it may be a previous valid backup that the
+        # atomic publisher deliberately preserved.
         return None
+
+    logger.info(
+        "automatic backup phase=archive status=complete duration_ms=%.1f files=%d bytes=%d",
+        (time.monotonic() - archive_started) * 1000,
+        len(files_to_add),
+        out_path.stat().st_size,
+    )
 
     return out_path
 
@@ -2705,4 +1835,81 @@ def create_pre_update_backup(
         return None
 
     _prune_pre_update_backups(backup_dir, keep=keep)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Pre-migration auto-backup (used by `hermes claw migrate`)
+# ---------------------------------------------------------------------------
+
+_PRE_MIGRATION_PREFIX = "pre-migration-"
+_PRE_MIGRATION_DEFAULT_KEEP = 5
+
+
+def _prune_pre_migration_backups(backup_dir: Path, keep: int) -> int:
+    """Remove oldest pre-migration backups beyond the keep limit.
+
+    Only touches files matching ``pre-migration-*.zip`` so other backups in
+    the same directory are never touched.
+    """
+    keep = max(keep, 0)
+    if not backup_dir.exists():
+        return 0
+
+    backups = sorted(
+        (p for p in backup_dir.iterdir()
+         if p.is_file() and p.name.startswith(_PRE_MIGRATION_PREFIX) and p.suffix.lower() == ".zip"),
+        key=lambda p: p.name,
+        reverse=True,
+    )
+
+    deleted = 0
+    for p in backups[keep:]:
+        try:
+            p.unlink()
+            deleted += 1
+        except OSError as exc:
+            logger.warning("Failed to prune pre-migration backup %s: %s", p.name, exc)
+
+    return deleted
+
+
+def create_pre_migration_backup(
+    hermes_home: Optional[Path] = None,
+    keep: int = _PRE_MIGRATION_DEFAULT_KEEP,
+) -> Optional[Path]:
+    """Create a full zip backup of HERMES_HOME under ``backups/`` before a
+    ``hermes claw migrate`` apply.
+
+    Shares implementation with :func:`create_pre_update_backup` via
+    ``_write_full_zip_backup`` — same exclusions, same SQLite safe-copy,
+    restorable with ``hermes import <archive>``.  Writes to
+    ``<HERMES_HOME>/backups/pre-migration-<timestamp>.zip`` and auto-prunes
+    old pre-migration backups.
+
+    Returns the path to the created zip, or ``None`` if nothing was found
+    to back up (fresh install) or the write failed.  Never raises — the
+    caller decides whether to abort or proceed.
+    """
+    hermes_root = hermes_home or get_default_hermes_root()
+    if not hermes_root.is_dir():
+        return None
+
+    # Reuses the shared backups/ directory so `hermes import` and the
+    # update-backup listing pick up pre-migration archives too.
+    backup_dir = _pre_update_backup_dir(hermes_root)
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("Could not create pre-migration backup dir %s: %s", backup_dir, exc)
+        return None
+
+    stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    out_path = backup_dir / f"{_PRE_MIGRATION_PREFIX}{stamp}.zip"
+
+    result = _write_full_zip_backup(out_path, hermes_root)
+    if result is None:
+        return None
+
+    _prune_pre_migration_backups(backup_dir, keep=keep)
     return out_path

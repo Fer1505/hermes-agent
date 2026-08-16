@@ -54,6 +54,7 @@ import functools
 import json
 import logging
 import os
+import signal
 import re
 import subprocess
 import shutil
@@ -61,16 +62,52 @@ import sys
 import tempfile
 import threading
 import time
-import requests
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
-from agent.auxiliary_client import call_llm
 from agent.redact import redact_cdp_url
-from hermes_constants import agent_browser_runnable, get_hermes_home
+from hermes_constants import (
+    agent_browser_runnable,
+    get_hermes_home,
+    get_hermes_home_override,
+    hermes_home_key,
+    node_tool_runnable,
+)
 from utils import env_int, is_truthy_value
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
 from hermes_cli._subprocess_compat import windows_hide_flags
+
+
+def __getattr__(name: str):
+    """Lazy module attributes (PEP 562) — import diet for cold start.
+
+    ``requests`` (~40 ms) and ``agent.auxiliary_client.call_llm`` (~65 ms)
+    are only needed on specific code paths, so they load on first use. The
+    module-level names are preserved for the test-patch surface
+    (``patch("tools.browser_tool.requests.get")`` /
+    ``patch("tools.browser_tool.call_llm")``): first attribute access imports
+    the real object and binds it into module globals.
+    """
+    if name == "requests":
+        import requests as _requests
+
+        globals()["requests"] = _requests
+        return _requests
+    if name == "call_llm":
+        from agent.auxiliary_client import call_llm as _call_llm
+
+        globals()["call_llm"] = _call_llm
+        return _call_llm
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _lazy_call_llm(*args, **kwargs):
+    """Invoke ``call_llm`` through module globals so test patches of
+    ``tools.browser_tool.call_llm`` are honored, importing lazily otherwise."""
+    fn = globals().get("call_llm")
+    if fn is None:
+        fn = __getattr__("call_llm")
+    return fn(*args, **kwargs)
 
 # Browser-specific tool keys passed through to the agent-browser subprocess
 # AFTER credential stripping.  agent-browser is a Node process loading npm
@@ -114,14 +151,12 @@ try:
     from tools.url_safety import (
         is_safe_url as _is_safe_url,
         is_always_blocked_url as _is_always_blocked_url,
-        is_public_network_url as _is_public_network_url,
         normalize_url_for_request as _normalize_url_for_request,
         sensitive_query_param_name as _sensitive_query_param_name,
     )
 except Exception:
     _is_safe_url = lambda url: False  # noqa: E731 — fail-closed: block all if safety module unavailable
     _is_always_blocked_url = lambda url: True  # noqa: E731 — fail-closed on the floor too
-    _is_public_network_url = lambda url, **kwargs: False  # noqa: E731 — fail-closed
     _normalize_url_for_request = lambda url: url  # noqa: E731 — best-effort fallback
     _sensitive_query_param_name = lambda url: None  # noqa: E731 — best-effort fallback
 # Browser-provider ABC + registry — PR #25214 moved the per-vendor providers
@@ -129,15 +164,20 @@ except Exception:
 # and into ``plugins/browser/<vendor>/``. The dispatcher consults the
 # registry; the legacy class names are re-exported below as backward-compat
 # shims for callers that import them from this module.
-from agent.browser_provider import (
-    REMOTE_PROVIDER_EGRESS,
-    BrowserControlTransport,
-    BrowserEgressCapability,
-    BrowserProvider as CloudBrowserProvider,  # noqa: F401  (legacy alias)
-)
+from agent.browser_provider import BrowserProvider as CloudBrowserProvider  # noqa: F401  (legacy alias)
 from agent.browser_registry import (  # noqa: F401  (test-patchable surface)
     get_provider as _registry_get_browser_provider,
 )
+try:
+    from agent.browser_registry import (
+        registry_generation as _browser_registry_generation,
+    )
+except ImportError:
+    # A few isolated compatibility tests intentionally install a minimal
+    # ``agent.browser_registry`` stub exposing only ``get_provider``. Those
+    # harnesses have no mutable registry, so a constant generation is exact.
+    def _browser_registry_generation(*, scope=None):
+        return (0, 0)
 from plugins.browser.browserbase.provider import (  # noqa: F401  (legacy import surface)
     BrowserbaseBrowserProvider as BrowserbaseProvider,
 )
@@ -148,17 +188,18 @@ from plugins.browser.firecrawl.provider import (  # noqa: F401
     FirecrawlBrowserProvider as FirecrawlProvider,
 )
 from tools.tool_backend_helpers import normalize_browser_cloud_provider
-# Camofox self-hosted anti-detection browser backend (optional).
+# Camofox local anti-detection browser backend (optional).
 # When CAMOFOX_URL is set, all browser operations route through the
 # camofox REST API instead of the agent-browser CLI.
 try:
-    from tools.browser_camofox import (
-        is_camofox_co_resident as _is_camofox_co_resident,
-        is_camofox_mode as _is_camofox_mode,
-    )
+    from tools.browser_camofox import is_camofox_mode as _is_camofox_mode
 except ImportError:
     _is_camofox_mode = lambda: False  # noqa: E731
-    _is_camofox_co_resident = lambda: False  # noqa: E731
+# Browser Use CLI (optional)
+try:
+    from tools.browser_use_cli import is_browser_use_cli_mode as _is_browser_use_cli_mode
+except ImportError:
+    _is_browser_use_cli_mode = lambda: False  # noqa: E731
 
 logger = logging.getLogger(__name__)
 
@@ -408,163 +449,7 @@ def _get_extraction_model() -> Optional[str]:
     return os.getenv("AUXILIARY_WEB_EXTRACT_MODEL", "").strip() or None
 
 
-_CDP_PROVENANCE_OPERATOR = "operator-override"
-_CDP_PROVENANCE_CLOUD_PROVIDER = "cloud-provider"
-_PROVIDER_CDP_ALLOWED_SCHEMES = frozenset({"http", "https", "ws", "wss"})
-_PROVIDER_CDP_WEBSOCKET_SCHEMES = frozenset({"ws", "wss"})
-_MAX_CDP_DISCOVERY_BYTES = 64 * 1024
-
-
-def _validated_provider_cdp_parts(
-    endpoint: str,
-    *,
-    allowed_schemes: frozenset[str],
-):
-    """Parse and public-network preflight a provider-returned CDP endpoint."""
-    if not isinstance(endpoint, str):
-        raise ValueError("Provider CDP endpoint must be a string")
-    raw = endpoint.strip()
-    if not raw or any(char.isspace() or ord(char) < 32 for char in raw):
-        raise ValueError("Provider CDP endpoint is empty or malformed")
-    try:
-        parsed = urlsplit(raw)
-        _ = parsed.port
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Provider CDP endpoint is malformed") from exc
-    if parsed.scheme.lower() not in allowed_schemes or not parsed.hostname:
-        raise ValueError("Provider CDP endpoint uses an unsupported URL scheme")
-    if parsed.username is not None or parsed.password is not None:
-        raise ValueError("Provider CDP endpoint must not contain URL userinfo credentials")
-    if parsed.fragment:
-        raise ValueError("Provider CDP endpoint must not contain a URL fragment")
-    if not _is_public_network_url(raw, allowed_schemes=allowed_schemes):
-        raise ValueError("Provider CDP endpoint did not pass public-network preflight")
-    return parsed
-
-
-def _cdp_authority(parsed) -> tuple[str, int | None]:
-    """Return a normalized authority, mapping HTTP↔WS default ports."""
-    scheme = parsed.scheme.lower()
-    default_port = 443 if scheme in {"https", "wss"} else 80
-    return ((parsed.hostname or "").lower().rstrip("."), parsed.port or default_port)
-
-
-def _bounded_cdp_discovery_json(response: requests.Response) -> Dict[str, Any]:
-    """Decode a bounded JSON object without buffering an untrusted body."""
-    content_length = response.headers.get("content-length")
-    if isinstance(content_length, str) and content_length.strip().isdigit():
-        if int(content_length) > _MAX_CDP_DISCOVERY_BYTES:
-            raise ValueError("CDP discovery response exceeds the size limit")
-
-    body = bytearray()
-    for chunk in response.iter_content(chunk_size=8192):
-        if not chunk:
-            continue
-        body.extend(chunk)
-        if len(body) > _MAX_CDP_DISCOVERY_BYTES:
-            raise ValueError("CDP discovery response exceeds the size limit")
-    try:
-        payload = json.loads(bytes(body).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("CDP discovery response is not valid JSON") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("CDP discovery response must be a JSON object")
-    return payload
-
-
-def _resolve_provider_cdp_endpoint(
-    cdp_url: str,
-    capability: BrowserEgressCapability,
-) -> str:
-    """Resolve a provider endpoint under its explicit, unpinned contract."""
-    parsed = _validated_provider_cdp_parts(
-        cdp_url,
-        allowed_schemes=_PROVIDER_CDP_ALLOWED_SCHEMES,
-    )
-    scheme = parsed.scheme.lower()
-
-    # A concrete websocket is already the final control endpoint. A bare
-    # websocket authority (with no path/query) retains legacy discovery
-    # behavior by mapping ws→http and wss→https.
-    if scheme in _PROVIDER_CDP_WEBSOCKET_SCHEMES and (
-        parsed.path not in {"", "/"} or parsed.query
-    ):
-        return cdp_url.strip()
-
-    if scheme in _PROVIDER_CDP_WEBSOCKET_SCHEMES:
-        discovery_scheme = "https" if scheme == "wss" else "http"
-        parsed = urlsplit(
-            urlunsplit(
-                (discovery_scheme, parsed.netloc, parsed.path, parsed.query, "")
-            )
-        )
-
-    path = parsed.path.rstrip("/")
-    if not path.endswith("/json/version"):
-        path = f"{path}/json/version" if path else "/json/version"
-    version_url = urlunsplit(
-        (parsed.scheme, parsed.netloc, path, parsed.query, "")
-    )
-    discovery_parts = _validated_provider_cdp_parts(
-        version_url,
-        allowed_schemes=frozenset({"http", "https"}),
-    )
-
-    response = None
-    try:
-        response = requests.get(
-            version_url,
-            timeout=10,
-            allow_redirects=False,
-            stream=True,
-        )
-        if 300 <= response.status_code < 400:
-            raise ValueError("CDP discovery redirects are not allowed")
-        response.raise_for_status()
-        payload = _bounded_cdp_discovery_json(response)
-    except Exception as exc:
-        logger.warning(
-            "Provider CDP discovery failed for %s: %s",
-            _sanitize_url_for_logs(version_url),
-            type(exc).__name__,
-        )
-        raise RuntimeError(
-            f"Provider CDP discovery failed ({type(exc).__name__})"
-        ) from None
-    finally:
-        if response is not None:
-            response.close()
-
-    ws_url = payload.get("webSocketDebuggerUrl")
-    if not isinstance(ws_url, str) or not ws_url.strip():
-        raise ValueError("CDP discovery did not return webSocketDebuggerUrl")
-    ws_url = ws_url.strip()
-    websocket_parts = _validated_provider_cdp_parts(
-        ws_url,
-        allowed_schemes=_PROVIDER_CDP_WEBSOCKET_SCHEMES,
-    )
-    if (
-        _cdp_authority(discovery_parts) != _cdp_authority(websocket_parts)
-        and not capability.allows_cross_authority_cdp_discovery
-    ):
-        raise ValueError(
-            "Provider CDP discovery returned a cross-authority websocket "
-            "without declaring that behavior"
-        )
-    logger.info(
-        "Resolved provider CDP endpoint %s -> %s (public preflight; DNS unpinned)",
-        _sanitize_url_for_logs(version_url),
-        _sanitize_url_for_logs(ws_url),
-    )
-    return ws_url
-
-
-def _resolve_cdp_override(
-    cdp_url: str,
-    *,
-    provenance: str = _CDP_PROVENANCE_OPERATOR,
-    source_contract: Optional[BrowserEgressCapability] = None,
-) -> str:
+def _resolve_cdp_override(cdp_url: str) -> str:
     """Normalize a user-supplied CDP endpoint into a concrete connectable URL.
 
     Accepts:
@@ -576,13 +461,6 @@ def _resolve_cdp_override(
     webSocketDebuggerUrl so downstream tools always receive a concrete browser
     websocket instead of an ambiguous host:port URL.
     """
-    if provenance == _CDP_PROVENANCE_CLOUD_PROVIDER:
-        if not isinstance(source_contract, BrowserEgressCapability):
-            raise ValueError("Provider CDP endpoint requires an egress source contract")
-        return _resolve_provider_cdp_endpoint(cdp_url, source_contract)
-    if provenance != _CDP_PROVENANCE_OPERATOR:
-        raise ValueError("Unknown CDP endpoint provenance")
-
     raw = (cdp_url or "").strip()
     if not raw:
         return ""
@@ -603,18 +481,12 @@ def _resolve_cdp_override(
     else:
         version_url = discovery_url.rstrip("/") + "/json/version"
 
-    response = None
     try:
-        response = requests.get(
-            version_url,
-            timeout=10,
-            allow_redirects=False,
-            stream=True,
-        )
-        if 300 <= response.status_code < 400:
-            raise ValueError("CDP discovery redirects are not allowed")
+        import requests  # lazy — shared module object, test patches still apply
+
+        response = requests.get(version_url, timeout=10)
         response.raise_for_status()
-        payload = _bounded_cdp_discovery_json(response)
+        payload = response.json()
     except Exception as exc:
         logger.warning(
             "Failed to resolve CDP endpoint %s via %s: %s",
@@ -623,9 +495,6 @@ def _resolve_cdp_override(
             _sanitize_url_for_logs(exc),
         )
         return raw
-    finally:
-        if response is not None:
-            response.close()
 
     ws_url = str(payload.get("webSocketDebuggerUrl") or "").strip()
     if ws_url:
@@ -643,6 +512,45 @@ def _resolve_cdp_override(
     return raw
 
 
+def _get_cdp_override_raw() -> str:
+    """Return the *configured* CDP override without any network I/O.
+
+    Precedence is:
+    1. ``BROWSER_CDP_URL`` env var (live override from ``/browser connect``)
+    2. ``browser.cdp_url`` in config.yaml (persistent config)
+
+    This is the availability-check variant: callers that only need to know
+    *whether* a CDP override is configured (tool ``check_fn`` gates,
+    ``_is_local_mode`` / ``_is_local_backend`` routing decisions,
+    ``hermes doctor``) MUST use this instead of :func:`_get_cdp_override`.
+
+    Rationale: ``_get_cdp_override`` resolves the endpoint over HTTP
+    (``/json/version`` discovery, 10s timeout). Tool-schema assembly runs at
+    every CLI/Desktop startup and probes several browser-family check_fns;
+    when a *stale* ``browser.cdp_url`` points at a dead endpoint (the debug
+    Chrome it referenced is long gone), each check blocked on a failing
+    socket connect and startup stalled for 10+ seconds before the banner —
+    with no error, just mystery slowness. Same principle as the existing
+    "do not execute ``agent-browser --version`` here" rule in
+    ``check_browser_requirements``: no side effects during schema build.
+    """
+    env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
+    if env_override:
+        return env_override
+
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config()
+        browser_cfg = cfg.get("browser", {})
+        if isinstance(browser_cfg, dict):
+            return str(browser_cfg.get("cdp_url", "") or "").strip()
+    except Exception as e:
+        logger.debug("Could not read browser.cdp_url from config: %s", e)
+
+    return ""
+
+
 def _get_cdp_override() -> str:
     """Return a normalized CDP URL override, or empty string.
 
@@ -653,22 +561,16 @@ def _get_cdp_override() -> str:
     When either is set, we skip both Browserbase and the local headless
     launcher and connect directly to the supplied Chrome DevTools Protocol
     endpoint.
+
+    NOTE: resolution may perform an HTTP ``/json/version`` discovery request.
+    Only call this on paths that are about to *connect* (session creation,
+    supervisor attach). Pure is-it-configured gates must use
+    :func:`_get_cdp_override_raw`.
     """
-    env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
-    if env_override:
-        return _resolve_cdp_override(env_override)
-
-    try:
-        from hermes_cli.config import read_raw_config
-
-        cfg = read_raw_config()
-        browser_cfg = cfg.get("browser", {})
-        if isinstance(browser_cfg, dict):
-            return _resolve_cdp_override(str(browser_cfg.get("cdp_url", "") or ""))
-    except Exception as e:
-        logger.debug("Could not read browser.cdp_url from config: %s", e)
-
-    return ""
+    raw = _get_cdp_override_raw()
+    if not raw:
+        return ""
+    return _resolve_cdp_override(raw)
 
 
 def _get_dialog_policy_config() -> Tuple[str, float]:
@@ -794,6 +696,11 @@ _DEFAULT_PROVIDER_REGISTRY: Dict[str, type] = dict(_PROVIDER_REGISTRY)
 
 _cached_cloud_provider: Optional[CloudBrowserProvider] = None
 _cloud_provider_resolved = False
+_cached_cloud_provider_scope: Optional[str] = None
+_cached_cloud_providers: Dict[
+    tuple[str, tuple[int, int]], Optional[CloudBrowserProvider]
+] = {}
+_cloud_provider_cache_lock = threading.RLock()
 _allow_private_urls_resolved = False
 _cached_allow_private_urls: Optional[bool] = None
 _cached_agent_browser: Optional[str] = None
@@ -803,47 +710,6 @@ _agent_browser_resolved = False
 # agent-browser v0.25.3+ supports ``--engine lightpanda`` natively.
 _cached_browser_engine: Optional[str] = None
 _browser_engine_resolved = False
-
-
-class _FailedConfiguredBrowserProvider(CloudBrowserProvider):
-    """Fail-closed stand-in for an explicit provider that cannot be loaded."""
-
-    def __init__(self, configured_name: str, reason: str) -> None:
-        self._configured_name = configured_name
-        self._reason = reason
-        self.configuration_error = True
-
-    @property
-    def name(self) -> str:
-        return self._configured_name
-
-    @property
-    def display_name(self) -> str:
-        return self._configured_name
-
-    @property
-    def egress_capability(self) -> BrowserEgressCapability:
-        return REMOTE_PROVIDER_EGRESS
-
-    def is_available(self) -> bool:
-        return False
-
-    def create_session(self, task_id: str) -> Dict[str, object]:
-        raise RuntimeError(
-            f"Configured browser cloud provider {self._configured_name!r} "
-            f"is unavailable: {self._reason}"
-        )
-
-    def close_session(self, session_id: str) -> bool:
-        return False
-
-    def emergency_cleanup(self, session_id: str) -> None:
-        return None
-
-
-def _failed_configured_provider(name: str, reason: str) -> CloudBrowserProvider:
-    """Return a non-local backend marker without poisoning the resolver cache."""
-    return _FailedConfiguredBrowserProvider(name, reason)
 
 
 def _is_legacy_provider_registry_overridden() -> bool:
@@ -890,6 +756,46 @@ def _ensure_browser_plugins_loaded() -> None:
 
 
 def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
+    """Return the provider cached for the active Hermes profile."""
+    global _cached_cloud_provider, _cloud_provider_resolved
+    global _cached_cloud_provider_scope
+
+    scope = hermes_home_key()
+    with _cloud_provider_cache_lock:
+        # Tests and legacy reset paths clear the boolean. Treat that as a full
+        # reset even if a previous scoped resolution remains mirrored here.
+        if not _cloud_provider_resolved:
+            _cached_cloud_provider_scope = None
+            _cached_cloud_providers.clear()
+        while True:
+            before_generation = _browser_registry_generation(scope=scope)
+            cache_key = (scope, before_generation)
+            if cache_key in _cached_cloud_providers:
+                _cached_cloud_provider = _cached_cloud_providers[cache_key]
+                _cloud_provider_resolved = True
+                _cached_cloud_provider_scope = scope
+                return _cached_cloud_provider
+
+            _cached_cloud_provider = None
+            _cloud_provider_resolved = False
+            resolved = _resolve_cloud_provider_uncached()
+            after_generation = _browser_registry_generation(scope=scope)
+            if before_generation != after_generation:
+                # A force reload replaced/unloaded this profile's provider
+                # while resolution was in progress. Discard the stale result
+                # and resolve against the new registry generation.
+                continue
+            if _cloud_provider_resolved:
+                _cached_cloud_provider_scope = scope
+                for stale_key in [
+                    key for key in _cached_cloud_providers if key[0] == scope
+                ]:
+                    _cached_cloud_providers.pop(stale_key, None)
+                _cached_cloud_providers[cache_key] = resolved
+            return resolved
+
+
+def _resolve_cloud_provider_uncached() -> Optional[CloudBrowserProvider]:
     """Return the configured cloud browser provider, or None for local mode.
 
     Reads ``config["browser"]["cloud_provider"]`` once and caches the result
@@ -899,10 +805,6 @@ def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
     historic auto-detect order, now expressed as the
     :data:`agent.browser_registry._LEGACY_PREFERENCE` walk.
 
-    An explicitly configured provider is authoritative. Unknown names and
-    construction failures return a fail-closed provider marker; they never
-    enter auto-detect or silently select a local browser.
-
     Selection routes through :mod:`agent.browser_registry` so third-party
     browser plugins (``~/.hermes/plugins/browser/<vendor>/``) participate
     in explicit-config resolution. Test fixtures that override
@@ -911,8 +813,6 @@ def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
     ``_is_legacy_provider_registry_overridden``.
     """
     global _cached_cloud_provider, _cloud_provider_resolved
-    if _cloud_provider_resolved:
-        return _cached_cloud_provider
 
     resolved: Optional[CloudBrowserProvider] = None
     try:
@@ -936,36 +836,32 @@ def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
                     factory = _PROVIDER_REGISTRY.get(provider_key)
                     if factory is not None:
                         resolved = factory()
-                    else:
-                        return _failed_configured_provider(
-                            provider_key, "no provider with that name is registered"
-                        )
                 else:
                     # Ensure plugins are discovered so the registry is
                     # populated. Idempotent — cheap on subsequent calls.
                     _ensure_browser_plugins_loaded()
                     resolved = _registry_get_browser_provider(provider_key)
                     if resolved is None:
+                        # Explicit config name unknown to the registry —
+                        # might be a typo, an uninstalled plugin, or a
+                        # registry-population failure. Warn the user
+                        # (legacy code would have surfaced a typed
+                        # credentials error via direct class instantiation;
+                        # post-migration we surface this WARNING instead).
                         logger.warning(
                             "browser.cloud_provider=%r is not a registered "
-                            "browser plugin; refusing automatic or local fallback "
-                            "(install the plugin or fix the config key spelling).",
+                            "browser plugin; falling back to auto-detect "
+                            "(install the corresponding plugin or fix the "
+                            "config key spelling).",
                             provider_key,
                         )
-                        return _failed_configured_provider(
-                            provider_key, "no provider with that name is registered"
-                        )
-            except Exception as exc:
+            except Exception:
                 logger.warning(
-                    "Failed to instantiate explicit cloud_provider %r; refusing "
-                    "automatic or local fallback and retrying resolution on the next call",
+                    "Failed to instantiate explicit cloud_provider %r; will retry on next call",
                     provider_key,
                     exc_info=True,
                 )
-                return _failed_configured_provider(
-                    provider_key,
-                    f"provider initialization failed ({type(exc).__name__})",
-                )
+                return None
     except Exception as e:
         # Config file may be temporarily unreadable; still try auto-detect so
         # env-based / managed-gateway credentials can resolve. Don't pin cache.
@@ -1011,8 +907,26 @@ def _browser_install_hint() -> str:
     return "npm install -g agent-browser && agent-browser install --with-deps"
 
 
+# Sentinel _find_agent_browser returns/caches to mean "resolve via npx" rather
+# than a concrete executable path. A named constant + predicate keep the six
+# comparison sites (four here, plus hermes_cli/tools_config.py and
+# hermes_cli/doctor.py) from drifting if the sentinel's exact spelling ever
+# changes.
+NPX_AGENT_BROWSER_SENTINEL = "npx agent-browser"
+
+# Pinned to match scripts/install.sh / scripts/install.ps1's
+# "agent-browser@^0.26.0" managed install so a git-clone install resolving
+# agent-browser via bare npx gets the same version as a managed install,
+# instead of floating latest with no integrity check. Update both together.
+AGENT_BROWSER_NPX_SPEC = "agent-browser@^0.26.0"
+
+
+def _is_npx_agent_browser_sentinel(browser_cmd: str) -> bool:
+    return browser_cmd.strip() == NPX_AGENT_BROWSER_SENTINEL
+
+
 def _requires_real_termux_browser_install(browser_cmd: str) -> bool:
-    return _is_termux_environment() and _is_local_mode() and browser_cmd.strip() == "npx agent-browser"
+    return _is_termux_environment() and _is_local_mode() and _is_npx_agent_browser_sentinel(browser_cmd)
 
 
 def _termux_browser_install_error() -> str:
@@ -1024,7 +938,7 @@ def _termux_browser_install_error() -> str:
 
 def _is_local_mode() -> bool:
     """Return True when the browser tool will use a local browser backend."""
-    if _get_cdp_override():
+    if _get_cdp_override_raw():
         return False
     return _get_cloud_provider() is None
 
@@ -1032,10 +946,12 @@ def _is_local_mode() -> bool:
 def _is_local_backend() -> bool:
     """Return True when the browser runs locally AND the terminal is also local.
 
-    SSRF protection is required whenever page traffic originates outside the
-    local terminal's network position. A Camofox REST backend is co-resident
-    only when its configured control authority is loopback; Docker aliases,
-    LAN names, and remote authorities are external and uncontrolled.
+    SSRF protection is only meaningful for cloud backends (Browserbase,
+    BrowserUse) where the agent could reach internal resources on a remote
+    machine.  For local backends — Camofox, or the built-in headless
+    Chromium without a cloud provider — the user already has full terminal
+    and network access on the same machine, so the check adds no security
+    value.
 
     However, when the terminal runs in a container (docker, modal, daytona,
     ssh, singularity), the browser on the host can access internal networks
@@ -1054,15 +970,15 @@ def _is_local_backend() -> bool:
     # config (both via _get_cdp_override(), and both now suppress camofox in
     # browser_camofox.py). _is_local_mode() already treats any CDP override as
     # non-local; keep the two helpers in agreement.
-    if _get_cdp_override():
+    if _get_cdp_override_raw():
         return False
-    terminal_backend = os.getenv("TERMINAL_ENV", "local").strip().lower()
     if _is_camofox_mode():
-        return _is_camofox_co_resident() and terminal_backend in ("local", "")
+        return True
     if _get_cloud_provider() is not None:
         return False
     # When terminal runs in a container, browser on host can access
     # internal networks the terminal can't → treat as non-local.
+    terminal_backend = os.getenv("TERMINAL_ENV", "local").strip().lower()
     return terminal_backend in ("local", "")
 
 
@@ -1314,14 +1230,19 @@ def _run_chrome_fallback_command(
             )
         return {"success": False, "error": hint}
 
-    # On Windows npx is npx.cmd — use shutil.which so CreateProcessW can
-    # execute the batch shim.  shutil.which honours PATHEXT on Windows and
-    # returns the plain executable on POSIX.  If npx isn't on PATH (Termux,
-    # bare container), fall back to the bare name and let Popen raise with
-    # a readable "FileNotFoundError: 'npx'" rather than WinError 193.
-    if browser_cmd == "npx agent-browser":
-        _npx_bin = shutil.which("npx") or "npx"
-        cmd_prefix = [_npx_bin, "agent-browser"]
+    # Resolve npx via the same PATH + extended-PATH cascade _find_agent_browser
+    # uses, not a bare shutil.which("npx") — Hermes-managed-Node-only setups
+    # resolve npx only through the extended fallback path, and a bare lookup
+    # would let a broken system npx shadow a healthy managed one. If npx isn't
+    # found at all (Termux, bare container), fall back to the bare name and
+    # let Popen raise with a readable "FileNotFoundError: 'npx'" rather than
+    # WinError 193.
+    if _is_npx_agent_browser_sentinel(browser_cmd):
+        _npx_bin = _resolve_npx_bin() or "npx"
+        # --ignore-scripts: AGENT_BROWSER_NPX_SPEC is a floating ^0.26.0 range,
+        # not an exact pin — a compromised future 0.26.x patch must not get to
+        # run its own install-time lifecycle scripts on this machine.
+        cmd_prefix = [_npx_bin, "--ignore-scripts", "--prefer-offline", "-y", AGENT_BROWSER_NPX_SPEC]
     else:
         cmd_prefix = [browser_cmd]
     base_args = cmd_prefix + ["--engine", "chrome", "--session", tmp_session, "--json"]
@@ -1538,8 +1459,7 @@ def _navigation_session_key(task_id: str, url: str) -> str:
          default True).
       3. The URL resolves to a private/LAN/loopback address.
       4. A CDP override is not active (that path owns the whole session).
-      5. Camofox mode is not active (its REST adapter enforces its own
-         co-resident/external boundary and does not use Chromium sidecars).
+      5. Camofox mode is not active (Camofox is already local-only).
 
     When all are true, returns ``f"{task_id}::local"`` so the hybrid-routing
     path spawns a local Chromium sidecar while the cloud session (if any)
@@ -1547,16 +1467,11 @@ def _navigation_session_key(task_id: str, url: str) -> str:
     """
     if task_id is None:
         task_id = "default"
-    if _get_cdp_override():
+    if _get_cdp_override_raw():
         return task_id
     if _is_camofox_mode():
         return task_id
-    provider = _get_cloud_provider()
-    if provider is None:
-        return task_id
-    # A typo or unloadable explicit provider must fail on the cloud-session
-    # path. It must not qualify for the private-URL local-sidecar exception.
-    if getattr(provider, "configuration_error", False) is True:
+    if _get_cloud_provider() is None:
         return task_id
     if not _auto_local_for_private_urls():
         return task_id
@@ -1625,26 +1540,39 @@ def _last_session_key(task_id: str) -> str:
 def _allow_private_urls() -> bool:
     """Return whether the browser is allowed to navigate to private/internal addresses.
 
-    Reads ``config["browser"]["allow_private_urls"]`` once and caches the result
-    for the process lifetime.  Defaults to ``False`` (SSRF protection active).
+    Reads ``config["browser"]["allow_private_urls"]``. Single-profile calls
+    cache the result for the process lifetime; multiplexed profile turns resolve
+    their context-local config on each call. Defaults to ``False`` (SSRF
+    protection active).
     """
     global _cached_allow_private_urls, _allow_private_urls_resolved
+
+    # The profile multiplexer scopes config with a ContextVar while sharing
+    # this module. Never reuse another profile's private-network opt-out.
+    if get_hermes_home_override() is not None:
+        return _resolve_allow_private_urls()
+
     if _allow_private_urls_resolved:
         return _cached_allow_private_urls
 
     _allow_private_urls_resolved = True
-    _cached_allow_private_urls = False  # safe default
+    _cached_allow_private_urls = _resolve_allow_private_urls()
+    return _cached_allow_private_urls
+
+
+def _resolve_allow_private_urls() -> bool:
+    """Read the browser private-URL toggle from the active config scope."""
     try:
         from hermes_cli.config import read_raw_config
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {})
         if isinstance(browser_cfg, dict):
-            _cached_allow_private_urls = is_truthy_value(
+            return is_truthy_value(
                 browser_cfg.get("allow_private_urls"), default=False
             )
     except Exception as e:
         logger.debug("Could not read allow_private_urls from config: %s", e)
-    return _cached_allow_private_urls
+    return False
 
 
 def _socket_safe_tmpdir() -> str:
@@ -1723,6 +1651,42 @@ _cleanup_running = False
 # Protects _session_last_activity AND _active_sessions for thread safety
 # (subagents run concurrently via ThreadPoolExecutor)
 _cleanup_lock = threading.Lock()
+
+
+def _session_expiry_timestamp(session_info: Dict[str, Any]) -> Optional[float]:
+    """Return a provider-authoritative session expiry as epoch seconds.
+
+    Cloud providers may omit ``expires_at``. Unknown or malformed values are
+    therefore treated as having no known expiry, preserving the existing
+    lifecycle for local browsers and providers without an expiry contract.
+    """
+    value = session_info.get("expires_at")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+
+    normalized = value.strip()
+    if normalized.endswith(("Z", "z")):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        logger.warning("Ignoring invalid cloud browser session expiry timestamp")
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def _session_has_expired(
+    session_info: Dict[str, Any], *, now: Optional[float] = None
+) -> bool:
+    """Return whether a cached browser session crossed its provider deadline."""
+    expires_at = _session_expiry_timestamp(session_info)
+    if expires_at is None:
+        return False
+    return (time.time() if now is None else now) >= expires_at
 
 
 def _emergency_cleanup_all_sessions():
@@ -2276,133 +2240,7 @@ def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
         "bb_session_id": None,
         "cdp_url": cdp_url,
         "features": {"cdp_override": True},
-        "cdp_endpoint": {
-            "provenance": _CDP_PROVENANCE_OPERATOR,
-            "network_policy": "operator-trusted-unpinned",
-        },
     }
-
-
-def _allow_local_fallback_on_cloud_failure() -> bool:
-    """Return the explicit config.yaml opt-in for degraded local execution."""
-    try:
-        from hermes_cli.config import read_raw_config
-
-        return is_truthy_value(
-            cfg_get(
-                read_raw_config(),
-                "browser",
-                "allow_local_fallback_on_cloud_failure",
-                default=False,
-            ),
-            default=False,
-        )
-    except Exception as exc:
-        logger.debug("Could not read cloud fallback policy; failing closed: %s", exc)
-        return False
-
-
-def _provider_egress_capability(
-    provider: CloudBrowserProvider,
-) -> BrowserEgressCapability:
-    """Resolve and validate the provider's explicit egress contract."""
-    if getattr(type(provider), "egress_capability", None) is None:
-        raise ValueError(
-            f"Cloud provider {type(provider).__name__} does not declare an "
-            "egress_capability contract"
-        )
-    capability = provider.egress_capability
-    if not isinstance(capability, BrowserEgressCapability):
-        raise ValueError(
-            f"Cloud provider {type(provider).__name__} returned an invalid "
-            "egress_capability contract"
-        )
-    return capability
-
-
-def _validate_cloud_session(
-    provider: CloudBrowserProvider,
-    session_info: object,
-) -> Dict[str, Any]:
-    """Validate cloud metadata before it can select the CDP backend."""
-    if not isinstance(session_info, dict) or not session_info:
-        raise ValueError(f"Cloud provider returned invalid session: {session_info!r}")
-
-    validated = dict(session_info)
-    for key in ("session_name", "bb_session_id"):
-        value = validated.get(key)
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(
-                f"Cloud provider returned invalid session metadata: {key} "
-                "must be a non-empty string"
-            )
-    if not isinstance(validated.get("features"), dict):
-        raise ValueError(
-            "Cloud provider returned invalid session metadata: features must be a dict"
-        )
-
-    capability = _provider_egress_capability(provider)
-    if (
-        capability.control_transport is not BrowserControlTransport.CDP
-        or not capability.requires_cdp_url
-    ):
-        raise ValueError(
-            f"Cloud provider {type(provider).__name__} declares an unsupported "
-            "egress transport contract"
-        )
-
-    raw_cdp_url = validated.get("cdp_url")
-    if not isinstance(raw_cdp_url, str) or not raw_cdp_url.strip():
-        raise ValueError(
-            "Cloud provider returned invalid session metadata: cdp_url must be "
-            "a non-empty websocket URL"
-        )
-    resolved_cdp_url = _resolve_cdp_override(
-        raw_cdp_url,
-        provenance=_CDP_PROVENANCE_CLOUD_PROVIDER,
-        source_contract=capability,
-    )
-    parsed = urlsplit(resolved_cdp_url)
-    try:
-        _ = parsed.port
-    except ValueError:
-        invalid_port = True
-    else:
-        invalid_port = False
-    if (
-        parsed.scheme.lower() not in {"ws", "wss"}
-        or not parsed.hostname
-        or invalid_port
-        or any(char.isspace() or ord(char) < 32 for char in resolved_cdp_url)
-    ):
-        raise ValueError(
-            "Cloud provider returned invalid session metadata: cdp_url must "
-            "resolve to a ws:// or wss:// endpoint"
-        )
-
-    validated["cdp_url"] = resolved_cdp_url
-    validated["egress"] = capability.as_session_metadata()
-    validated["cdp_endpoint"] = {
-        "provenance": _CDP_PROVENANCE_CLOUD_PROVIDER,
-        "network_policy": "public-preflight-unpinned",
-    }
-    return validated
-
-
-def _close_rejected_cloud_session(
-    provider: CloudBrowserProvider,
-    session_info: object,
-) -> None:
-    """Best-effort cleanup when a created cloud session fails validation."""
-    if not isinstance(session_info, dict):
-        return
-    session_id = session_info.get("bb_session_id")
-    if not isinstance(session_id, str) or not session_id.strip():
-        return
-    try:
-        provider.close_session(session_id)
-    except Exception as exc:
-        logger.warning("Could not close rejected cloud browser session: %s", exc)
 
 
 def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
@@ -2434,8 +2272,29 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
 
     with _cleanup_lock:
         # Check if we already have a session for this task
-        if task_id in _active_sessions:
-            return _active_sessions[task_id]
+        existing_session = _active_sessions.get(task_id)
+
+    if existing_session is not None:
+        if not _session_has_expired(existing_session):
+            return existing_session
+
+        logger.info(
+            "Replacing expired cloud browser session for task %s",
+            task_id,
+        )
+        _cleanup_single_browser_session(task_id)
+        # Cleanup removes the activity entry. The replacement session must be
+        # tracked by the inactivity reaper just like an initial session.
+        _update_session_activity(task_id)
+
+        # Guard against a concurrent replacement: another thread may have
+        # already cleaned up the expired session and created a fresh one
+        # while we were waiting.  If so, return the live replacement instead
+        # of falling through to create yet another session.
+        with _cleanup_lock:
+            replacement = _active_sessions.get(task_id)
+        if replacement is not None and replacement is not existing_session:
+            return replacement
 
     # Hybrid routing: session keys ending with ``::local`` force a local
     # Chromium regardless of the globally-configured cloud provider.  Public
@@ -2454,27 +2313,21 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, Any]:
         if provider is None:
             session_info = _create_local_session(task_id)
         else:
-            created_session: object = None
             try:
-                created_session = provider.create_session(task_id)
-                session_info = _validate_cloud_session(provider, created_session)
+                session_info = provider.create_session(task_id)
+                # Validate cloud provider returned a usable session
+                if not session_info or not isinstance(session_info, dict):
+                    raise ValueError(f"Cloud provider returned invalid session: {session_info!r}")
+                if session_info.get("cdp_url"):
+                    # Some cloud providers (including Browser-Use v3) return an HTTP
+                    # CDP discovery URL instead of a raw websocket endpoint.
+                    session_info = dict(session_info)
+                    session_info["cdp_url"] = _resolve_cdp_override(str(session_info["cdp_url"]))
             except Exception as e:
                 provider_name = type(provider).__name__
-                _close_rejected_cloud_session(provider, created_session)
-                if getattr(provider, "configuration_error", False) is True:
-                    raise RuntimeError(
-                        f"Cloud provider configuration failed closed: {e}"
-                    ) from e
-                if not _allow_local_fallback_on_cloud_failure():
-                    raise RuntimeError(
-                        f"Cloud provider {provider_name} failed ({e}). Local browser "
-                        "fallback is disabled by default; set "
-                        "browser.allow_local_fallback_on_cloud_failure: true in "
-                        "config.yaml to opt in."
-                    ) from e
                 logger.warning(
-                    "Cloud provider %s failed (%s); explicit policy permits fallback "
-                    "to local Chromium for task %s",
+                    "Cloud provider %s failed (%s); attempting fallback to local "
+                    "Chromium for task %s",
                     provider_name, e, task_id,
                     exc_info=True,
                 )
@@ -2522,6 +2375,27 @@ def _agent_browser_candidate_present(path: str | None) -> bool:
     return os.path.exists(path) and (os.name == "nt" or os.access(path, os.X_OK))
 
 
+def _resolve_npx_bin() -> Optional[str]:
+    """Resolve a runnable npx binary, preferring the Hermes-managed/Homebrew
+    extended search over a bare ambient PATH lookup.
+
+    Checking bare PATH first would let a broken or unrelated system npx
+    shadow a healthy Hermes-managed one with no recovery — every candidate
+    is therefore validated with ``node_tool_runnable`` (the same check
+    ``find_hermes_node_executable`` uses to self-heal a managed Node tree)
+    before being trusted, falling through to the next candidate otherwise.
+    """
+    extended_path = _merge_browser_path("")
+    if extended_path:
+        extended_npx = shutil.which("npx", path=extended_path)
+        if extended_npx and node_tool_runnable(extended_npx):
+            return extended_npx
+    npx_path = shutil.which("npx")
+    if npx_path and node_tool_runnable(npx_path):
+        return npx_path
+    return None
+
+
 def _find_agent_browser(*, validate: bool = True) -> str:
     """
     Find the agent-browser CLI executable.
@@ -2541,7 +2415,6 @@ def _find_agent_browser(*, validate: bool = True) -> str:
             raise FileNotFoundError(
                 "agent-browser CLI not found (cached). Install it with: "
                 f"{_browser_install_hint()}\n"
-                "Or run 'npm install' in the repo root to install locally.\n"
                 "Or ensure npx is available in your PATH."
             )
         return _cached_agent_browser
@@ -2606,49 +2479,184 @@ def _find_agent_browser(*, validate: bool = True) -> str:
             return _cached_agent_browser
 
     # Check common npx locations (also search the extended fallback PATH)
-    npx_path = shutil.which("npx")
-    if not npx_path and extended_path:
-        npx_path = shutil.which("npx", path=extended_path)
+    npx_path = _resolve_npx_bin()
     if npx_path:
         if not validate:
-            return "npx agent-browser"
-        _cached_agent_browser = "npx agent-browser"
+            return NPX_AGENT_BROWSER_SENTINEL
+        _cached_agent_browser = NPX_AGENT_BROWSER_SENTINEL
         _agent_browser_resolved = True
         return _cached_agent_browser
 
     if not validate:
         raise FileNotFoundError("agent-browser CLI not found")
 
-    # Nothing found — try lazy installation before giving up, but only when
-    # explicitly enabled or attached to an interactive terminal. Headless CI
-    # and tests should cache the miss quickly rather than running install.sh.
-    auto_install = is_truthy_value(os.environ.get("HERMES_BROWSER_AUTO_INSTALL"))
-    if auto_install or sys.stdin.isatty():
-        try:
-            from hermes_cli.dep_ensure import ensure_dependency
-            if ensure_dependency("browser", interactive=sys.stdin.isatty()):
-                candidates = [
-                    shutil.which("agent-browser"),
-                    shutil.which("agent-browser", path=extended_path) if extended_path else None,
-                    shutil.which("agent-browser", path=str(get_hermes_home() / "node_modules" / ".bin")),
-                    shutil.which("agent-browser", path=str(get_hermes_home() / "node" / "bin")),
-                    shutil.which("agent-browser", path=str(get_hermes_home() / "node")),
-                ]
-                for recheck in candidates:
-                    if recheck and agent_browser_runnable(recheck):
-                        _cached_agent_browser = recheck
-                        _agent_browser_resolved = True
-                        return recheck
-        except Exception:
-            pass
+    # Nothing found — try lazy installation before giving up.
+    try:
+        from hermes_cli.dep_ensure import ensure_dependency
+        if ensure_dependency("browser"):
+            candidates = [
+                shutil.which("agent-browser"),
+                shutil.which("agent-browser", path=extended_path) if extended_path else None,
+                shutil.which("agent-browser", path=str(get_hermes_home() / "node_modules" / ".bin")),
+                shutil.which("agent-browser", path=str(get_hermes_home() / "node" / "bin")),
+                shutil.which("agent-browser", path=str(get_hermes_home() / "node")),
+            ]
+            for recheck in candidates:
+                if recheck and agent_browser_runnable(recheck):
+                    _cached_agent_browser = recheck
+                    _agent_browser_resolved = True
+                    return recheck
+    except Exception:
+        pass
 
     _agent_browser_resolved = True
     raise FileNotFoundError(
         "agent-browser CLI not found. Install it with: "
         f"{_browser_install_hint()}\n"
-        "Or run 'npm install' in the repo root to install locally.\n"
         "Or ensure npx is available in your PATH."
     )
+
+
+def _kill_process_tree(proc: "subprocess.Popen") -> None:
+    """Best-effort kill of *proc* and any descendants it spawned.
+
+    ``Popen.kill()`` only signals the direct child PID. npm/npx routinely
+    fork further processes (registry-fetch helpers, npm's own lifecycle
+    runner, agent-browser's own detached daemon grandchild) that can survive
+    a plain ``kill()`` of the top-level PID and keep a ``capture_output``-style
+    pipe open, hanging the caller's ``communicate()`` past the nominal
+    timeout — the same orphaned-pipe hazard already hit in production on
+    POSIX (see ``tools/process_registry.py``'s ``_reader_loop``, issue
+    #68915: a backgrounded grandchild inheriting a pipe's write end kept it
+    from ever reaching EOF). That hazard is cross-platform, not
+    Windows-specific; what *is* Windows-specific is the lack of a remedy
+    other than killing the tree — anonymous pipes there don't support
+    overlapped I/O, so there's no ``select()``-style non-blocking read to
+    poll around a stuck grandchild the way POSIX can. Killing the whole
+    process group/tree the child was launched into reaches those
+    descendants on both platforms.
+
+    Fires SIGTERM then SIGKILL back-to-back with no grace period between
+    them (unlike ``tools/mcp_stdio_watchdog.py``'s ``_terminate_process_group``,
+    which waits between signals because it's reacting to a live daemon being
+    orphaned). By the time this is called, the caller has already burned its
+    full timeout budget waiting for a graceful exit — there's nothing to gain
+    from waiting again here, only more delay on an already-timed-out call.
+    """
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                check=False,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+        return
+    # os.killpg/signal.SIGKILL don't exist on Windows; this branch is
+    # POSIX-only (the `os.name == "nt"` check above already returns first
+    # on Windows), but resolve them defensively via getattr anyway so an
+    # accidental future refactor that drops that guard degrades to a plain
+    # kill() instead of AttributeError — same discipline as
+    # tools/mcp_stdio_watchdog.py's _terminate_process_group.
+    killpg = getattr(os, "killpg", None)
+    if killpg is None:  # windows-footgun: ok - non-POSIX fallback
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        return
+    sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+    for sig in (signal.SIGTERM, sigkill):
+        try:
+            killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+
+
+def warm_agent_browser_npx_cache(timeout: float = 60.0) -> bool:
+    """Best-effort pre-fetch of the agent-browser npm package via npx.
+
+    agent-browser is no longer a root package.json dependency (#43564) —
+    it resolves lazily via ``npx agent-browser`` instead, which keeps it
+    out of the npm workspace install graph entirely (nothing to prune it
+    anymore) but means the first real invocation in a session would
+    otherwise pay npx's registry-lookup/fetch cost. Calling this during
+    ``hermes update`` (or ``hermes doctor --fix``) warms npx's own cache
+    ahead of time, restoring the "available before any session starts"
+    property agent-browser had while it was an eager root dependency —
+    without re-entangling it with the workspace graph.
+
+    Runs a credential-scrubbed, PATH-propagated environment matching every
+    other agent-browser subprocess spawn (see ``_build_browser_env``) —
+    this used to inherit the full parent environment, including every
+    provider/gateway credential Hermes holds, while running registry-fetched
+    npm code on every ``hermes update`` (the GHSA-m4m8-xjp4-5rmm class of
+    risk ``_build_browser_env`` exists specifically to prevent). Runs in its
+    own process group and kills the *whole* group — not just the top-level
+    npx PID — on timeout, since a surviving descendant can otherwise hold a
+    capture pipe open past the nominal deadline (see ``_kill_process_tree``).
+
+    Fire-and-forget: never raises, always safe to call opportunistically.
+    Returns True only if npx actually ran successfully (npx unavailable,
+    a timeout, or a nonzero exit all return False silently).
+    """
+    npx_bin = _resolve_npx_bin()
+    if not npx_bin:
+        return False
+
+    env = _build_browser_env()
+    env["PATH"] = _merge_browser_path(env.get("PATH", ""))
+
+    popen_kwargs: dict = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "env": env,
+        "creationflags": windows_hide_flags(),
+    }
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    else:
+        popen_kwargs["creationflags"] |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+    cmd = [
+        npx_bin,
+        # --ignore-scripts: AGENT_BROWSER_NPX_SPEC is a floating ^0.26.0
+        # range, not an exact pin — a compromised future 0.26.x patch must
+        # not get to run its own install-time lifecycle scripts here.
+        "--ignore-scripts",
+        # --prefer-offline: once cached, repeat `hermes update`/`doctor
+        # --fix` runs shouldn't hit the registry just to re-confirm
+        # "latest" is still latest — that would defeat the point of
+        # warming the cache in the first place.
+        "--prefer-offline",
+        "-y",
+        AGENT_BROWSER_NPX_SPEC,
+        "--version",
+    ]
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, **popen_kwargs)
+    except Exception:
+        return False
+    try:
+        proc.communicate(timeout=timeout)
+        return proc.returncode == 0
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        return False
+    except Exception:
+        _kill_process_tree(proc)
+        return False
 
 
 def _extract_screenshot_path_from_text(text: str) -> Optional[str]:
@@ -2771,10 +2779,13 @@ def _run_browser_command(
 
     # Keep concrete executable paths intact, even when they contain spaces.
     # Only the synthetic npx fallback needs to expand into multiple argv items.
-    # shutil.which resolves npx → npx.cmd on Windows; bare "npx" stays on POSIX.
-    if browser_cmd == "npx agent-browser":
-        _npx_bin = shutil.which("npx") or "npx"
-        cmd_prefix = [_npx_bin, "agent-browser"]
+    # Resolve via the same PATH + extended-PATH cascade _find_agent_browser
+    # uses (see the chrome-fallback call site above for why a bare
+    # shutil.which("npx") is wrong here).
+    if _is_npx_agent_browser_sentinel(browser_cmd):
+        _npx_bin = _resolve_npx_bin() or "npx"
+        # --ignore-scripts: see _run_chrome_fallback_command's identical comment.
+        cmd_prefix = [_npx_bin, "--ignore-scripts", "--prefer-offline", "-y", AGENT_BROWSER_NPX_SPEC]
     else:
         cmd_prefix = [browser_cmd]
 
@@ -3095,7 +3106,7 @@ def _extract_relevant_content(
         model = _get_extraction_model()
         if model:
             call_kwargs["model"] = model
-        response = call_llm(**call_kwargs)
+        response = _lazy_call_llm(**call_kwargs)
         extracted = (response.choices[0].message.content or "").strip()
         if not extracted:
             # _truncate_snapshot stores its own pointer (dedupes to the same
@@ -3177,6 +3188,37 @@ def _redact_browser_output(value: Any) -> Any:
 # Browser Tool Functions
 # ============================================================================
 
+def evaluate_url_safety(url: str) -> Optional[dict]:
+    """Run URL safety checks; None if safe, else an error dict"""
+    import urllib.parse
+    from agent.redact import _PREFIX_RE
+
+    _secret = {"success": False, "error": "Blocked: URL contains what appears to be an API key or token. Secrets must not be sent in URLs."}
+    if _PREFIX_RE.search(url) or _PREFIX_RE.search(urllib.parse.unquote(url)):
+        return _secret
+    url = _normalize_url_for_request(url)
+    if _PREFIX_RE.search(url) or _PREFIX_RE.search(urllib.parse.unquote(url)):
+        return _secret
+
+    local = _is_local_backend()
+    sensitive_query_key = _sensitive_query_param_name(url)
+    if sensitive_query_key and not local:
+        return {"success": False, "error": (
+            "Blocked: URL contains a credential-like query parameter "
+            f"({sensitive_query_key}). Cloud browser backends are third-party "
+            "readers; use a local browser/CDP session or remove the sensitive "
+            "query parameter before navigating.")}
+    if _is_always_blocked_url(url):
+        return {"success": False, "error": "Blocked: URL targets a cloud metadata endpoint"}
+    if not local and not _allow_private_urls() and not _is_safe_url(url):
+        return {"success": False, "error": "Blocked: URL targets a private or internal address"}
+    blocked = check_website_access(url)
+    if blocked:
+        return {"success": False, "error": blocked["message"],
+                "blocked_by_policy": {"host": blocked["host"], "rule": blocked["rule"], "source": blocked["source"]}}
+    return None
+
+
 def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     """
     Navigate to a URL in the browser.
@@ -3211,10 +3253,9 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         })
 
     # SSRF protection — block private/internal addresses before navigating.
-    # Skipped only when the browser shares the local terminal's network
-    # position (loopback-controlled Camofox or local headless Chromium).
-    # External Camofox authorities are uncontrolled remote boundaries. Also
-    # skipped when hybrid routing will auto-spawn a
+    # Skipped for local backends (Camofox, headless Chromium without a cloud
+    # provider) because the agent already has full local network access via
+    # the terminal tool.  Also skipped when hybrid routing will auto-spawn a
     # local Chromium sidecar for this URL (cloud provider configured +
     # private URL + ``browser.auto_local_for_private_urls`` enabled) — the
     # cloud provider never sees the URL in that case.  Can also be opted
@@ -4234,28 +4275,10 @@ def _camofox_current_page_private_url(tab_id: str, user_id: str) -> Optional[str
 
 
 def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
-    """Evaluate JS via Camofox's /tabs/{tab_id}/eval endpoint (if available)."""
-    from tools.browser_camofox import (
-        _content_access_error,
-        _ensure_tab,
-        _external_camofox,
-        _post,
-        _with_boundary,
-    )
+    """Evaluate JS via Camofox's /tabs/{tab_id}/evaluate endpoint (if available)."""
+    from tools.browser_camofox import _ensure_tab, _post
     try:
         tab_info = _ensure_tab(task_id or "default")
-        content_error = _content_access_error(tab_info)
-        if content_error is not None:
-            return content_error
-        if _external_camofox(tab_info):
-            return json.dumps(_with_boundary({
-                "success": False,
-                "error": (
-                    "Blocked: JavaScript evaluation is unavailable for an external "
-                    "Camofox boundary because the REST API cannot independently "
-                    "verify the final main-frame URL after script execution."
-                ),
-            }, tab_info))
         tab_id = tab_info.get("tab_id") or tab_info.get("id")
         user_id = tab_info["user_id"]
         resp = _post(f"/tabs/{tab_id}/evaluate", body={"expression": expression, "userId": user_id})
@@ -4677,7 +4700,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
             call_kwargs["model"] = vision_model
         # Try full-size screenshot; on size-related rejection, downscale and retry.
         try:
-            response = call_llm(**call_kwargs)
+            response = _lazy_call_llm(**call_kwargs)
         except Exception as _api_err:
             from tools.vision_tools import (
                 _is_image_size_error, _resize_image_for_vision, _RESIZE_TARGET_BYTES,
@@ -4693,7 +4716,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                 data_url = _resize_image_for_vision(
                     screenshot_path, mime_type="image/png")
                 call_kwargs["messages"][0]["content"][1]["image_url"]["url"] = data_url
-                response = call_llm(**call_kwargs)
+                response = _lazy_call_llm(**call_kwargs)
             else:
                 raise
 
@@ -4851,12 +4874,23 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         # Stop auto-recording before closing (saves the file)
         _maybe_stop_recording(task_id)
 
-        # Try to close via agent-browser first (needs session in _active_sessions)
-        try:
-            _run_browser_command(task_id, "close", [], timeout=10)
-            logger.debug("agent-browser close command completed for task %s", task_id)
-        except Exception as e:
-            logger.warning("agent-browser close failed for task %s: %s", task_id, e)
+        # An expired cloud CDP URL cannot accept an agent-browser close command.
+        # Avoid feeding it back through _get_session_info(), which would try to
+        # renew the session recursively while cleanup is still in progress.
+        if _session_has_expired(session_info):
+            logger.debug(
+                "Skipping agent-browser close for expired session %s",
+                task_id,
+            )
+        else:
+            try:
+                _run_browser_command(task_id, "close", [], timeout=10)
+                logger.debug(
+                    "agent-browser close command completed for task %s",
+                    task_id,
+                )
+            except Exception as e:
+                logger.warning("agent-browser close failed for task %s: %s", task_id, e)
 
         # Now remove from tracking under lock
         with _cleanup_lock:
@@ -5068,8 +5102,10 @@ def _maybe_autoinstall_chromium() -> bool:
     except FileNotFoundError:
         return False
 
-    if browser_cmd == "npx agent-browser":
-        install_cmd = [shutil.which("npx") or "npx", "-y", "agent-browser", "install"]
+    if _is_npx_agent_browser_sentinel(browser_cmd):
+        install_cmd = [
+            _resolve_npx_bin() or "npx", "--ignore-scripts", "-y", AGENT_BROWSER_NPX_SPEC, "install",
+        ]
     else:
         install_cmd = [browser_cmd, "install"]
 
@@ -5081,7 +5117,7 @@ def _maybe_autoinstall_chromium() -> bool:
         proc = subprocess.run(
             install_cmd,
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=600,
             env=_build_browser_env(),
         )
@@ -5128,13 +5164,21 @@ def check_browser_requirements() -> bool:
     Returns:
         True if all requirements are met, False otherwise
     """
+    # Browser Use CLI backend — browser_exec replaces the whole browser_*
+    # surface (including browser_cdp/browser_dialog, whose check_fns funnel
+    # through here), so hide these tools from the model.
+    if _is_browser_use_cli_mode():
+        return False
+
     # Camofox backend — only needs the server URL, no agent-browser CLI
     if _is_camofox_mode():
         return True
 
     # CDP override mode can connect to an existing remote/local browser endpoint
     # without requiring the local agent-browser binary on PATH.
-    if _get_cdp_override():
+    # Raw (no-I/O) check: this runs during tool-schema assembly at startup,
+    # where a stale endpoint must not cost a blocking HTTP probe.
+    if _get_cdp_override_raw():
         return True
 
     # The agent-browser CLI is required for local launch and cloud-provider flows.

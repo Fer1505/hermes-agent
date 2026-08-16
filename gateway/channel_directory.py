@@ -9,7 +9,7 @@ action="list" and for resolving human-friendly channel names to numeric IDs.
 import asyncio
 import json
 import logging
-import re
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -19,42 +19,14 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 
 DIRECTORY_PATH = get_hermes_home() / "channel_directory.json"
-STATIC_MERGE_PLATFORMS = frozenset({"bluebubbles"})
-DELIVERY_METADATA_KEYS = frozenset({
-    "delivery_status",
-    "stale_reason",
-    "last_delivery_error",
-    "last_delivery_failed_at",
-})
-STALE_DELIVERY_ERROR_MARKERS = (
-    "chat not found",
-    "channel not found",
-    "room not found",
-    "thread not found",
-    "forbidden",
-    "bot was blocked",
-    "bot blocked",
-    "not enough rights",
-    "not a member",
-    "have no access",
-    "missing access",
-    "missing permissions",
-)
-TRANSIENT_DELIVERY_ERROR_MARKERS = (
-    "timed out",
-    "timeout",
-    "temporarily unavailable",
-    "try again",
-    "too many requests",
-    "rate limit",
-    "flood",
-    "bad gateway",
-    "gateway timeout",
-    "service unavailable",
-    "connection reset",
-    "network",
-)
-_EXPLICIT_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
+# Throttle window for repeated Slack channel-directory refresh failures.
+# The directory rebuilds on a timer, so a persistent workspace error (e.g.
+# missing scope, revoked token) would otherwise re-log the same warning on
+# every refresh. Warn once per (team, error detail) per interval; repeats
+# drop to DEBUG.
+_SLACK_DIRECTORY_WARNING_INTERVAL_SECONDS = 3600
+_slack_directory_warning_last: Dict[tuple[str, str], float] = {}
+
 # User-maintained friendly-name overlay. The directory is fully regenerated
 # from live adapters + session data on a timer, so hand-edits to
 # channel_directory.json don't survive. Aliases declared here are re-applied
@@ -142,256 +114,25 @@ def _session_entry_name(origin: Dict[str, Any]) -> str:
     return f"{base_name} / {topic_label}"
 
 
-def _channel_is_stale(channel: Dict[str, Any]) -> bool:
-    return channel.get("delivery_status") == "stale"
-
-
-def _channel_delivery_id(chat_id: str, thread_id: Optional[str] = None) -> str:
-    if thread_id:
-        return f"{chat_id}:{thread_id}"
-    return str(chat_id)
-
-
-def channel_delivery_status(
-    platform_name: str,
-    chat_id: str,
-    *,
-    thread_id: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    """Return cached delivery metadata for a platform target, when known."""
-    directory = load_directory()
-    channels = directory.get("platforms", {}).get(platform_name, [])
-    if not isinstance(channels, list):
-        return None
-
-    target_id = _channel_delivery_id(str(chat_id), str(thread_id) if thread_id else None)
-    for channel in channels:
-        if not isinstance(channel, dict) or str(channel.get("id")) != target_id:
-            continue
-        return {
-            "delivery_status": channel.get("delivery_status"),
-            "stale_reason": channel.get("stale_reason"),
-            "last_delivery_error": channel.get("last_delivery_error"),
-            "last_delivery_failed_at": channel.get("last_delivery_failed_at"),
-        }
-    return None
-
-
-def _safe_error_text(error: Any) -> str:
-    text = str(error or "unknown delivery failure")
-    try:
-        from agent.redact import redact_sensitive_text
-        text = redact_sensitive_text(text)
-    except Exception:
-        pass
-    return text[:500]
-
-
-def is_stale_delivery_error(error: Any) -> bool:
-    """Return True when a delivery error indicates a stale target, not a transient outage."""
-    text = str(error or "").lower()
-    if not text:
-        return False
-    if any(marker in text for marker in TRANSIENT_DELIVERY_ERROR_MARKERS):
-        return False
-    return any(marker in text for marker in STALE_DELIVERY_ERROR_MARKERS)
-
-
-def _preserve_delivery_metadata(
-    entries: List[Dict[str, Any]],
-    previous_entries: Any,
-) -> List[Dict[str, Any]]:
-    """Carry stale delivery proof across session-derived directory rebuilds."""
-    if not isinstance(entries, list) or not isinstance(previous_entries, list):
-        return entries
-
-    previous_by_id = {
-        str(entry.get("id")): entry
-        for entry in previous_entries
-        if isinstance(entry, dict) and entry.get("id") is not None
-    }
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        previous = previous_by_id.get(str(entry.get("id")))
-        if not previous:
-            continue
-        for key in DELIVERY_METADATA_KEYS:
-            if key in previous:
-                entry[key] = previous[key]
-    return entries
-
-
-def _parse_json_prefix(value: Any) -> Optional[Dict[str, Any]]:
-    """Parse the leading JSON object from a tool payload.
-
-    Tool loop warnings can be appended after the JSON result, so a strict
-    json.loads() would miss the provider error that matters for stale recovery.
-    """
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        parsed, _idx = json.JSONDecoder().raw_decode(value.strip())
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def _resolve_recovery_target(
-    platforms: Dict[str, List[Dict[str, Any]]],
-    target: Any,
-) -> Optional[tuple[str, str, Optional[str]]]:
-    if not isinstance(target, str) or ":" not in target:
-        return None
-
-    platform_name, target_ref = target.split(":", 1)
-    platform_name = platform_name.strip().lower()
-    target_ref = target_ref.strip()
-    if not platform_name or not target_ref:
-        return None
-
-    explicit_match = _EXPLICIT_TOPIC_TARGET_RE.fullmatch(target_ref)
-    if explicit_match:
-        return platform_name, explicit_match.group(1), explicit_match.group(2)
-
-    query = _normalize_channel_query(target_ref)
-    for channel in platforms.get(platform_name, []):
-        if not isinstance(channel, dict):
-            continue
-        entry_id = channel.get("id")
-        if entry_id is None:
-            continue
-        if str(entry_id) == target_ref:
-            return platform_name, str(entry_id), None
-        if _normalize_channel_query(str(channel.get("name") or "")) == query:
-            return platform_name, str(entry_id), channel.get("thread_id")
-        if _normalize_channel_query(_channel_target_name(platform_name, channel)) == query:
-            return platform_name, str(entry_id), channel.get("thread_id")
-
-    return None
-
-
-def _recent_session_jsonl_paths(limit: int = 200) -> List[Any]:
-    sessions_dir = get_hermes_home() / "sessions"
-    if not sessions_dir.exists():
-        return []
-    try:
-        paths = sorted(
-            sessions_dir.glob("*.jsonl"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
+def _warn_slack_directory(team_id: str, detail: str) -> None:
+    """Warn once per team/error per interval for recurring Slack refresh failures."""
+    key = (str(team_id), str(detail))
+    now = time.monotonic()
+    last = _slack_directory_warning_last.get(key)
+    if last is None or now - last >= _SLACK_DIRECTORY_WARNING_INTERVAL_SECONDS:
+        _slack_directory_warning_last[key] = now
+        logger.warning(
+            "Channel directory: failed to list Slack channels for team %s: %s",
+            team_id,
+            detail,
         )
-    except Exception:
-        return []
-    return list(reversed(paths[:limit]))
-
-
-def _recover_session_delivery_metadata(
-    platforms: Dict[str, List[Dict[str, Any]]],
-) -> Dict[tuple[str, str, Optional[str]], Dict[str, Any]]:
-    """Recover stale delivery marks from persisted send_message transcripts."""
-    states: Dict[tuple[str, str, Optional[str]], Dict[str, Any]] = {}
-
-    for path in _recent_session_jsonl_paths():
-        pending_calls: Dict[str, Dict[str, Any]] = {}
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except Exception:
-            continue
-
-        for line in lines:
-            try:
-                event = json.loads(line)
-            except Exception:
-                continue
-
-            if event.get("role") == "assistant":
-                for tool_call in event.get("tool_calls") or []:
-                    function = tool_call.get("function") or {}
-                    if function.get("name") != "send_message":
-                        continue
-                    call_id = tool_call.get("id") or tool_call.get("call_id")
-                    if not call_id:
-                        continue
-                    arguments = _parse_json_prefix(function.get("arguments"))
-                    if isinstance(arguments, dict):
-                        pending_calls[str(call_id)] = arguments
-                continue
-
-            if event.get("role") != "tool" or event.get("name") != "send_message":
-                continue
-            call_id = event.get("tool_call_id")
-            arguments = pending_calls.get(str(call_id))
-            if not arguments:
-                continue
-            resolved = _resolve_recovery_target(platforms, arguments.get("target"))
-            if not resolved:
-                continue
-
-            platform_name, chat_id, thread_id = resolved
-            key = (platform_name, chat_id, str(thread_id) if thread_id else None)
-            result = _parse_json_prefix(event.get("content")) or {}
-            error = result.get("error")
-            if error and is_stale_delivery_error(error):
-                states[key] = {
-                    "delivery_status": "stale",
-                    "stale_reason": "delivery_failed",
-                    "last_delivery_error": _safe_error_text(error),
-                    "last_delivery_failed_at": event.get("timestamp") or datetime.now().isoformat(),
-                }
-            elif result.get("success"):
-                states.pop(key, None)
-
-    return states
-
-
-def _apply_recovered_delivery_metadata(
-    platforms: Dict[str, List[Dict[str, Any]]],
-) -> Dict[str, List[Dict[str, Any]]]:
-    recovered = _recover_session_delivery_metadata(platforms)
-    if not recovered:
-        return platforms
-
-    for platform_name, channels in platforms.items():
-        if not isinstance(channels, list):
-            continue
-        for channel in channels:
-            if not isinstance(channel, dict):
-                continue
-            entry_id = channel.get("id")
-            if entry_id is None:
-                continue
-            key = (
-                platform_name,
-                str(entry_id),
-                str(channel.get("thread_id")) if channel.get("thread_id") else None,
-            )
-            metadata = recovered.get(key)
-            if metadata:
-                channel.update(metadata)
-    return platforms
-
-
-def _merge_static_entries(
-    platform_name: str,
-    session_entries: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Preserve installer-seeded targets for platforms with no enumeration API."""
-    if platform_name not in STATIC_MERGE_PLATFORMS:
-        return session_entries
-
-    existing = load_directory().get("platforms", {}).get(platform_name, [])
-    merged: List[Dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    for entry in [*(existing if isinstance(existing, list) else []), *session_entries]:
-        if not isinstance(entry, dict):
-            continue
-        entry_id = str(entry.get("id") or "").strip()
-        if not entry_id or entry_id in seen_ids:
-            continue
-        merged.append(entry)
-        seen_ids.add(entry_id)
-    return merged
+    else:
+        logger.debug(
+            "Channel directory: suppressed repeated Slack channel list failure "
+            "for team %s: %s",
+            team_id,
+            detail,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -406,11 +147,16 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     """
     from gateway.config import Platform
 
-    previous_platforms = load_directory().get("platforms", {})
-    platforms: Dict[str, List[Dict[str, Any]]] = {}
+    platforms: Dict[str, List[Dict[str, str]]] = {}
 
     for platform, adapter in adapters.items():
         try:
+            list_channels = getattr(adapter, "list_channels", None)
+            if callable(list_channels):
+                platform_channels = await list_channels()
+                if platform_channels is not None:
+                    platforms[platform.value] = _normalize_adapter_channels(platform_channels)
+                    continue
             if platform == Platform.DISCORD:
                 platforms["discord"] = await asyncio.to_thread(_build_discord, adapter)
             elif platform == Platform.SLACK:
@@ -427,19 +173,13 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     adapter_platform_names = {getattr(p, "value", str(p)) for p in adapters}
     for plat in Platform:
         plat_name = plat.value
-        if plat_name in _SKIP_SESSION_DISCOVERY or plat_name in platforms:
+        if (
+            plat_name in _SKIP_SESSION_DISCOVERY
+            or plat_name in platforms
+            or plat_name not in adapter_platform_names
+        ):
             continue
-        # Connected-only rule applies to SESSION discovery only; installer-seeded
-        # static targets (STATIC_MERGE_PLATFORMS, e.g. BlueBubbles) must survive
-        # even when the platform is not connected in this gateway process.
-        session_entries = (
-            await asyncio.to_thread(_build_from_sessions, plat_name)
-            if plat_name in adapter_platform_names
-            else []
-        )
-        merged_entries = _merge_static_entries(plat_name, session_entries)
-        if merged_entries:
-            platforms[plat_name] = merged_entries
+        platforms[plat_name] = await asyncio.to_thread(_build_from_sessions, plat_name)
 
     # Include plugin-registered platforms (dynamic enum members aren't in
     # Platform.__members__, so the loop above misses them). Same
@@ -448,33 +188,17 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     try:
         from gateway.platform_registry import platform_registry
         for entry in platform_registry.plugin_entries():
-            if entry.name not in _SKIP_SESSION_DISCOVERY and entry.name not in platforms:
-                # Connected-only rule applies to SESSION discovery (don't expose
-                # stale session targets for plugins that are not loaded), but
-                # installer-seeded static targets must survive regardless — they
-                # are the only reachable directory for platforms with no
-                # enumeration API (e.g. BlueBubbles seeds).
-                session_entries = (
-                    await asyncio.to_thread(_build_from_sessions, entry.name)
-                    if entry.name in adapter_platform_names
-                    else []
-                )
-                merged_entries = _merge_static_entries(entry.name, session_entries)
-                if merged_entries:
-                    platforms[entry.name] = merged_entries
+            if (
+                entry.name not in _SKIP_SESSION_DISCOVERY
+                and entry.name not in platforms
+                and entry.name in adapter_platform_names
+            ):
+                platforms[entry.name] = await asyncio.to_thread(_build_from_sessions, entry.name)
     except Exception:
         pass
 
-    # Overlay user-maintained friendly names before preserving/recovering
-    # delivery metadata, so stale status survives alias display-name changes.
+    # Overlay user-maintained friendly names before persisting.
     _apply_channel_aliases(platforms)
-
-    for platform_name, entries in list(platforms.items()):
-        platforms[platform_name] = _preserve_delivery_metadata(
-            entries,
-            previous_platforms.get(platform_name, []),
-        )
-    platforms = _apply_recovered_delivery_metadata(platforms)
 
     directory = {
         "updated_at": datetime.now().isoformat(),
@@ -482,84 +206,11 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     }
 
     try:
-        atomic_json_write(DIRECTORY_PATH, directory)
+        await asyncio.to_thread(atomic_json_write, DIRECTORY_PATH, directory)
     except Exception as e:
         logger.warning("Channel directory: failed to write: %s", e)
 
     return directory
-
-
-def mark_channel_delivery_failed(
-    platform_name: str,
-    chat_id: str,
-    error: Any,
-    *,
-    thread_id: Optional[str] = None,
-) -> bool:
-    """Mark a cached directory entry stale after a permanent delivery failure."""
-    if not is_stale_delivery_error(error):
-        return False
-
-    directory = load_directory()
-    platforms = directory.get("platforms", {})
-    channels = platforms.get(platform_name, [])
-    if not isinstance(channels, list):
-        return False
-
-    target_id = _channel_delivery_id(str(chat_id), str(thread_id) if thread_id else None)
-    changed = False
-    for channel in channels:
-        if not isinstance(channel, dict) or str(channel.get("id")) != target_id:
-            continue
-        channel["delivery_status"] = "stale"
-        channel["stale_reason"] = "delivery_failed"
-        channel["last_delivery_error"] = _safe_error_text(error)
-        channel["last_delivery_failed_at"] = datetime.now().isoformat()
-        changed = True
-
-    if not changed:
-        return False
-
-    try:
-        atomic_json_write(DIRECTORY_PATH, directory)
-    except Exception as exc:
-        logger.warning("Channel directory: failed to mark %s:%s stale: %s", platform_name, target_id, exc)
-        return False
-    return True
-
-
-def mark_channel_delivery_success(
-    platform_name: str,
-    chat_id: str,
-    *,
-    thread_id: Optional[str] = None,
-) -> bool:
-    """Clear stale delivery metadata after a later successful send."""
-    directory = load_directory()
-    platforms = directory.get("platforms", {})
-    channels = platforms.get(platform_name, [])
-    if not isinstance(channels, list):
-        return False
-
-    target_id = _channel_delivery_id(str(chat_id), str(thread_id) if thread_id else None)
-    changed = False
-    for channel in channels:
-        if not isinstance(channel, dict) or str(channel.get("id")) != target_id:
-            continue
-        for key in DELIVERY_METADATA_KEYS:
-            if key in channel:
-                channel.pop(key, None)
-                changed = True
-
-    if not changed:
-        return False
-
-    try:
-        atomic_json_write(DIRECTORY_PATH, directory)
-    except Exception as exc:
-        logger.warning("Channel directory: failed to clear stale mark for %s:%s: %s", platform_name, target_id, exc)
-        return False
-    return True
 
 
 def _build_discord(adapter) -> List[Dict[str, str]]:
@@ -599,13 +250,57 @@ def _build_discord(adapter) -> List[Dict[str, str]]:
     return channels
 
 
+def _slack_api_error_code(error: Exception) -> Optional[str]:
+    """Return Slack Web API error code from SlackApiError-like exceptions."""
+    response = getattr(error, "response", None)
+    if isinstance(response, dict):
+        value = response.get("error")
+        return str(value) if value else None
+    if response is not None:
+        try:
+            value = response.get("error")
+            return str(value) if value else None
+        except Exception:
+            pass
+    return None
+
+
+def _normalize_adapter_channels(raw_channels: Any) -> List[Dict[str, Any]]:
+    """Validate and dedupe channel entries returned by an adapter's
+    ``list_channels()`` hook (see ``build_channel_directory``)."""
+    channels: List[Dict[str, Any]] = []
+    seen_ids = set()
+    if not isinstance(raw_channels, list):
+        return channels
+    for raw in raw_channels:
+        if not isinstance(raw, dict):
+            continue
+        channel_id = str(raw.get("id") or "").strip()
+        name = str(raw.get("name") or channel_id).strip()
+        if not channel_id or not name or channel_id in seen_ids:
+            continue
+        entry: Dict[str, Any] = {
+            "id": channel_id,
+            "name": name,
+            "type": str(raw.get("type") or "dm"),
+        }
+        if raw.get("thread_id"):
+            entry["thread_id"] = str(raw.get("thread_id"))
+        if raw.get("guild"):
+            entry["guild"] = str(raw.get("guild"))
+        channels.append(entry)
+        seen_ids.add(channel_id)
+    return channels
+
+
 async def _build_slack(adapter) -> List[Dict[str, Any]]:
     """List Slack channels the bot has joined across all workspaces.
 
     Uses ``users.conversations`` against each workspace's web client. Pulls
     public + private channels the bot is a member of, then merges in DMs
     discovered from session history (IMs aren't useful to enumerate
-    proactively).
+    proactively). If the Slack app lacks channels:read, fall back to session
+    history quietly instead of logging a recurring warning every refresh.
     """
     team_clients = getattr(adapter, "_team_clients", None) or {}
     if not team_clients:
@@ -625,11 +320,15 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
                     cursor=cursor,
                 )
                 if not response.get("ok"):
-                    logger.warning(
-                        "Channel directory: users.conversations not ok for team %s: %s",
-                        team_id,
-                        response.get("error", "unknown"),
-                    )
+                    error_code = response.get("error", "unknown")
+                    if error_code == "missing_scope":
+                        logger.debug(
+                            "Channel directory: Slack team %s lacks channels:read; using session history only",
+                            team_id,
+                        )
+                    else:
+                        detail = f"users.conversations not ok: {error_code}"
+                        _warn_slack_directory(team_id, detail)
                     break
                 for ch in response.get("channels", []):
                     cid = ch.get("id")
@@ -646,17 +345,80 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
                 if not cursor:
                     break
         except Exception as e:
-            logger.warning(
-                "Channel directory: failed to list Slack channels for team %s: %s",
-                team_id, e,
-            )
+            if _slack_api_error_code(e) == "missing_scope":
+                logger.debug(
+                    "Channel directory: Slack team %s lacks channels:read; using session history only",
+                    team_id,
+                )
+            else:
+                _warn_slack_directory(team_id, str(e))
             continue
 
     # Merge in DM/group entries discovered from session history.
+    # Thread-qualified IDs are internal routing keys, not Slack API IDs.
+    def slack_lookup_id(entry_id: str) -> str:
+        return entry_id.split(":", 1)[0]
+
+    # Build a lookup from API-discovered channels so we can enrich session entries.
+    api_name_lookup = {ch["id"]: ch["name"] for ch in channels}
+
     for entry in await asyncio.to_thread(_build_from_sessions, "slack"):
-        if entry.get("id") not in seen_ids:
+        eid = entry.get("id")
+        if not isinstance(eid, str):
+            continue
+        if eid not in seen_ids:
+            # If the entry name is still a raw Slack ID (e.g. C0xxx / D0xxx),
+            # try to resolve it from the API lookup using the base conversation ID.
+            if entry.get("name", "").startswith(("C0", "D0", "G0")):
+                base_id = slack_lookup_id(eid)
+                if base_id in api_name_lookup:
+                    entry["name"] = api_name_lookup[base_id]
             channels.append(entry)
-            seen_ids.add(entry.get("id"))
+            seen_ids.add(eid)
+
+    # Resolve remaining raw-ID entries (DMs, private channels not in bot scope)
+    # by calling conversations.info + users.info once per base conversation,
+    # with all base-ID lookups running concurrently.
+    unresolved = [ch for ch in channels if ch.get("name", "").startswith(("C0", "D0", "G0"))]
+    if unresolved and team_clients:
+        client = next(iter(team_clients.values()))
+        unresolved_by_base = {}
+        for entry in unresolved:
+            unresolved_by_base.setdefault(slack_lookup_id(entry["id"]), []).append(entry)
+
+        async def _resolve_base(base_id: str, entries: list) -> None:
+            try:
+                resp = await client.conversations_info(channel=base_id)
+                if not resp.get("ok"):
+                    return
+                ch_info = resp.get("channel", {})
+                resolved_name = None
+                resolved_type = None
+                if ch_info.get("is_im"):
+                    peer_user = ch_info.get("user", "")
+                    if peer_user:
+                        user_resp = await client.users_info(user=peer_user)
+                        if user_resp.get("ok"):
+                            u = user_resp["user"]
+                            resolved_name = (
+                                u.get("profile", {}).get("display_name")
+                                or u.get("real_name")
+                                or u.get("name")
+                            )
+                            resolved_type = "dm"
+                else:
+                    resolved_name = ch_info.get("name") or ch_info.get("name_normalized")
+                if resolved_name:
+                    for entry in entries:
+                        entry["name"] = resolved_name
+                        if resolved_type:
+                            entry["type"] = resolved_type
+            except Exception as e:
+                logger.debug("Channel directory: failed to resolve %s: %s", base_id, e)
+
+        await asyncio.gather(
+            *[_resolve_base(bid, ents) for bid, ents in unresolved_by_base.items()]
+        )
 
     return channels
 
@@ -815,8 +577,6 @@ def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
 
     # 1. Exact name match, including the display labels shown by send_message(action="list")
     for ch in channels:
-        if _channel_is_stale(ch):
-            continue
         if _normalize_channel_query(ch["name"]) == query:
             return ch["id"]
         if _normalize_channel_query(_channel_target_name(platform_name, ch)) == query:
@@ -826,37 +586,44 @@ def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
     if "/" in query:
         guild_part, ch_part = query.rsplit("/", 1)
         for ch in channels:
-            if _channel_is_stale(ch):
-                continue
             guild = ch.get("guild", "").strip().lower()
             if guild == guild_part and _normalize_channel_query(ch["name"]) == ch_part:
                 return ch["id"]
 
     # 3. Partial prefix match (only if unambiguous)
-    matches = [
-        ch for ch in channels
-        if not _channel_is_stale(ch) and _normalize_channel_query(ch["name"]).startswith(query)
-    ]
+    matches = [ch for ch in channels if _normalize_channel_query(ch["name"]).startswith(query)]
     if len(matches) == 1:
         return matches[0]["id"]
 
     return None
 
 
-def format_directory_for_display() -> str:
-    """Format the channel directory as a human-readable list for the model."""
-    directory = load_directory()
-    platforms = directory.get("platforms", {})
+def format_directory_for_display(platforms: Optional[Dict[str, Any]] = None) -> str:
+    """Format the channel directory as a human-readable list for the model.
 
-    if not any(platforms.values()):
+    ``platforms`` overrides the on-disk directory when provided (used by
+    ``hermes send --list`` to merge in configured-but-undiscovered
+    platforms). Platforms present with an empty channel list are rendered
+    with a "(no channels discovered yet)" hint instead of being hidden —
+    a configured platform is a valid send target even before discovery.
+    """
+    if platforms is None:
+        directory = load_directory()
+        platforms = directory.get("platforms", {})
+
+    if not platforms:
         return "No messaging platforms connected or no channels discovered yet."
 
     lines = ["Available messaging targets:\n"]
-    stale_lines: List[str] = []
-    active_count = 0
 
     for plat_name, channels in sorted(platforms.items()):
         if not channels:
+            lines.append(f"{plat_name.title()}:")
+            lines.append(
+                f"  (no channels discovered yet — send directly with "
+                f"{plat_name}:<chat_id>, or bare '{plat_name}' for the home channel)"
+            )
+            lines.append("")
             continue
 
         # Group Discord channels by guild
@@ -873,53 +640,19 @@ def format_directory_for_display() -> str:
             for guild_name, guild_channels in sorted(guilds.items()):
                 lines.append(f"Discord ({guild_name}):")
                 for ch in sorted(guild_channels, key=lambda c: c["name"]):
-                    if _channel_is_stale(ch):
-                        stale_lines.append(_format_stale_target_line(plat_name, ch))
-                        continue
                     lines.append(f"  discord:{_channel_target_name(plat_name, ch)}")
-                    active_count += 1
             if dms:
-                active_dms = [ch for ch in dms if not _channel_is_stale(ch)]
+                lines.append("Discord (DMs):")
                 for ch in dms:
-                    if _channel_is_stale(ch):
-                        stale_lines.append(_format_stale_target_line(plat_name, ch))
-                if active_dms:
-                    lines.append("Discord (DMs):")
-                    for ch in active_dms:
-                        lines.append(f"  discord:{_channel_target_name(plat_name, ch)}")
-                        active_count += 1
+                    lines.append(f"  discord:{_channel_target_name(plat_name, ch)}")
             lines.append("")
         else:
-            active_channels = []
+            lines.append(f"{plat_name.title()}:")
             for ch in channels:
-                if _channel_is_stale(ch):
-                    stale_lines.append(_format_stale_target_line(plat_name, ch))
-                else:
-                    active_channels.append(ch)
-            if active_channels:
-                lines.append(f"{plat_name.title()}:")
-                for ch in active_channels:
-                    label = _channel_target_name(plat_name, ch)
-                    lines.append(f"  {plat_name}:{label}")
-                    active_count += 1
+                lines.append(f"  {plat_name}:{_channel_target_name(plat_name, ch)}")
             lines.append("")
 
-    if active_count == 0:
-        lines.append("No currently usable messaging targets are available.")
-        lines.append("")
-
-    if stale_lines:
-        lines.append("Unavailable stale targets (do not use until refreshed):")
-        lines.extend(stale_lines)
-        lines.append("")
-
-    lines.append('Use only the available targets above as the "target" parameter when sending.')
+    lines.append('Use these as the "target" parameter when sending.')
     lines.append('Bare platform name (e.g. "telegram") sends to home channel.')
 
     return "\n".join(lines)
-
-
-def _format_stale_target_line(platform_name: str, channel: Dict[str, Any]) -> str:
-    label = _channel_target_name(platform_name, channel)
-    error = channel.get("last_delivery_error") or channel.get("stale_reason") or "delivery failed"
-    return f"  {platform_name}:{label} — stale, not currently usable ({error})"

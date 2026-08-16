@@ -140,16 +140,15 @@ class TestBusySessionAuthBypass:
 
     @pytest.mark.asyncio
     async def test_authorized_user_still_processed_in_busy_path(self):
-        """An authorized user's message must still be processed normally."""
+        """An authorized user's message is durably queued for the next turn."""
         from gateway.run import GatewayRunner
 
-        runner, sentinel = _make_runner(authorized_users={"user1"})
+        runner, _sentinel = _make_runner(authorized_users={"user1"})
         runner._busy_input_mode = "interrupt"
         adapter = _make_adapter()
 
         event = _make_event(text="follow up", user_id="user1")
         sk = build_session_key(event.source)
-
         running_agent = MagicMock()
         running_agent.get_activity_summary.return_value = {}
         runner._running_agents[sk] = running_agent
@@ -160,10 +159,9 @@ class TestBusySessionAuthBypass:
             runner, event, sk
         )
 
-        # Should return True (handled) but message is queued/processed
         assert result is BusyMessageDisposition.QUEUED
-        # The message should be merged into pending
         assert sk in adapter._pending_messages
+
 
     @pytest.mark.asyncio
     async def test_unauthorized_user_during_drain_still_blocked(self):

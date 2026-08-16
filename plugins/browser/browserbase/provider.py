@@ -38,11 +38,8 @@ from typing import Any, Dict, Optional
 
 import requests
 
-from agent.browser_provider import (
-    REMOTE_PROVIDER_EGRESS,
-    BrowserEgressCapability,
-    BrowserProvider,
-)
+from agent.browser_provider import BrowserProvider
+from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -62,11 +59,6 @@ class BrowserbaseBrowserProvider(BrowserProvider):
     def display_name(self) -> str:
         return "Browserbase"
 
-    @property
-    def egress_capability(self) -> BrowserEgressCapability:
-        """Pages run remotely; provider-managed egress is not verified by Hermes."""
-        return REMOTE_PROVIDER_EGRESS
-
     def is_available(self) -> bool:
         return self._get_config_or_none() is not None
 
@@ -75,8 +67,8 @@ class BrowserbaseBrowserProvider(BrowserProvider):
     # ------------------------------------------------------------------
 
     def _get_config_or_none(self) -> Optional[Dict[str, Any]]:
-        api_key = os.environ.get("BROWSERBASE_API_KEY")
-        project_id = os.environ.get("BROWSERBASE_PROJECT_ID")
+        api_key = get_secret("BROWSERBASE_API_KEY")
+        project_id = get_secret("BROWSERBASE_PROJECT_ID")
         if api_key and project_id:
             return {
                 "api_key": api_key,
@@ -302,5 +294,7 @@ class BrowserbaseBrowserProvider(BrowserProvider):
                     "prompt": "Browserbase project ID",
                 },
             ],
-            "post_setup": "agent_browser",
+            # Cloud-scoped hook: installs the agent-browser CLI only (no
+            # local Chromium — Browserbase hosts the browser).
+            "post_setup": "browserbase",
         }

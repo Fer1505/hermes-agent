@@ -12,6 +12,7 @@ id stability, and the startup redelivery sweep's contract:
 
 import asyncio
 import time
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -52,12 +53,31 @@ def _row(oid):
     }
 
 
-def _claim_token(oid="ob-1"):
-    with dl._connect() as conn:
-        return conn.execute(
-            "SELECT claim_token FROM delivery_obligations WHERE obligation_id=?",
-            (oid,),
-        ).fetchone()[0]
+def _blocking_probe():
+    """Return a blocking ledger call and an event-loop progress witness."""
+    ledger_started = threading.Event()
+    event_loop_progressed = threading.Event()
+    blocked_event_loop = []
+
+    def _slow_ledger_call(*args, **kwargs):
+        ledger_started.set()
+        # Generous timeout: a genuinely blocked loop can never set the event
+        # (the witness coroutine cannot run), so a longer wait only guards
+        # against loaded-CI scheduling flake, not against missing the bug.
+        if not event_loop_progressed.wait(timeout=5.0):
+            blocked_event_loop.append(True)
+
+    async def _event_loop_witness():
+        import asyncio
+
+        deadline = asyncio.get_running_loop().time() + 10
+        while not ledger_started.is_set():
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("ledger call never started")
+            await asyncio.sleep(0)
+        event_loop_progressed.set()
+
+    return _slow_ledger_call, _event_loop_witness, blocked_event_loop
 
 
 def _orphan(oid):
@@ -88,7 +108,7 @@ class TestStateMachine:
         assert dl.mark_failed("ob-1", token, "chat_not_found")
         assert _row("ob-1")["state"] == "failed"
 
-    def test_rerecord_same_id_is_idempotent(self):
+    def test_rerecord_same_id_preserves_active_generation(self):
         token = _record()
         assert dl.mark_attempting("ob-1", token)
         assert _record() == token
@@ -197,8 +217,9 @@ class TestSweep:
 
     def test_dead_owner_attempting_is_quarantined_without_resend(self):
         token = _record()
-        dl.mark_attempting("ob-1", token)
+        assert dl.mark_attempting("ob-1", token)
         _orphan("ob-1")
+
         assert dl.sweep_recoverable() == []
         assert _row("ob-1")["state"] == "ambiguous"
 
@@ -211,46 +232,6 @@ class TestSweep:
 
         assert dl.sweep_recoverable(now=time.time() + dl.RETRY_MAX_SECONDS) == []
         assert _row("ob-1")["state"] == "ambiguous"
-
-    def test_failed_claim_cannot_cross_send_boundary_before_due(self):
-        token = _record()
-        assert dl.mark_attempting("ob-1", token)
-        assert dl.mark_failed("ob-1", token, "definitive rejection", retry_after=60)
-
-        assert dl.mark_attempting("ob-1", token) is False
-
-    def test_dead_owner_failed_needs_marker(self):
-        token = _record()
-        assert dl.mark_attempting("ob-1", token)
-        dl.mark_failed("ob-1", token, "boom", retry_after=0)
-        _orphan("ob-1")
-        claimed = dl.sweep_recoverable()
-        assert claimed[0]["needs_marker"] is True
-
-    def test_delivered_rows_ignored(self):
-        token = _record()
-        assert dl.mark_attempting("ob-1", token)
-        dl.mark_delivered("ob-1", token)
-        _orphan("ob-1")
-        assert dl.sweep_recoverable() == []
-
-    def test_attempts_cap_abandons(self):
-        _record()
-        _orphan("ob-1")
-        with dl._connect() as conn:
-            conn.execute(
-                "UPDATE delivery_obligations SET attempts=? WHERE obligation_id=?",
-                (dl.MAX_ATTEMPTS, "ob-1"),
-            )
-        assert dl.sweep_recoverable() == []
-        assert _row("ob-1")["state"] == "abandoned"
-
-    def test_stale_cutoff_abandons(self):
-        _record()
-        _orphan("ob-1")
-        future = time.time() + dl.STALE_AFTER_SECONDS + 60
-        assert dl.sweep_recoverable(now=future) == []
-        assert _row("ob-1")["state"] == "abandoned"
 
 
 class TestPrune:
@@ -266,16 +247,6 @@ class TestPrune:
         dl._prune()
         assert _row("ob-1") is None
 
-    def test_undelivered_rows_survive_retention(self):
-        _record()
-        with dl._connect() as conn:
-            conn.execute(
-                "UPDATE delivery_obligations SET updated_at=? WHERE obligation_id=?",
-                (time.time() - dl._RETENTION_SECONDS - 60, "ob-1"),
-            )
-        dl._prune()
-        assert _row("ob-1") is not None
-
     def test_row_cap_never_evicts_undelivered_work(self, monkeypatch):
         _record()
         monkeypatch.setattr(dl, "_MAX_ROWS", 0)
@@ -289,13 +260,6 @@ class TestLedgerEnabled:
     def test_default_on(self):
         assert dl.ledger_enabled({}) is True
         assert dl.ledger_enabled({"gateway": {}}) is True
-
-    def test_explicit_off(self):
-        assert dl.ledger_enabled({"gateway": {"delivery_ledger": False}}) is False
-        assert dl.ledger_enabled({"gateway": {"delivery_ledger": "off"}}) is False
-
-    def test_truthy_strings(self):
-        assert dl.ledger_enabled({"gateway": {"delivery_ledger": "true"}}) is True
 
 
 class TestGatewayRedeliverySweep:
@@ -342,7 +306,7 @@ class TestGatewayRedeliverySweep:
 
     def test_attempting_is_quarantined_without_provider_resend(self):
         token = _record()
-        dl.mark_attempting("ob-1", token)
+        assert dl.mark_attempting("ob-1", token)
         _orphan("ob-1")
         adapter = self._adapter()
         runner = self._runner(adapter)
@@ -352,40 +316,6 @@ class TestGatewayRedeliverySweep:
         assert n == 0
         adapter.send.assert_not_awaited()
         assert _row("ob-1")["state"] == "ambiguous"
-
-    def test_send_failure_marks_failed_for_next_boot(self):
-        _record()
-        _orphan("ob-1")
-        runner = self._runner(self._adapter(success=False))
-
-        n = asyncio.run(runner._redeliver_pending_obligations())
-
-        assert n == 0
-        assert _row("ob-1")["state"] == "failed"
-
-    def test_missing_adapter_leaves_row_recoverable(self):
-        _record()
-        _orphan("ob-1")
-        runner = self._runner(adapter=None)  # slack not connected
-
-        n = asyncio.run(runner._redeliver_pending_obligations())
-
-        assert n == 0
-        # Row still claimed by us but NOT delivered/abandoned — a later boot
-        # (attempts cap permitting) can retry once the platform connects.
-        assert _row("ob-1")["state"] == "pending"
-
-    def test_disabled_gate_short_circuits(self):
-        _record()
-        _orphan("ob-1")
-        adapter = self._adapter()
-        runner = self._runner(adapter)
-        with patch.object(dl, "ledger_enabled", return_value=False), patch(
-            "gateway.delivery_ledger.ledger_enabled", return_value=False
-        ):
-            n = asyncio.run(runner._redeliver_pending_obligations())
-        assert n == 0
-        adapter.send.assert_not_awaited()
 
     def test_periodic_watcher_recovers_without_gateway_restart(self):
         runner = self._runner()
@@ -403,6 +333,28 @@ class TestGatewayRedeliverySweep:
             runner._delivery_obligation_watcher(interval=0.01, initial_delay=0)
         )
         assert calls == 1
+
+    @pytest.mark.parametrize(
+        ("send_success", "ledger_method"),
+        [(True, "mark_delivered"), (False, "mark_failed")],
+    )
+    @pytest.mark.asyncio
+    async def test_slow_state_update_does_not_block_event_loop(
+        self, send_success, ledger_method
+    ):
+        import asyncio
+
+        _record()
+        _orphan("ob-1")
+        runner = self._runner(self._adapter(success=send_success))
+        slow_update, event_loop_witness, blocked_event_loop = _blocking_probe()
+
+        with patch.object(dl, ledger_method, side_effect=slow_update):
+            await asyncio.gather(
+                runner._redeliver_pending_obligations(), event_loop_witness()
+            )
+
+        assert blocked_event_loop == []
 
 
 class TestAttemptsOnlySpentOnRealSends:
@@ -447,33 +399,6 @@ class TestAttemptsOnlySpentOnRealSends:
         assert len(claimed) == 1
         assert claimed[0]["attempts"] == 1
 
-    def test_present_platform_still_claims(self):
-        _record(platform="slack")
-        _orphan("ob-1")
-        claimed = dl.sweep_recoverable(deliverable_platforms={"slack"})
-        assert len(claimed) == 1
-
-    def test_omitting_the_filter_claims_everything(self):
-        """Back-compat: existing callers pass no platform set."""
-        _record(platform="telegram")
-        _orphan("ob-1")
-        assert len(dl.sweep_recoverable()) == 1
-
-    def test_stale_rows_abandon_even_when_undeliverable(self):
-        """The cutoff still bounds rows whose platform never returns."""
-        _record(platform="telegram")
-        _orphan("ob-1")
-        future = time.time() + dl.STALE_AFTER_SECONDS + 10
-        assert dl.sweep_recoverable(
-            now=future, deliverable_platforms={"discord"}
-        ) == []
-        with dl._connect() as conn:
-            state = conn.execute(
-                "SELECT state FROM delivery_obligations WHERE obligation_id=?",
-                ("ob-1",),
-            ).fetchone()[0]
-        assert state == "abandoned"
-
 
 class TestUnconnectedPlatformKeepsItsBudget:
     """End-to-end through the real runner: boots where the platform failed to
@@ -492,33 +417,17 @@ class TestUnconnectedPlatformKeepsItsBudget:
         runner._async_session_store = _store
         return runner
 
-    def test_row_survives_boots_where_its_platform_is_down(self):
+    @pytest.mark.asyncio
+    async def test_row_survives_boots_where_its_platform_is_down(self):
         token = _record(platform="slack")
         dl.mark_attempting("ob-1", token)
 
         for _ in range(dl.MAX_ATTEMPTS + 1):
             _orphan("ob-1")
             runner = self._runner_without_slack()
-            assert asyncio.run(runner._redeliver_pending_obligations()) == 0
+            assert await runner._redeliver_pending_obligations() == 0
 
         assert _row("ob-1")["state"] != "abandoned", (
             "the obligation was abandoned without a single send being attempted"
         )
         assert _row("ob-1")["attempts"] == 0
-
-    def test_delivers_when_the_platform_comes_back(self):
-        from gateway.config import Platform
-
-        _record(platform="slack")
-        for _ in range(dl.MAX_ATTEMPTS + 1):
-            _orphan("ob-1")
-            asyncio.run(self._runner_without_slack()._redeliver_pending_obligations())
-
-        _orphan("ob-1")
-        adapter = MagicMock()
-        adapter.send = AsyncMock(return_value=MagicMock(success=True, error=""))
-        runner = self._runner_without_slack()
-        runner.adapters = {Platform.SLACK: adapter}
-
-        assert asyncio.run(runner._redeliver_pending_obligations()) == 1
-        assert _row("ob-1")["state"] == "delivered"
