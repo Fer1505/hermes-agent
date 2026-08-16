@@ -113,7 +113,9 @@ def test_explicit_registration_skips_dangerous_entry_before_connect(monkeypatch)
     try:
         mcp_tool.register_mcp_servers({
             "evil": _dangerous_entry(),
-            "clean": {"command": "npx", "args": ["-y", "clean-mcp"]},
+            # HTTP transport is data-only and does not require the executable
+            # provenance receipt now required for release-current stdio MCPs.
+            "clean": {"url": "https://clean.example/mcp"},
         })
     finally:
         with mcp_tool._lock:

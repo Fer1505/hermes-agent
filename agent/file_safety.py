@@ -3,8 +3,246 @@
 from __future__ import annotations
 
 import os
+import json
+import unicodedata
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional, Sequence
+
+
+class ProtectedFileOperation(str, Enum):
+    READ = "read"
+    WRITE = "write"
+    RENAME = "rename"
+    DELETE = "delete"
+    ARCHIVE = "archive"
+    IMPORT = "import"
+
+
+class ProtectedFileCapability(str, Enum):
+    """Typed internal authority for Hermes control-file operations.
+
+    These values are deliberately not accepted by model-facing file tools.
+    Only narrow operator/config lifecycle call sites may pass them.
+    """
+
+    INTERNAL_CONFIG = "internal_config"
+    MCP_REGISTRATION = "mcp_registration"
+    PROFILE_LIFECYCLE = "profile_lifecycle"
+    BACKUP_RESTORE = "backup_restore"
+
+
+@dataclass(frozen=True)
+class ProtectedFileDecision:
+    allowed: bool
+    operation: ProtectedFileOperation
+    protected: bool
+    capability: Optional[ProtectedFileCapability]
+    matched_path: Optional[str] = None
+    reason: Optional[str] = None
+
+
+_CONTROL_FILE_NAMES = frozenset({
+    "auth.json",
+    "auth.lock",
+    "config.yaml",
+    "webhook_subscriptions.json",
+    ".env",
+    ".anthropic_oauth.json",
+    "mcp-authorizations.json",
+})
+_CONTROL_RELATIVE_FILES = frozenset({
+    ("auth", "google_oauth.json"),
+    ("cache", "bws_cache.json"),
+})
+_CONTROL_DIRECTORY_NAMES = frozenset({"mcp-installs", "mcp-tokens", "pairing"})
+_MUTATING_CONTROL_OPERATIONS = frozenset({
+    ProtectedFileOperation.WRITE,
+    ProtectedFileOperation.RENAME,
+    ProtectedFileOperation.DELETE,
+    ProtectedFileOperation.ARCHIVE,
+    ProtectedFileOperation.IMPORT,
+})
+
+
+def _normalized_component(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).casefold()
+
+
+def _absolute_path(path: str | os.PathLike[str], cwd: str | None = None) -> Path:
+    raw = os.path.expandvars(os.path.expanduser(os.fspath(path)))
+    if cwd and not os.path.isabs(raw):
+        raw = os.path.join(cwd, raw)
+    return Path(os.path.abspath(os.path.normpath(raw)))
+
+
+def _control_bases() -> list[Path]:
+    bases: list[Path] = []
+    for base in (_hermes_home_path(), _hermes_root_path()):
+        try:
+            absolute = _absolute_path(base)
+        except Exception:
+            continue
+        if absolute not in bases:
+            bases.append(absolute)
+    return bases
+
+
+def _relative_parts_casefold(path: Path, base: Path) -> Optional[tuple[str, ...]]:
+    try:
+        relative = path.relative_to(base)
+    except ValueError:
+        return None
+    return tuple(_normalized_component(part) for part in relative.parts)
+
+
+def _is_control_relative_path(parts: Sequence[str]) -> bool:
+    if not parts:
+        return False
+    if len(parts) == 1 and parts[0] in _CONTROL_FILE_NAMES:
+        return True
+    if tuple(parts) in _CONTROL_RELATIVE_FILES:
+        return True
+    if parts[0] in _CONTROL_DIRECTORY_NAMES:
+        return True
+    return False
+
+
+def _is_control_ancestor(parts: Sequence[str]) -> bool:
+    """Return true for directories whose mutation removes protected children."""
+    return tuple(parts) in {("auth",), ("cache",)}
+
+
+def _classify_control_path(candidate: Path, operation: ProtectedFileOperation) -> bool:
+    bases = _control_bases()
+    root = _absolute_path(_hermes_root_path())
+    for base in bases:
+        parts = _relative_parts_casefold(candidate, base)
+        if parts is not None and _is_control_relative_path(parts):
+            return True
+        if (
+            parts is not None
+            and operation in _MUTATING_CONTROL_OPERATIONS
+            and _is_control_ancestor(parts)
+        ):
+            return True
+
+    # Every named profile is an alternate Hermes root. Protect its control
+    # files even when it is not the active HERMES_HOME.
+    root_parts = _relative_parts_casefold(candidate, root)
+    if root_parts and len(root_parts) >= 3 and root_parts[0] == "profiles":
+        if _is_control_relative_path(root_parts[2:]):
+            return True
+
+    # Mutating a Hermes/profile root itself can rename/delete/archive every
+    # control file below it, so it is a protected target too.
+    if operation in _MUTATING_CONTROL_OPERATIONS:
+        if any(candidate == base for base in bases):
+            return True
+        if root_parts and len(root_parts) == 2 and root_parts[0] == "profiles":
+            return True
+        if root_parts == ("profiles",):
+            return True
+    return False
+
+
+def decide_protected_control_file(
+    operation: ProtectedFileOperation | str,
+    paths: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
+    *,
+    capability: ProtectedFileCapability | str | None = None,
+    cwd: str | None = None,
+) -> ProtectedFileDecision:
+    """Make one typed decision for aliases, resolved sources, and destinations."""
+    try:
+        typed_operation = ProtectedFileOperation(operation)
+    except ValueError:
+        raise ValueError(f"Unsupported protected-file operation: {operation!r}") from None
+    try:
+        typed_capability = ProtectedFileCapability(capability) if capability is not None else None
+    except ValueError:
+        raise ValueError(f"Unsupported protected-file capability: {capability!r}") from None
+
+    raw_paths = [paths] if isinstance(paths, (str, os.PathLike)) else list(paths)
+    for raw_path in raw_paths:
+        try:
+            lexical = _absolute_path(raw_path, cwd=cwd)
+            resolved = Path(os.path.realpath(lexical))
+        except (OSError, TypeError, ValueError) as exc:
+            return ProtectedFileDecision(
+                allowed=False,
+                operation=typed_operation,
+                protected=True,
+                capability=typed_capability,
+                matched_path=os.fspath(raw_path),
+                reason=f"protected-file path could not be normalized: {exc}",
+            )
+        if not (
+            _classify_control_path(lexical, typed_operation)
+            or _classify_control_path(resolved, typed_operation)
+        ):
+            continue
+
+        allowed_capabilities = {
+            ProtectedFileOperation.READ: {
+                ProtectedFileCapability.BACKUP_RESTORE,
+                ProtectedFileCapability.INTERNAL_CONFIG,
+                ProtectedFileCapability.MCP_REGISTRATION,
+                ProtectedFileCapability.PROFILE_LIFECYCLE,
+            },
+            ProtectedFileOperation.WRITE: {
+                ProtectedFileCapability.INTERNAL_CONFIG,
+                ProtectedFileCapability.MCP_REGISTRATION,
+            },
+            ProtectedFileOperation.RENAME: {ProtectedFileCapability.PROFILE_LIFECYCLE},
+            ProtectedFileOperation.DELETE: {ProtectedFileCapability.PROFILE_LIFECYCLE},
+            ProtectedFileOperation.ARCHIVE: {
+                ProtectedFileCapability.BACKUP_RESTORE,
+                ProtectedFileCapability.PROFILE_LIFECYCLE,
+            },
+            ProtectedFileOperation.IMPORT: {
+                ProtectedFileCapability.BACKUP_RESTORE,
+                ProtectedFileCapability.PROFILE_LIFECYCLE,
+            },
+        }[typed_operation]
+        if typed_capability in allowed_capabilities:
+            continue
+        return ProtectedFileDecision(
+            allowed=False,
+            operation=typed_operation,
+            protected=True,
+            capability=typed_capability,
+            matched_path=str(resolved),
+            reason=(
+                f"{typed_operation.value} denied for protected Hermes control path; "
+                "use an operator-authorized typed configuration/profile API"
+            ),
+        )
+
+    return ProtectedFileDecision(
+        allowed=True,
+        operation=typed_operation,
+        protected=False,
+        capability=typed_capability,
+    )
+
+
+def require_protected_control_file_capability(
+    operation: ProtectedFileOperation | str,
+    paths: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
+    *,
+    capability: ProtectedFileCapability | str | None = None,
+    cwd: str | None = None,
+) -> None:
+    decision = decide_protected_control_file(
+        operation,
+        paths,
+        capability=capability,
+        cwd=cwd,
+    )
+    if not decision.allowed:
+        raise PermissionError(decision.reason or "Protected Hermes control-file operation denied")
 
 
 def _hermes_home_path() -> Path:
@@ -35,17 +273,9 @@ def build_write_denied_paths(home: str) -> set[str]:
             os.path.join(home, ".ssh", "authorized_keys"),
             os.path.join(home, ".ssh", "id_rsa"),
             os.path.join(home, ".ssh", "id_ed25519"),
-            # NOTE: ``~/.ssh/config`` is deliberately NOT hard-denied here.
-            # It carries no private-key bytes and editing it (host aliases,
-            # ProxyJump, VS Code Remote-SSH targets) is a routine, expected
-            # task. Free-writing it is still wrong -- it can carry
-            # ProxyCommand / Match exec directives -- so it is routed through
-            # an approval gate in tools/file_tools.py instead (the same
-            # approve-once/session/always flow the terminal tool already uses
-            # for ~/.ssh writes). See build_write_approval_paths() below and
-            # _check_ssh_config_write() in tools/file_tools.py. Hard-denying
-            # it while the terminal only *asked* was an inconsistency that
-            # made writes look like they flip-flopped between denied and OK.
+            # ``~/.ssh/config`` is approval-gated below rather than hard
+            # denied: it contains no private-key bytes, but may contain
+            # process-executing directives such as ProxyCommand.
             # Active profile .env (or top-level .env when not in profile mode).
             str(hermes_home / ".env"),
             # Top-level .env, even when running under a profile — overwriting it
@@ -109,17 +339,11 @@ def get_safe_write_roots() -> set[str]:
 
 
 def build_write_approval_paths(home: str) -> set[str]:
-    """Return paths that require human APPROVAL to write, but are not
-    hard-denied credentials.
+    """Return sensitive write targets that require interactive approval.
 
-    ``~/.ssh/config`` lives here: it is routine to edit (host aliases,
-    ProxyJump, VS Code Remote-SSH targets) and holds no private-key bytes,
-    but it CAN carry ``ProxyCommand`` / ``Match exec`` directives, so a
-    free write is inappropriate. The interactive file tools gate these
-    through an approve-once/session/always prompt (mirroring the terminal
-    tool's existing ``~/.ssh`` write approval); non-interactive callers
-    that cannot prompt (ACP shims, background jobs) treat an
-    approval-required path as denied and fail closed.
+    Non-interactive callers fail closed through
+    :func:`is_write_approval_required`; interactive file tools may use their
+    existing approve-once/session/always flow.
     """
     return {
         os.path.realpath(p)
@@ -129,16 +353,218 @@ def build_write_approval_paths(home: str) -> set[str]:
     }
 
 
+def _load_runtime_boundary_config() -> dict:
+    """Best-effort config load for runtime path boundary settings."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+_STRUCTURED_PATH_KEYS = (
+    "path",
+    "root",
+    "filesystemPath",
+    "filesystem_path",
+    "workspaceRoot",
+    "workspace_root",
+    "writeSafeRoot",
+    "write_safe_root",
+)
+
+
+def _iter_scalar_path_values(value: object) -> Iterable[str]:
+    """Yield string path fragments from scalar/list env or config values."""
+    if value is None:
+        return
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                for item in parsed:
+                    yield from _iter_path_values(item)
+                return
+        for piece in text.replace(",", os.pathsep).split(os.pathsep):
+            piece = piece.strip()
+            if piece:
+                yield piece
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from _iter_scalar_path_values(item)
+
+
+def _iter_path_values(value: object) -> Iterable[str]:
+    """Yield explicitly configured filesystem path values from env/config structures."""
+    if isinstance(value, dict):
+        for key in _STRUCTURED_PATH_KEYS:
+            if key in value:
+                yield from _iter_path_values(value.get(key))
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from _iter_path_values(item)
+        return
+    yield from _iter_scalar_path_values(value)
+
+
+def _resolve_boundary_path(path: str) -> Optional[str]:
+    try:
+        expanded = os.path.expandvars(os.path.expanduser(path))
+        return os.path.realpath(expanded)
+    except Exception:
+        return None
+
+
+def _dedupe_resolved_paths(paths: Iterable[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in paths:
+        resolved = _resolve_boundary_path(raw)
+        if resolved and resolved not in seen:
+            out.append(resolved)
+            seen.add(resolved)
+    return out
+
+
+def _nested_config_value(cfg: dict, keys: tuple[str, ...]) -> object:
+    cur: object = cfg
+    for key in keys:
+        if not isinstance(cur, dict) or key not in cur:
+            return None
+        cur = cur[key]
+    return cur
+
+
+def get_workspace_roots(config: Optional[dict] = None) -> list[str]:
+    """Return configured workspace read/cwd roots.
+
+    Supports both env vars and config spellings used by runtime manifests:
+    ``workspaceRoot`` / ``workspace_root`` at top level, under ``runtime``,
+    or under ``permissions``. Explicit writable filesystem roots are also
+    readable; otherwise a profile can be authorized to edit a repo but unable
+    to read the same files before patching them. Empty means no workspace
+    boundary is active.
+    """
+    cfg = config if isinstance(config, dict) else _load_runtime_boundary_config()
+    raw_values: list[object] = [
+        os.getenv("HERMES_WORKSPACE_ROOTS"),
+        os.getenv("HERMES_WORKSPACE_ROOT"),
+        os.getenv("HERMES_WRITE_SAFE_ROOTS"),
+        os.getenv("HERMES_WRITE_SAFE_ROOT"),
+        cfg.get("workspaceRoots"),
+        cfg.get("workspace_roots"),
+        cfg.get("workspaceRoot"),
+        cfg.get("workspace_root"),
+        cfg.get("writableSurfaces"),
+        cfg.get("writable_surfaces"),
+        _nested_config_value(cfg, ("runtime", "workspaceRoots")),
+        _nested_config_value(cfg, ("runtime", "workspace_roots")),
+        _nested_config_value(cfg, ("runtime", "workspaceRoot")),
+        _nested_config_value(cfg, ("runtime", "workspace_root")),
+        _nested_config_value(cfg, ("runtime", "writableSurfaces")),
+        _nested_config_value(cfg, ("runtime", "writable_surfaces")),
+        _nested_config_value(cfg, ("permissions", "workspaceRoots")),
+        _nested_config_value(cfg, ("permissions", "workspace_roots")),
+        _nested_config_value(cfg, ("permissions", "workspaceRoot")),
+        _nested_config_value(cfg, ("permissions", "workspace_root")),
+        _nested_config_value(cfg, ("permissions", "writableSurfaces")),
+        _nested_config_value(cfg, ("permissions", "writable_surfaces")),
+        _nested_config_value(cfg, ("terminal", "writableSurfaces")),
+        _nested_config_value(cfg, ("terminal", "writable_surfaces")),
+        _nested_config_value(cfg, ("terminal", "write_safe_root")),
+    ]
+    return _dedupe_resolved_paths(
+        path for value in raw_values for path in _iter_path_values(value)
+    )
+
+
+def get_writable_surfaces(config: Optional[dict] = None) -> list[str]:
+    """Return configured write/cwd roots.
+
+    ``HERMES_WRITE_SAFE_ROOT`` remains the backward-compatible single-root
+    setting. The plural env/config forms support multiple writable surfaces.
+    If only ``workspaceRoot`` is configured, it is also used as the writable
+    surface so a workspace-only manifest still gets write protection.
+    """
+    cfg = config if isinstance(config, dict) else _load_runtime_boundary_config()
+    raw_values: list[object] = [
+        os.getenv("HERMES_WRITE_SAFE_ROOTS"),
+        os.getenv("HERMES_WRITE_SAFE_ROOT"),
+        cfg.get("writableSurfaces"),
+        cfg.get("writable_surfaces"),
+        _nested_config_value(cfg, ("runtime", "writableSurfaces")),
+        _nested_config_value(cfg, ("runtime", "writable_surfaces")),
+        _nested_config_value(cfg, ("permissions", "writableSurfaces")),
+        _nested_config_value(cfg, ("permissions", "writable_surfaces")),
+        _nested_config_value(cfg, ("terminal", "writableSurfaces")),
+        _nested_config_value(cfg, ("terminal", "writable_surfaces")),
+        _nested_config_value(cfg, ("terminal", "write_safe_root")),
+    ]
+    surfaces = _dedupe_resolved_paths(
+        path for value in raw_values for path in _iter_path_values(value)
+    )
+    return surfaces or get_workspace_roots(cfg)
+
+
+def is_path_within_roots(path: str, roots: Iterable[str], cwd: str | None = None) -> bool:
+    """Return True when *path* resolves inside one of *roots*."""
+    if not path:
+        return False
+    candidate = os.path.expandvars(os.path.expanduser(str(path)))
+    if cwd and not os.path.isabs(candidate):
+        candidate = os.path.join(cwd, candidate)
+    resolved = os.path.realpath(candidate)
+    for root in roots:
+        root_resolved = os.path.realpath(os.path.expanduser(str(root)))
+        if resolved == root_resolved or resolved.startswith(root_resolved + os.sep):
+            return True
+    return False
+
+
+def get_path_boundary_error(
+    path: str,
+    *,
+    purpose: str,
+    cwd: str | None = None,
+    config: Optional[dict] = None,
+) -> Optional[str]:
+    """Return a boundary error for a configured read/write/workdir path.
+
+    No configured roots means fail-open for backward compatibility. This is
+    intentionally a path guard, not a shell sandbox: terminal commands can
+    still reference absolute paths after launch unless the backend itself is
+    sandboxed.
+    """
+    roots = get_workspace_roots(config) if purpose == "read" else get_writable_surfaces(config)
+    if not roots:
+        return None
+    if is_path_within_roots(path, roots, cwd=cwd):
+        return None
+    roots_text = ", ".join(roots)
+    return (
+        f"Path boundary denied for {purpose}: {path!r} resolves outside "
+        f"configured root(s): {roots_text}"
+    )
+
+
 def _classify_write_denial(path: str) -> Optional[str]:
-    """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
+    """Return ``credential``, ``safe_root``, or ``None`` if writes are allowed."""
+    if not decide_protected_control_file(ProtectedFileOperation.WRITE, path).allowed:
+        return "credential"
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
 
-    # Approval-gated paths (e.g. ~/.ssh/config) are NOT hard-denied here:
-    # they are allowed at this layer so the interactive file tools can run
-    # their approval prompt, and only blocked for non-interactive callers
-    # via get_write_approval_error(). Checked before the credential deny so
-    # the ``.ssh/`` directory prefix below doesn't swallow the config file.
+    # Approval-gated paths must be checked before the broader credential
+    # directory prefixes (notably ``~/.ssh/``) below.
     if resolved in build_write_approval_paths(home):
         return None
 
@@ -148,6 +574,15 @@ def _classify_write_denial(path: str) -> Optional[str]:
         if resolved.startswith(prefix):
             return "credential"
 
+    # Olympus boundary: configured writable surfaces stay authoritative — a
+    # path outside every configured surface is denied before the upstream
+    # control-plane checks run.
+    safe_roots = get_writable_surfaces()
+    if safe_roots and not any(
+        resolved == root or resolved.startswith(root + os.sep)
+        for root in safe_roots
+    ):
+        return "safe_root"
     mcp_tokens_dir_name = "mcp-tokens"
 
     hermes_dirs = []
@@ -165,10 +600,10 @@ def _classify_write_denial(path: str) -> Optional[str]:
         # falsify conversation history and invalidate resume/compression state.
         try:
             if resolved == os.path.realpath(os.path.join(base_real, "state.db")):
-                return True
+                return "credential"
             sessions_real = os.path.realpath(os.path.join(base_real, "sessions"))
             if resolved == sessions_real or resolved.startswith(sessions_real + os.sep):
-                return True
+                return "credential"
         except Exception:
             pass
         try:
@@ -217,14 +652,7 @@ def get_write_denied_error(path: str, *, verb: str = "Write") -> Optional[str]:
 
 
 def is_write_approval_required(path: str) -> bool:
-    """Return True if ``path`` is an approval-gated write target.
-
-    These paths (currently ``~/.ssh/config``) are not credentials and are
-    not hard-denied, but a write to them must be confirmed by a human
-    because they can influence process execution (e.g. an SSH
-    ``ProxyCommand``). Callers with an interactive/gateway channel should
-    prompt; callers without one should treat this as a block (fail closed).
-    """
+    """Return True when writing *path* requires interactive human approval."""
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
     return resolved in build_write_approval_paths(home)
@@ -289,6 +717,18 @@ def get_read_block_error(path: str) -> Optional[str]:
     ``"auth.json"`` would otherwise miss the denylist when the task's
     terminal cwd differs from the process cwd.
     """
+    control_decision = decide_protected_control_file(ProtectedFileOperation.READ, path)
+    if not control_decision.allowed:
+        kind = (
+            "MCP token store"
+            if "mcp-tokens" in _normalized_component(str(control_decision.matched_path or path))
+            else "credential store or protected Hermes control path"
+        )
+        return (
+            f"Access denied: {path} is a Hermes {kind} and "
+            "cannot be read by model-facing file tools."
+        )
+
     resolved = Path(path).expanduser().resolve()
 
     # Resolve BOTH the active HERMES_HOME (profile-aware) AND the global

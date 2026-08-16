@@ -254,7 +254,6 @@ class TestWebServerEndpoints:
         from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
 
         monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db")
-
         self.client = TestClient(app)
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
@@ -936,7 +935,7 @@ class TestWebServerEndpoints:
 
 
 
-    def test_get_media_requires_auth(self):
+    def test_get_media_loopback_reaches_path_guard_without_token(self):
         from hermes_cli.web_server import _SESSION_HEADER_NAME
 
         resp = self.client.get(
@@ -944,7 +943,7 @@ class TestWebServerEndpoints:
             params={"path": "/tmp/x.png"},
             headers={_SESSION_HEADER_NAME: "wrong-token"},
         )
-        assert resp.status_code == 401
+        assert resp.status_code == 403
 
     # ── POST /api/chat/image-upload (browser clipboard/drop images) ─────
 
@@ -1419,23 +1418,27 @@ class TestWebServerEndpoints:
 
 
 
-    def test_unauthenticated_api_blocked(self):
-        """API requests without the session token should be rejected."""
+    def test_loopback_api_does_not_require_a_browser_token(self):
+        """Loopback API relies on the host/peer boundary, not a bearer token.
+
+        Gated-mode fail-closed behavior is covered by the dedicated dashboard
+        auth middleware tests, which authenticate with the OAuth cookie.
+        """
         from starlette.testclient import TestClient
         from hermes_cli.web_server import app
         # Create a client WITHOUT the dashboard session header
         unauth_client = TestClient(app)
         resp = unauth_client.get("/api/env")
-        assert resp.status_code == 401
+        assert resp.status_code == 200
         resp = unauth_client.get("/api/config")
-        assert resp.status_code == 401
+        assert resp.status_code == 200
         # Public endpoints should still work
         resp = unauth_client.get("/api/status")
         assert resp.status_code == 200
         resp = unauth_client.get("/api/dashboard/plugins")
         assert resp.status_code == 200
         resp = unauth_client.get("/api/dashboard/plugins/rescan")
-        assert resp.status_code == 401
+        assert resp.status_code == 200
         resp = self.client.get("/api/dashboard/plugins/rescan")
         assert resp.status_code == 200
 
@@ -3394,7 +3397,6 @@ class TestBulkDeleteSessionsEndpoint:
         monkeypatch.setattr(
             hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db"
         )
-
         self.client = TestClient(app)
         self.auth_client = TestClient(app)
         self.auth_client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
@@ -3483,7 +3485,6 @@ class TestDeleteEmptySessionsEndpoint:
         monkeypatch.setattr(
             hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db"
         )
-
         self.client = TestClient(app)
         self.auth_client = TestClient(app)
         self.auth_client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
@@ -3518,14 +3519,10 @@ class TestDeleteEmptySessionsEndpoint:
             db.close()
 
 
-    def test_delete_endpoint_requires_auth(self):
-        """DELETE /api/sessions/empty must 401 without the session token.
-
-        Regression guard for issue #19533 — the bulk-delete is a strictly
-        destructive primitive, the middleware must gate it even if a
-        future refactor introduces a non-auth path."""
+    def test_delete_endpoint_is_tokenless_on_loopback(self):
+        """Loopback mutation uses the host/peer boundary without a token."""
         resp = self.client.delete("/api/sessions/empty")
-        assert resp.status_code == 401
+        assert resp.status_code == 200
 
 
     def test_delete_returns_count_and_removes_only_empties(self):
@@ -3574,8 +3571,8 @@ class TestDeleteEmptySessionsEndpoint:
         )
 
 
-class TestPluginAPIAuth:
-    """Tests that plugin API routes require the session token (issue #19533)."""
+class TestPluginAPILoopback:
+    """Plugin routes share the tokenless loopback host/peer boundary."""
 
     @pytest.fixture(autouse=True)
     def _setup_test_client(self, monkeypatch, _isolate_hermes_home, _install_example_plugin):
@@ -3596,61 +3593,42 @@ class TestPluginAPIAuth:
         from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
 
         monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db")
-
         self.client = TestClient(app)
         self.auth_client = TestClient(app)
         self.auth_client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
 
-    def test_plugin_route_allows_auth(self):
-        """Plugin API routes should work with a valid session token.
+    def test_plugin_route_is_available_without_browser_token(self):
+        """A loopback plugin route works without a browser bearer token.
 
         Uses ``/api/plugins/example/hello`` from the example-dashboard
         test fixture (installed into HERMES_HOME by the class-level
-        ``_install_example_plugin`` fixture) — a stable, side-effect-free
-        GET that's only loaded for tests. With a valid token the handler
-        should run (200); without one the middleware should 401 before
-        the handler is reached.
+        ``_install_example_plugin`` fixture). Gated cookie behavior is covered
+        by the dedicated dashboard-auth middleware suite.
         """
-        # Without auth: middleware blocks before reaching the handler.
         resp = self.client.get("/api/plugins/example/hello")
-        assert resp.status_code == 401
+        assert resp.status_code == 200
 
-        # With auth: handler runs.
+        # A legacy header remains harmless in tokenless loopback mode.
         resp = self.auth_client.get("/api/plugins/example/hello")
         assert resp.status_code == 200
 
 
-    def test_plugin_patch_requires_auth(self):
-        """Plugin PATCH routes should return 401 without a valid session token.
-
-        PATCH is the mutation method most commonly used by the dashboard for
-        kanban task edits — explicitly cover it so a future middleware
-        regression that whitelists non-GET methods can't sneak through.
-        """
+    def test_plugin_patch_reaches_router_without_browser_token(self):
         resp = self.client.patch(
             "/api/plugins/kanban/tasks/t_fake",
             json={"title": "renamed"},
         )
-        assert resp.status_code == 401
+        assert resp.status_code == 404
 
 
-    def test_non_kanban_plugin_route_requires_auth(self):
-        """Auth must be plugin-agnostic, not kanban-specific.
-
-        The middleware fix is at the gate level (no per-plugin allowlist),
-        so any plugin's API surface — kanban, hermes-achievements, future
-        plugins — must require the session token. Hit a non-kanban plugin
-        path to lock that in.
-        """
+    def test_non_kanban_plugin_route_reaches_router_without_browser_token(self):
         # Real plugin path (hermes-achievements is loaded by default).
         resp = self.client.get("/api/plugins/hermes-achievements/overview")
-        assert resp.status_code == 401
-        # Same for an arbitrary plugin namespace that doesn't even exist —
-        # the middleware should 401 before routing decides 404, so an
-        # attacker can't fingerprint plugin names by status codes.
+        assert resp.status_code == 404
+        # Arbitrary plugin namespaces likewise reach normal routing.
         resp = self.client.get("/api/plugins/_definitely_not_a_plugin_/anything")
-        assert resp.status_code == 401
+        assert resp.status_code == 404
 
     def test_plugin_websocket_unaffected_by_http_middleware(self):
         """The kanban /events WebSocket has its own ``?token=`` check;
@@ -3967,13 +3945,14 @@ def test_resolve_chat_argv_injects_gateway_ws_url(monkeypatch):
     )
     monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.1", raising=False)
     monkeypatch.setattr(ws.app.state, "bound_port", 9119, raising=False)
+    monkeypatch.setattr(ws.app.state, "auth_required", False, raising=False)
 
     _argv, _cwd, env = ws._resolve_chat_argv()
 
     assert env is not None
     gateway_url = env.get("HERMES_TUI_GATEWAY_URL", "")
-    assert gateway_url.startswith("ws://127.0.0.1:9119/api/ws?")
-    assert "token=" in gateway_url
+    assert gateway_url == "ws://127.0.0.1:9119/api/ws"
+    assert "token=" not in gateway_url
 
 
 class TestDashboardPluginStaticAssetAllowlist:

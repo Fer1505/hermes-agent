@@ -11,7 +11,7 @@ import sys
 import threading
 from pathlib import Path, PurePosixPath
 
-from agent.file_safety import get_read_block_error
+from agent.file_safety import get_path_boundary_error, get_read_block_error
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
     ShellFileOperations,
@@ -1641,6 +1641,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                     ),
                 })
 
+        boundary_error = get_path_boundary_error(str(_resolved), purpose="read")
+        if boundary_error:
+            return tool_error(boundary_error)
+
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
         # Malformed documents fall through to the normal path/binary guard.
@@ -2171,6 +2175,15 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
+    try:
+        boundary_error = get_path_boundary_error(
+            str(_resolve_path_for_task(path, task_id)), purpose="write"
+        )
+    except Exception:
+        boundary_error = get_path_boundary_error(path, purpose="write")
+    if boundary_error:
+        return tool_error(boundary_error)
+
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -2305,6 +2318,14 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     return _err
                 _paths_to_check.append(v4a_path)
     for _p in _paths_to_check:
+        try:
+            boundary_error = get_path_boundary_error(
+                str(_resolve_path_for_task(_p, task_id)), purpose="write"
+            )
+        except Exception:
+            boundary_error = get_path_boundary_error(_p, purpose="write")
+        if boundary_error:
+            return tool_error(boundary_error)
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)
@@ -2503,6 +2524,15 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             resolved_path = _resolve_path_for_task(path, task_id)
         except (OSError, ValueError, RuntimeError):
             resolved_path = None
+        try:
+            boundary_error = get_path_boundary_error(
+                str(resolved_path) if resolved_path else path,
+                purpose="read",
+            )
+        except Exception:
+            boundary_error = get_path_boundary_error(path, purpose="read")
+        if boundary_error:
+            return tool_error(boundary_error)
         block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
         if block_error:
             return tool_error(block_error)

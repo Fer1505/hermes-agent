@@ -200,7 +200,11 @@ class TestCamofoxInteractions:
         mock_post.return_value = _mock_response(json_data={"tabId": "tab8", "url": "https://x.com"})
         camofox_navigate("https://x.com", task_id="t8")
 
-        mock_post.return_value = _mock_response(json_data={"ok": True})
+        # Interaction responses must prove the final main-frame URL; omitting
+        # it is intentionally quarantined as an ambiguous landing.
+        mock_post.return_value = _mock_response(
+            json_data={"ok": True, "url": "https://x.com"}
+        )
         result = json.loads(camofox_press("Enter", task_id="t8"))
         assert result["success"] is True
         assert result["pressed"] == "Enter"
@@ -360,5 +364,3 @@ class TestBrowserToolRouting:
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
         from tools.browser_tool import check_browser_requirements
         assert check_browser_requirements() is True
-
-

@@ -420,13 +420,11 @@ class TestJWTTokens:
 
 
 class TestDiscordMentions:
-    """Discord mention snowflakes (<@ID> / <@!ID>) are public syntax, not
-    secrets — they must pass through the redactor unchanged so multi-bot
-    @-pings (DISCORD_ALLOW_BOTS=mentions) keep resolving. See issue #35611."""
+    """Discord mention snowflakes are contact metadata and are masked."""
 
-    def test_normal_mention_passes_through(self):
+    def test_normal_mention_is_masked(self):
         text = "Hello <@222589316709220353>"
-        assert redact_sensitive_text(text) == text
+        assert redact_sensitive_text(text) == "Hello <@***>"
 
 
 
@@ -435,16 +433,13 @@ class TestDiscordMentions:
 
 
 class TestWebUrlsNotRedacted:
-    """Web URLs (http/https/wss) pass through unchanged — magic-link
-    checkouts, OAuth callbacks the agent is meant to follow, and pre-signed
-    share URLs must reach the tool intact. Known credential shapes inside
-    URLs (sk-, ghp_, JWTs) are still caught by the prefix and JWT regexes.
-    DB connection-string passwords are still caught by _DB_CONNSTR_RE.
-    """
+    """Web URLs retain routing structure while credential values are masked."""
 
-    def test_oauth_callback_code_passes_through(self):
+    def test_oauth_callback_code_is_masked(self):
         text = "GET https://api.example.com/oauth/cb?code=abc123xyz789&state=csrf_ok"
-        assert redact_sensitive_text(text) == text
+        assert redact_sensitive_text(text) == (
+            "GET https://api.example.com/oauth/cb?code=***&state=csrf_ok"
+        )
 
 
 
@@ -507,7 +502,12 @@ class TestStrictUrlCredentialRedaction:
     def test_masks_all_url_reference_forms_only_when_opted_in(
         self, text, secret, expected
     ):
-        assert redact_sensitive_text(text) == text
+        default_result = redact_sensitive_text(text)
+        if text.startswith("/resume?token="):
+            # Bare request targets are log-shaped and protected by default.
+            assert default_result == expected
+        else:
+            assert default_result == text
 
         result = redact_sensitive_text(text, redact_url_credentials=True)
 
