@@ -8,7 +8,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from agent.memory_provider import MemoryProvider
-from agent.memory_manager import MemoryManager, inject_memory_provider_tools
+from agent.memory_manager import (
+    MemoryManager,
+    inject_memory_provider_tools,
+    memory_provider_tools_enabled_for_agent,
+)
 
 # ---------------------------------------------------------------------------
 # Concrete test provider
@@ -1323,6 +1327,162 @@ class TestMemoryToolToolsetGate:
         )
         mgr.add_provider(p)
         return mgr
+
+    @staticmethod
+    def _provider_surface(provider, enabled_toolsets, disabled_toolsets=None):
+        mgr = MemoryManager()
+        mgr.add_provider(provider)
+        agent = SimpleNamespace(
+            _memory_manager=mgr,
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            tools=[],
+            valid_tool_names=set(),
+        )
+        inject_memory_provider_tools(agent)
+        prompt = mgr.build_system_prompt(
+            tool_guidance_enabled=memory_provider_tools_enabled_for_agent(agent)
+        )
+        names = {
+            tool["function"]["name"]
+            for tool in agent.tools
+            if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
+        }
+        return names, prompt
+
+    @pytest.mark.parametrize(
+        ("enabled_toolsets", "disabled_toolsets", "tools_expected"),
+        [
+            (None, None, True),
+            (["memory"], None, True),
+            (["terminal"], None, False),
+            (None, ["memory"], False),
+        ],
+    )
+    def test_mem0_guidance_matches_effective_tool_exposure(
+        self,
+        enabled_toolsets,
+        disabled_toolsets,
+        tools_expected,
+    ):
+        from plugins.memory.mem0 import Mem0MemoryProvider
+
+        names, prompt = self._provider_surface(
+            Mem0MemoryProvider(),
+            enabled_toolsets,
+            disabled_toolsets,
+        )
+
+        assert bool(names) is tools_expected
+        assert ("mem0_search" in names) is tools_expected
+        assert ("Call mem0_search before answering" in prompt) is tools_expected
+        if tools_expected:
+            assert "[External memory metadata; provider=mem0;" in prompt
+        else:
+            assert "[Trusted local memory capability; provider=mem0]" not in prompt
+            assert "You should call mem0_search" not in prompt
+
+    @pytest.mark.parametrize(
+        ("module_name", "class_name", "provider_name", "tool_name"),
+        [
+            ("plugins.memory.mem0", "Mem0MemoryProvider", "mem0", "mem0_search"),
+            (
+                "plugins.memory.holographic",
+                "HolographicMemoryProvider",
+                "holographic",
+                "fact_store",
+            ),
+            (
+                "plugins.memory.byterover",
+                "ByteRoverMemoryProvider",
+                "byterover",
+                "brv_query",
+            ),
+            (
+                "plugins.memory.retaindb",
+                "RetainDBMemoryProvider",
+                "retaindb",
+                "retaindb_search",
+            ),
+            (
+                "plugins.memory.openviking",
+                "OpenVikingMemoryProvider",
+                "openviking",
+                "viking_search",
+            ),
+            (
+                "plugins.memory.supermemory",
+                "SupermemoryMemoryProvider",
+                "supermemory",
+                "supermemory_search",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("enabled_toolsets", "disabled_toolsets"),
+        [(["terminal"], None), (None, ["memory"])],
+    )
+    def test_tool_disabled_bundled_provider_emits_no_capability_guidance(
+        self,
+        module_name,
+        class_name,
+        provider_name,
+        tool_name,
+        enabled_toolsets,
+        disabled_toolsets,
+    ):
+        import importlib
+
+        provider_type = getattr(importlib.import_module(module_name), class_name)
+        names, prompt = self._provider_surface(
+            provider_type(),
+            enabled_toolsets,
+            disabled_toolsets,
+        )
+
+        assert names == set()
+        assert f"[Trusted local memory capability; provider={provider_name}]" not in prompt
+        assert tool_name not in prompt
+
+    @pytest.mark.parametrize("mode", ["context", "hybrid", "tools"])
+    @pytest.mark.parametrize(
+        ("enabled_toolsets", "disabled_toolsets", "tools_allowed"),
+        [
+            (["memory"], None, True),
+            (["terminal"], None, False),
+            (None, ["memory"], False),
+        ],
+    )
+    def test_honcho_mode_guidance_matches_effective_tool_exposure(
+        self,
+        mode,
+        enabled_toolsets,
+        disabled_toolsets,
+        tools_allowed,
+    ):
+        from plugins.memory.honcho import HonchoMemoryProvider
+
+        provider = HonchoMemoryProvider()
+        provider._recall_mode = mode
+        names, prompt = self._provider_surface(
+            provider,
+            enabled_toolsets,
+            disabled_toolsets,
+        )
+
+        schemas_expected = tools_allowed and mode != "context"
+        assert bool(names) is schemas_expected
+        assert ("honcho_profile" in names) is schemas_expected
+        assert ("honcho_profile" in prompt) is schemas_expected
+        if mode == "context":
+            assert "Relevant context is injected automatically" in prompt
+            assert "No Honcho tools are available in context-only mode" in prompt
+        elif mode == "hybrid" and not tools_allowed:
+            assert "Relevant context may be injected automatically" in prompt
+            assert "No Honcho tools are exposed in this agent" in prompt
+        elif mode == "tools" and not tools_allowed:
+            assert "[Trusted local memory capability; provider=honcho]" not in prompt
+            assert "honcho_profile" not in prompt
 
     def test_none_toolsets_injects(self):
         """enabled_toolsets=None (no filter) injects memory tools — backward compat."""

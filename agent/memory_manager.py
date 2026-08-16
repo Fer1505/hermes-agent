@@ -135,6 +135,21 @@ def memory_provider_tools_enabled(
         return False
 
 
+def memory_provider_tools_enabled_for_agent(agent: Any) -> bool:
+    """Apply the one canonical memory-provider tool exposure decision."""
+    tools = getattr(agent, "tools", None) or []
+    existing_tool_names = {
+        tool.get("function", {}).get("name")
+        for tool in tools
+        if isinstance(tool, dict)
+    }
+    return memory_provider_tools_enabled(
+        getattr(agent, "enabled_toolsets", None),
+        getattr(agent, "disabled_toolsets", None),
+        memory_tool_present="memory" in existing_tool_names,
+    )
+
+
 def inject_memory_provider_tools(agent: Any) -> int:
     """Append external memory-provider tool schemas to an agent tool surface."""
     memory_manager = getattr(agent, "_memory_manager", None)
@@ -142,17 +157,14 @@ def inject_memory_provider_tools(agent: Any) -> int:
     if not memory_manager or tools is None:
         return 0
 
+    if not memory_provider_tools_enabled_for_agent(agent):
+        return 0
+
     existing_tool_names = {
         tool.get("function", {}).get("name")
         for tool in tools
         if isinstance(tool, dict)
     }
-    if not memory_provider_tools_enabled(
-        getattr(agent, "enabled_toolsets", None),
-        getattr(agent, "disabled_toolsets", None),
-        memory_tool_present="memory" in existing_tool_names,
-    ):
-        return 0
 
     get_schemas = getattr(memory_manager, "get_all_tool_schemas", None)
     if not callable(get_schemas):
@@ -297,7 +309,11 @@ def _is_exact_bundled_provider(
     return module is not None and getattr(module, class_name, None) is provider_type
 
 
-def _trusted_provider_capability_guidance(provider: MemoryProvider) -> str:
+def _trusted_provider_capability_guidance(
+    provider: MemoryProvider,
+    *,
+    tool_guidance_enabled: bool,
+) -> str:
     """Return manager-owned instructions only for exact bundled provider classes.
 
     A provider's own ``system_prompt_block`` may contain remote or dynamically
@@ -322,17 +338,25 @@ def _trusted_provider_capability_guidance(provider: MemoryProvider) -> str:
                 "available in context-only mode."
             )
         elif mode == "tools":
+            if not tool_guidance_enabled:
+                return ""
             guidance = (
                 "No context is injected automatically. Use honcho_profile, "
                 "honcho_search, honcho_context, or honcho_reasoning to recall, "
                 "and honcho_conclude to retain facts."
             )
         elif mode == "hybrid":
-            guidance = (
-                "Relevant context is injected automatically; use honcho_profile, "
-                "honcho_search, honcho_context, or honcho_reasoning for explicit "
-                "recall and honcho_conclude to retain facts."
-            )
+            if tool_guidance_enabled:
+                guidance = (
+                    "Relevant context is injected automatically; use honcho_profile, "
+                    "honcho_search, honcho_context, or honcho_reasoning for explicit "
+                    "recall and honcho_conclude to retain facts."
+                )
+            else:
+                guidance = (
+                    "Relevant context may be injected automatically. No Honcho "
+                    "tools are exposed in this agent."
+                )
         else:
             return ""
         return f"[Trusted local memory capability; provider=honcho]\n{guidance}"
@@ -348,15 +372,23 @@ def _trusted_provider_capability_guidance(provider: MemoryProvider) -> str:
         if mode == "context":
             guidance = "Relevant Hindsight memories are injected automatically."
         elif mode == "tools":
+            if not tool_guidance_enabled:
+                return ""
             guidance = (
                 "Use hindsight_recall for explicit recall, hindsight_reflect for "
                 "synthesis, and hindsight_retain to store facts."
             )
         elif mode == "hybrid":
-            guidance = (
-                "Relevant memories are injected automatically; use hindsight_recall "
-                "or hindsight_reflect for explicit recall and hindsight_retain to store facts."
-            )
+            if tool_guidance_enabled:
+                guidance = (
+                    "Relevant memories are injected automatically; use hindsight_recall "
+                    "or hindsight_reflect for explicit recall and hindsight_retain to store facts."
+                )
+            else:
+                guidance = (
+                    "Relevant memories may be injected automatically. No Hindsight "
+                    "tools are exposed in this agent."
+                )
         else:
             return ""
         return f"[Trusted local memory capability; provider=hindsight]\n{guidance}"
@@ -368,6 +400,8 @@ def _trusted_provider_capability_guidance(provider: MemoryProvider) -> str:
         return ""
     expected_name, guidance = declared
     if provider.name != expected_name:
+        return ""
+    if not tool_guidance_enabled:
         return ""
     return (
         f"[Trusted local memory capability; provider={expected_name}]\n"
@@ -746,7 +780,7 @@ class MemoryManager:
 
     # -- System prompt -------------------------------------------------------
 
-    def build_system_prompt(self) -> str:
+    def build_system_prompt(self, *, tool_guidance_enabled: bool = True) -> str:
         """Collect system prompt blocks from all providers.
 
         Returns combined text, or empty string if no providers contribute.
@@ -757,9 +791,19 @@ class MemoryManager:
             return ""
         blocks = [EXTERNAL_MEMORY_TRUST_POLICY]
         for provider in providers:
-            trusted_guidance = _trusted_provider_capability_guidance(provider)
+            trusted_guidance = _trusted_provider_capability_guidance(
+                provider,
+                tool_guidance_enabled=tool_guidance_enabled,
+            )
             if trusted_guidance:
                 blocks.append(trusted_guidance)
+            if not tool_guidance_enabled:
+                # Bundled prompt blocks mix dynamic status with tool-call
+                # instructions. Omitting them when the platform gate is closed
+                # avoids presenting unavailable calls even inside the quoted
+                # untrusted envelope; automatic recall has its own provenance
+                # envelope at turn time.
+                continue
             try:
                 block = provider.system_prompt_block()
                 if block and block.strip():

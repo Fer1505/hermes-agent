@@ -130,6 +130,29 @@ def test_build_system_prompt_records_stable_prefix():
     assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
 
 
+def test_external_memory_prompt_uses_shared_effective_tool_gate():
+    class RecordingMemoryManager:
+        def __init__(self):
+            self.tool_guidance_enabled = None
+
+        def build_system_prompt(self, *, tool_guidance_enabled):
+            self.tool_guidance_enabled = tool_guidance_enabled
+            return "EXTERNAL MEMORY"
+
+    manager = RecordingMemoryManager()
+    agent = _make_agent(
+        _memory_manager=manager,
+        enabled_toolsets=["terminal"],
+        disabled_toolsets=None,
+        tools=[],
+    )
+
+    parts = _prompt_parts(agent)
+
+    assert manager.tool_guidance_enabled is False
+    assert "EXTERNAL MEMORY" in parts["volatile"]
+
+
 def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     """The cache split must not reorder the stored coding prompt."""
     import agent.system_prompt as system_prompt
