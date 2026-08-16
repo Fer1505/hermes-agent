@@ -393,10 +393,8 @@ def test_private_guard_inactive_does_not_probe(monkeypatch, cdp_server):
 # ---------------------------------------------------------------------------
 
 
-def test_check_fn_does_not_probe_network(monkeypatch):
-    """The availability gate must never hit the network: a stale/unreachable
-    configured endpoint used to cost multiple blocking HTTP probes at every
-    CLI/Desktop startup (tool-schema assembly), stalling launch by 10+ s."""
+def test_endpoint_check_does_not_probe_network_and_raw_cdp_requires_opt_in(monkeypatch):
+    """Endpoint discovery is nonblocking while the raw model tool fails closed."""
     import tools.browser_tool as bt
 
     def _boom(*a, **k):  # pragma: no cover — the assertion is that it's unused
@@ -405,6 +403,13 @@ def test_check_fn_does_not_probe_network(monkeypatch):
     monkeypatch.setattr(bt, "check_browser_requirements", lambda: True)
     monkeypatch.setattr(bt.requests, "get", _boom)
     monkeypatch.setenv("BROWSER_CDP_URL", "http://127.0.0.1:9222")
+    assert browser_cdp_tool._browser_cdp_endpoint_available() is True
+    assert browser_cdp_tool._browser_cdp_check() is False
+
+    monkeypatch.setattr(
+        "hermes_cli.config.read_raw_config",
+        lambda: {"browser": {"allow_raw_cdp": True}},
+    )
     assert browser_cdp_tool._browser_cdp_check() is True
 
 

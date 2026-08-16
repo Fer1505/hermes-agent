@@ -359,6 +359,44 @@ class TestGatewayCleanupWiring:
         assert "session-key" not in runner._agent_cache
 
 
+class TestTerminalAtexitCleanup:
+    def test_exit_cleanup_never_discovers_or_creates_scratch(self, monkeypatch):
+        """Shutdown cleans active envs without entering orphan discovery."""
+        from unittest.mock import MagicMock
+
+        from tools import terminal_tool
+
+        class FakeEnvironment:
+            def __init__(self):
+                self.cleaned = False
+                self.waited = False
+
+            def cleanup(self):
+                self.cleaned = True
+
+            def wait_for_cleanup(self, timeout):
+                assert timeout == 15.0
+                self.waited = True
+
+        environment = FakeEnvironment()
+        active = {"task": environment}
+        scratch_discovery = MagicMock(
+            side_effect=AssertionError("atexit must not discover scratch storage")
+        )
+        monkeypatch.setattr(terminal_tool, "_active_environments", active)
+        monkeypatch.setattr(terminal_tool, "_last_activity", {"task": 0.0})
+        monkeypatch.setattr(terminal_tool, "_creation_locks", {})
+        monkeypatch.setattr(terminal_tool, "_stop_cleanup_thread", lambda: None)
+        monkeypatch.setattr(terminal_tool, "_get_scratch_dir", scratch_discovery)
+
+        terminal_tool._atexit_cleanup()
+
+        assert environment.cleaned is True
+        assert environment.waited is True
+        assert active == {}
+        scratch_discovery.assert_not_called()
+
+
 class TestDelegationCleanup:
     """Verify subagent delegation cleans up child agents."""
 

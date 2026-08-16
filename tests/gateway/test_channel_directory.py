@@ -10,7 +10,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from gateway.config import Platform
 from gateway.channel_directory import (
     build_channel_directory,
+    channel_delivery_status,
     lookup_channel_type,
+    mark_channel_delivery_failed,
+    mark_channel_delivery_success,
     resolve_channel_name,
     format_directory_for_display,
     load_directory,
@@ -89,6 +92,122 @@ class TestBuildChannelDirectoryWrites:
             {"id": "default", "name": "主对话", "type": "dm"},
             {"id": "family_1", "name": "达拉崩吧", "type": "group"},
         ]
+
+    def test_recovers_stale_delivery_metadata_from_send_receipt(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {})
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        (sessions_dir / "sessions.json").write_text(json.dumps({
+            "group": {
+                "origin": {
+                    "platform": "telegram",
+                    "chat_id": "-1003579233553",
+                    "chat_name": "Team Room",
+                },
+                "chat_type": "group",
+            },
+        }))
+        (sessions_dir / "session.jsonl").write_text("\n".join([
+            json.dumps({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "function": {
+                        "name": "send_message",
+                        "arguments": json.dumps({
+                            "action": "send",
+                            "target": "telegram:Team Room",
+                            "message": "Status",
+                        }),
+                    },
+                }],
+            }),
+            json.dumps({
+                "role": "tool",
+                "name": "send_message",
+                "tool_call_id": "call-1",
+                "content": '{"error": "Telegram send failed: Chat not found"}',
+                "timestamp": "2026-06-08T15:23:23.966787",
+            }),
+        ]))
+
+        with (
+            patch("gateway.channel_directory.DIRECTORY_PATH", cache_file),
+            patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}),
+        ):
+            result = asyncio.run(
+                build_channel_directory({Platform.TELEGRAM: object()})
+            )
+
+        entry = result["platforms"]["telegram"][0]
+        assert entry["delivery_status"] == "stale"
+        assert entry["last_delivery_error"] == "Telegram send failed: Chat not found"
+
+    def test_later_success_clears_recovered_stale_delivery_metadata(self, tmp_path):
+        cache_file = _write_directory(tmp_path, {
+            "telegram": [{
+                "id": "-1003579233553",
+                "name": "Team Room",
+                "type": "group",
+                "delivery_status": "stale",
+                "stale_reason": "delivery_failed",
+                "last_delivery_error": "Chat not found",
+                "last_delivery_failed_at": "2026-06-08T15:23:23.966787",
+            }],
+        })
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        (sessions_dir / "sessions.json").write_text(json.dumps({
+            "group": {
+                "origin": {
+                    "platform": "telegram",
+                    "chat_id": "-1003579233553",
+                    "chat_name": "Team Room",
+                },
+                "chat_type": "group",
+            },
+        }))
+        events = []
+        for call_id, content in (
+            ("call-1", '{"error": "Telegram send failed: Chat not found"}'),
+            ("call-2", '{"success": true, "message_id": "777"}'),
+        ):
+            events.extend([
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "function": {
+                            "name": "send_message",
+                            "arguments": json.dumps({
+                                "action": "send",
+                                "target": "telegram:-1003579233553",
+                                "message": "Status",
+                            }),
+                        },
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "name": "send_message",
+                    "tool_call_id": call_id,
+                    "content": content,
+                    "timestamp": "2026-06-08T15:24:00.000000",
+                },
+            ])
+        (sessions_dir / "session.jsonl").write_text(
+            "\n".join(json.dumps(event) for event in events)
+        )
+
+        with (
+            patch("gateway.channel_directory.DIRECTORY_PATH", cache_file),
+            patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}),
+        ):
+            result = asyncio.run(
+                build_channel_directory({Platform.TELEGRAM: object()})
+            )
+
+        assert "delivery_status" not in result["platforms"]["telegram"][0]
 
 
 class TestBuildChannelDirectoryOffload:
@@ -176,6 +295,66 @@ class TestResolveChannelName:
         with self._setup(tmp_path, platforms):
             assert resolve_channel_name("telegram", "nonexistent") is None
 
+    def test_stale_delivery_labels_do_not_resolve_by_name(self, tmp_path):
+        platforms = {
+            "telegram": [{
+                "id": "-100999",
+                "name": "Old Group",
+                "type": "group",
+                "delivery_status": "stale",
+                "last_delivery_error": "Chat not found",
+            }],
+        }
+        with self._setup(tmp_path, platforms):
+            assert resolve_channel_name("telegram", "Old Group") is None
+            assert resolve_channel_name("telegram", "Old Group (group)") is None
+            assert resolve_channel_name("telegram", "-100999") == "-100999"
+            status = channel_delivery_status("telegram", "-100999")
+
+        assert status is not None
+        assert status["delivery_status"] == "stale"
+        assert status["last_delivery_error"] == "Chat not found"
+
+
+class TestDeliveryStaleMetadata:
+    def _setup(self, tmp_path, platforms):
+        cache_file = _write_directory(tmp_path, platforms)
+        return patch("gateway.channel_directory.DIRECTORY_PATH", cache_file)
+
+    def test_permanent_failure_marks_and_success_clears_entry(self, tmp_path):
+        with self._setup(tmp_path, {
+            "telegram": [{"id": "-100999", "name": "Old Group", "type": "group"}],
+        }):
+            assert mark_channel_delivery_failed(
+                "telegram", "-100999", "Chat not found"
+            ) is True
+            stale = load_directory()["platforms"]["telegram"][0]
+            assert stale["delivery_status"] == "stale"
+            assert stale["stale_reason"] == "delivery_failed"
+            assert stale["last_delivery_failed_at"]
+
+            assert mark_channel_delivery_success("telegram", "-100999") is True
+            recovered = load_directory()["platforms"]["telegram"][0]
+
+        for key in (
+            "delivery_status",
+            "stale_reason",
+            "last_delivery_error",
+            "last_delivery_failed_at",
+        ):
+            assert key not in recovered
+
+    def test_transient_failure_does_not_mark_entry_stale(self, tmp_path):
+        with self._setup(tmp_path, {
+            "telegram": [{"id": "-100999", "name": "Old Group", "type": "group"}],
+        }):
+            assert mark_channel_delivery_failed(
+                "telegram", "-100999", "Network timeout"
+            ) is False
+            result = load_directory()
+
+        assert "delivery_status" not in result["platforms"]["telegram"][0]
+
 
 class TestBuildFromSessions:
     def _write_sessions(self, tmp_path, sessions_data):
@@ -242,6 +421,27 @@ class TestFormatDirectoryForDisplay:
                 {"irc": [{"id": "#chan", "name": "#chan", "type": "channel"}]}
             )
         assert "irc:#chan" in result
+
+    def test_stale_targets_are_separated_from_usable_display(self):
+        result = format_directory_for_display({
+            "telegram": [
+                {"id": "123", "name": "Alice", "type": "dm"},
+                {
+                    "id": "-100999",
+                    "name": "Old Group",
+                    "type": "group",
+                    "delivery_status": "stale",
+                    "last_delivery_error": "Chat not found",
+                },
+            ],
+        })
+
+        active_section = result.split("Unavailable stale targets", 1)[0]
+        assert "telegram:Alice" in active_section
+        assert "telegram:Old Group" not in active_section
+        assert "Unavailable stale targets" in result
+        assert "telegram:Old Group (group)" in result
+        assert "do not use" in result
 
 
 class TestLookupChannelType:
@@ -397,4 +597,3 @@ class TestChannelAliases:
         names = [e["name"] for e in on_disk["platforms"]["whatsapp"]
                  if e["id"] == "120363@g.us"]
         assert names == ["general"]
-

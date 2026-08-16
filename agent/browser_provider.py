@@ -39,7 +39,69 @@ which provider is in use.
 from __future__ import annotations
 
 import abc
+from dataclasses import asdict, dataclass
+from enum import Enum
 from typing import Any, Dict, Optional
+
+
+class BrowserExecutionLocation(str, Enum):
+    PROVIDER_REMOTE = "provider-remote"
+
+
+class BrowserNetworkBoundary(str, Enum):
+    PROVIDER_MANAGED_UNVERIFIED = "provider-managed-unverified"
+
+
+class BrowserControlTransport(str, Enum):
+    CDP = "cdp"
+
+
+@dataclass(frozen=True)
+class BrowserEgressCapability:
+    """Truthful network-boundary contract for a remote browser provider."""
+
+    execution_location: BrowserExecutionLocation
+    network_boundary: BrowserNetworkBoundary
+    control_transport: BrowserControlTransport
+    requires_cdp_url: bool
+    allows_cross_authority_cdp_discovery: bool
+
+    def __post_init__(self) -> None:
+        for field_name, enum_type in (
+            ("execution_location", BrowserExecutionLocation),
+            ("network_boundary", BrowserNetworkBoundary),
+            ("control_transport", BrowserControlTransport),
+        ):
+            if not isinstance(getattr(self, field_name), enum_type):
+                raise TypeError(f"{field_name} must be a {enum_type.__name__}")
+        if not isinstance(self.requires_cdp_url, bool):
+            raise TypeError("requires_cdp_url must be a bool")
+        if not isinstance(self.allows_cross_authority_cdp_discovery, bool):
+            raise TypeError("allows_cross_authority_cdp_discovery must be a bool")
+
+    def as_session_metadata(self) -> Dict[str, object]:
+        metadata = asdict(self)
+        return {
+            key: value.value if isinstance(value, Enum) else value
+            for key, value in metadata.items()
+        }
+
+
+REMOTE_PROVIDER_EGRESS = BrowserEgressCapability(
+    execution_location=BrowserExecutionLocation.PROVIDER_REMOTE,
+    network_boundary=BrowserNetworkBoundary.PROVIDER_MANAGED_UNVERIFIED,
+    control_transport=BrowserControlTransport.CDP,
+    requires_cdp_url=True,
+    allows_cross_authority_cdp_discovery=False,
+)
+
+REMOTE_PROVIDER_EGRESS_WITH_CROSS_AUTHORITY_DISCOVERY = BrowserEgressCapability(
+    execution_location=BrowserExecutionLocation.PROVIDER_REMOTE,
+    network_boundary=BrowserNetworkBoundary.PROVIDER_MANAGED_UNVERIFIED,
+    control_transport=BrowserControlTransport.CDP,
+    requires_cdp_url=True,
+    allows_cross_authority_cdp_discovery=True,
+)
 
 
 # ---------------------------------------------------------------------------

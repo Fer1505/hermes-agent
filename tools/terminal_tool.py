@@ -2160,8 +2160,14 @@ def is_persistent_env(task_id: str) -> bool:
 
 
 
-def cleanup_all_environments():
-    """Clean up ALL active environments. Use with caution."""
+def cleanup_all_environments(*, cleanup_orphans: bool = True):
+    """Clean up all active environments and, optionally, orphaned storage.
+
+    Orphan discovery resolves and may create the configured scratch directory.
+    Callers performing interpreter teardown can disable that separate sweep so
+    shutdown never creates or relaxes validation of a sandbox merely to remove
+    old directories.
+    """
     task_ids = list(_active_environments.keys())
     cleaned = 0
     
@@ -2172,15 +2178,18 @@ def cleanup_all_environments():
         except Exception as e:
             logger.error("Error cleaning %s: %s", task_id, e, exc_info=True)
     
-    # Also clean any orphaned directories
-    scratch_dir = _get_scratch_dir()
-    import glob
-    for path in glob.glob(str(scratch_dir / "hermes-*")):
-        try:
-            shutil.rmtree(path, ignore_errors=True)
-            logger.info("Removed orphaned: %s", path)
-        except OSError as e:
-            logger.debug("Failed to remove orphaned path %s: %s", path, e)
+    if cleanup_orphans:
+        # This explicit maintenance sweep keeps the fail-closed scratch-path
+        # validation. Interpreter teardown skips it because discovery may
+        # create storage and can legitimately reject a symlinked ancestor.
+        scratch_dir = _get_scratch_dir()
+        import glob
+        for path in glob.glob(str(scratch_dir / "hermes-*")):
+            try:
+                shutil.rmtree(path, ignore_errors=True)
+                logger.info("Removed orphaned: %s", path)
+            except OSError as e:
+                logger.debug("Failed to remove orphaned path %s: %s", path, e)
     
     if cleaned > 0:
         logger.info("Cleaned %d environments", cleaned)
@@ -2265,7 +2274,7 @@ def _atexit_cleanup():
         # the dict; we need them to wait on docker cleanup threads after the
         # registry has been cleared.
         envs_to_wait = list(_active_environments.values())
-        cleanup_all_environments()
+        cleanup_all_environments(cleanup_orphans=False)
         # Block briefly so docker stop/rm actually completes before the
         # interpreter exits. Issue #20561 — without this join, the daemon
         # cleanup threads were getting torn down mid-`docker stop`, leaving

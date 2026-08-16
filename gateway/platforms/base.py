@@ -167,6 +167,11 @@ def _reply_anchor_for_event(event) -> str | None:
     return getattr(event, "message_id", None)
 
 
+def is_no_reply_sentinel(response) -> bool:
+    """Return True only for the agent's exact intentional-silence sentinel."""
+    return isinstance(response, str) and response.strip().upper() == "NO_REPLY"
+
+
 def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bool:
     """Return True when a media file should use the platform's audio sender.
 
@@ -6481,6 +6486,13 @@ class BasePlatformAdapter(ABC):
                     "[%s] Suppressing stale response for interrupted session %s",
                     self.name,
                     session_key,
+                )
+                response = None
+            if is_no_reply_sentinel(response):
+                logger.info(
+                    "[%s] Suppressing NO_REPLY sentinel for %s",
+                    self.name,
+                    event.source.chat_id,
                 )
                 response = None
             if not response:

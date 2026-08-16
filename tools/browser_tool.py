@@ -164,7 +164,11 @@ except Exception:
 # and into ``plugins/browser/<vendor>/``. The dispatcher consults the
 # registry; the legacy class names are re-exported below as backward-compat
 # shims for callers that import them from this module.
-from agent.browser_provider import BrowserProvider as CloudBrowserProvider  # noqa: F401  (legacy alias)
+from agent.browser_provider import (
+    REMOTE_PROVIDER_EGRESS,
+    BrowserEgressCapability,
+    BrowserProvider as CloudBrowserProvider,  # noqa: F401  (legacy alias)
+)
 from agent.browser_registry import (  # noqa: F401  (test-patchable surface)
     get_provider as _registry_get_browser_provider,
 )
@@ -188,13 +192,17 @@ from plugins.browser.firecrawl.provider import (  # noqa: F401
     FirecrawlBrowserProvider as FirecrawlProvider,
 )
 from tools.tool_backend_helpers import normalize_browser_cloud_provider
-# Camofox local anti-detection browser backend (optional).
+# Camofox self-hosted anti-detection browser backend (optional).
 # When CAMOFOX_URL is set, all browser operations route through the
 # camofox REST API instead of the agent-browser CLI.
 try:
-    from tools.browser_camofox import is_camofox_mode as _is_camofox_mode
+    from tools.browser_camofox import (
+        is_camofox_co_resident as _is_camofox_co_resident,
+        is_camofox_mode as _is_camofox_mode,
+    )
 except ImportError:
     _is_camofox_mode = lambda: False  # noqa: E731
+    _is_camofox_co_resident = lambda: False  # noqa: E731
 # Browser Use CLI (optional)
 try:
     from tools.browser_use_cli import is_browser_use_cli_mode as _is_browser_use_cli_mode
@@ -712,6 +720,47 @@ _cached_browser_engine: Optional[str] = None
 _browser_engine_resolved = False
 
 
+class _FailedConfiguredBrowserProvider(CloudBrowserProvider):
+    """Fail-closed stand-in for an explicit provider that cannot be loaded."""
+
+    def __init__(self, configured_name: str, reason: str) -> None:
+        self._configured_name = configured_name
+        self._reason = reason
+        self.configuration_error = True
+
+    @property
+    def name(self) -> str:
+        return self._configured_name
+
+    @property
+    def display_name(self) -> str:
+        return self._configured_name
+
+    @property
+    def egress_capability(self) -> BrowserEgressCapability:
+        return REMOTE_PROVIDER_EGRESS
+
+    def is_available(self) -> bool:
+        return False
+
+    def create_session(self, task_id: str) -> Dict[str, object]:
+        raise RuntimeError(
+            f"Configured browser cloud provider {self._configured_name!r} "
+            f"is unavailable: {self._reason}"
+        )
+
+    def close_session(self, session_id: str) -> bool:
+        return False
+
+    def emergency_cleanup(self, session_id: str) -> None:
+        return None
+
+
+def _failed_configured_provider(name: str, reason: str) -> CloudBrowserProvider:
+    """Return a non-local backend marker without poisoning the resolver cache."""
+    return _FailedConfiguredBrowserProvider(name, reason)
+
+
 def _is_legacy_provider_registry_overridden() -> bool:
     """Return True when a test has patched ``_PROVIDER_REGISTRY`` to a custom value.
 
@@ -805,6 +854,10 @@ def _resolve_cloud_provider_uncached() -> Optional[CloudBrowserProvider]:
     historic auto-detect order, now expressed as the
     :data:`agent.browser_registry._LEGACY_PREFERENCE` walk.
 
+    An explicitly configured provider is authoritative. Unknown names and
+    construction failures return a fail-closed provider marker; they never
+    enter auto-detect or silently select a local browser.
+
     Selection routes through :mod:`agent.browser_registry` so third-party
     browser plugins (``~/.hermes/plugins/browser/<vendor>/``) participate
     in explicit-config resolution. Test fixtures that override
@@ -836,32 +889,36 @@ def _resolve_cloud_provider_uncached() -> Optional[CloudBrowserProvider]:
                     factory = _PROVIDER_REGISTRY.get(provider_key)
                     if factory is not None:
                         resolved = factory()
+                    else:
+                        return _failed_configured_provider(
+                            provider_key, "no provider with that name is registered"
+                        )
                 else:
                     # Ensure plugins are discovered so the registry is
                     # populated. Idempotent — cheap on subsequent calls.
                     _ensure_browser_plugins_loaded()
                     resolved = _registry_get_browser_provider(provider_key)
                     if resolved is None:
-                        # Explicit config name unknown to the registry —
-                        # might be a typo, an uninstalled plugin, or a
-                        # registry-population failure. Warn the user
-                        # (legacy code would have surfaced a typed
-                        # credentials error via direct class instantiation;
-                        # post-migration we surface this WARNING instead).
                         logger.warning(
                             "browser.cloud_provider=%r is not a registered "
-                            "browser plugin; falling back to auto-detect "
-                            "(install the corresponding plugin or fix the "
-                            "config key spelling).",
+                            "browser plugin; refusing automatic or local fallback "
+                            "(install the plugin or fix the config key spelling).",
                             provider_key,
                         )
-            except Exception:
+                        return _failed_configured_provider(
+                            provider_key, "no provider with that name is registered"
+                        )
+            except Exception as exc:
                 logger.warning(
-                    "Failed to instantiate explicit cloud_provider %r; will retry on next call",
+                    "Failed to instantiate explicit cloud_provider %r; refusing "
+                    "automatic or local fallback and retrying resolution on the next call",
                     provider_key,
                     exc_info=True,
                 )
-                return None
+                return _failed_configured_provider(
+                    provider_key,
+                    f"provider initialization failed ({type(exc).__name__})",
+                )
     except Exception as e:
         # Config file may be temporarily unreadable; still try auto-detect so
         # env-based / managed-gateway credentials can resolve. Don't pin cache.
@@ -972,13 +1029,13 @@ def _is_local_backend() -> bool:
     # non-local; keep the two helpers in agreement.
     if _get_cdp_override_raw():
         return False
+    terminal_backend = os.getenv("TERMINAL_ENV", "local").strip().lower()
     if _is_camofox_mode():
-        return True
+        return _is_camofox_co_resident() and terminal_backend in ("local", "")
     if _get_cloud_provider() is not None:
         return False
     # When terminal runs in a container, browser on host can access
     # internal networks the terminal can't → treat as non-local.
-    terminal_backend = os.getenv("TERMINAL_ENV", "local").strip().lower()
     return terminal_backend in ("local", "")
 
 
@@ -4276,9 +4333,27 @@ def _camofox_current_page_private_url(tab_id: str, user_id: str) -> Optional[str
 
 def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate JS via Camofox's /tabs/{tab_id}/evaluate endpoint (if available)."""
-    from tools.browser_camofox import _ensure_tab, _post
+    from tools.browser_camofox import (
+        _content_access_error,
+        _ensure_tab,
+        _external_camofox,
+        _post,
+        _with_boundary,
+    )
     try:
         tab_info = _ensure_tab(task_id or "default")
+        content_error = _content_access_error(tab_info)
+        if content_error is not None:
+            return content_error
+        if _external_camofox(tab_info):
+            return json.dumps(_with_boundary({
+                "success": False,
+                "error": (
+                    "Blocked: JavaScript evaluation is unavailable for an external "
+                    "Camofox boundary because the REST API cannot independently "
+                    "verify the final main-frame URL after script execution."
+                ),
+            }, tab_info))
         tab_id = tab_info.get("tab_id") or tab_info.get("id")
         user_id = tab_info["user_id"]
         resp = _post(f"/tabs/{tab_id}/evaluate", body={"expression": expression, "userId": user_id})

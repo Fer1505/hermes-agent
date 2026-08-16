@@ -1,6 +1,7 @@
 """Tests for the delivery routing module."""
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from typing import Any, cast
@@ -281,6 +282,47 @@ async def test_explicit_telegram_private_thread_uses_reply_fallback_with_anchor(
 class FailingAdapter:
     async def send(self, chat_id, content, metadata=None):
         return SendResult(success=False, error="route failed", retryable=False)
+
+
+@pytest.mark.asyncio
+async def test_delivery_failure_calls_channel_stale_marker(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+
+    class PermanentlyFailingAdapter:
+        async def send(self, chat_id, content, metadata=None):
+            return SendResult(success=False, error="Chat not found", retryable=False)
+
+    router = DeliveryRouter(
+        GatewayConfig(),
+        adapters={Platform.TELEGRAM: PermanentlyFailingAdapter()},
+    )
+    target = DeliveryTarget.parse("telegram:-100999")
+
+    with patch("gateway.channel_directory.mark_channel_delivery_failed") as marker:
+        with pytest.raises(RuntimeError, match="Chat not found"):
+            await router._deliver_to_platform(target, "hello", metadata=None)
+
+    marker.assert_called_once_with(
+        "telegram",
+        "-100999",
+        "Chat not found",
+        thread_id=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delivery_success_calls_channel_stale_clearer(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    router = DeliveryRouter(
+        GatewayConfig(),
+        adapters={Platform.TELEGRAM: RecordingAdapter()},
+    )
+    target = DeliveryTarget.parse("telegram:-100999")
+
+    with patch("gateway.channel_directory.mark_channel_delivery_success") as clearer:
+        await router._deliver_to_platform(target, "hello", metadata=None)
+
+    clearer.assert_called_once_with("telegram", "-100999", thread_id=None)
 
 
 # ---------------------------------------------------------------------------

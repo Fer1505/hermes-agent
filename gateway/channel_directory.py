@@ -9,6 +9,7 @@ action="list" and for resolving human-friendly channel names to numeric IDs.
 import asyncio
 import json
 import logging
+import re
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -26,6 +27,41 @@ DIRECTORY_PATH = get_hermes_home() / "channel_directory.json"
 # drop to DEBUG.
 _SLACK_DIRECTORY_WARNING_INTERVAL_SECONDS = 3600
 _slack_directory_warning_last: Dict[tuple[str, str], float] = {}
+DELIVERY_METADATA_KEYS = frozenset({
+    "delivery_status",
+    "stale_reason",
+    "last_delivery_error",
+    "last_delivery_failed_at",
+})
+STALE_DELIVERY_ERROR_MARKERS = (
+    "chat not found",
+    "channel not found",
+    "room not found",
+    "thread not found",
+    "forbidden",
+    "bot was blocked",
+    "bot blocked",
+    "not enough rights",
+    "not a member",
+    "have no access",
+    "missing access",
+    "missing permissions",
+)
+TRANSIENT_DELIVERY_ERROR_MARKERS = (
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "try again",
+    "too many requests",
+    "rate limit",
+    "flood",
+    "bad gateway",
+    "gateway timeout",
+    "service unavailable",
+    "connection reset",
+    "network",
+)
+_EXPLICIT_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
 
 # User-maintained friendly-name overlay. The directory is fully regenerated
 # from live adapters + session data on a timer, so hand-edits to
@@ -135,6 +171,210 @@ def _warn_slack_directory(team_id: str, detail: str) -> None:
         )
 
 
+def _channel_is_stale(channel: Dict[str, Any]) -> bool:
+    return channel.get("delivery_status") == "stale"
+
+
+def _channel_delivery_id(chat_id: str, thread_id: Optional[str] = None) -> str:
+    return f"{chat_id}:{thread_id}" if thread_id else str(chat_id)
+
+
+def channel_delivery_status(
+    platform_name: str,
+    chat_id: str,
+    *,
+    thread_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return cached delivery metadata for a platform target, when known."""
+    channels = load_directory().get("platforms", {}).get(platform_name, [])
+    if not isinstance(channels, list):
+        return None
+    target_id = _channel_delivery_id(str(chat_id), str(thread_id) if thread_id else None)
+    for channel in channels:
+        if not isinstance(channel, dict) or str(channel.get("id")) != target_id:
+            continue
+        return {key: channel.get(key) for key in DELIVERY_METADATA_KEYS}
+    return None
+
+
+def _safe_error_text(error: Any) -> str:
+    text = str(error or "unknown delivery failure")
+    try:
+        from agent.redact import redact_sensitive_text
+
+        text = redact_sensitive_text(text)
+    except Exception:
+        pass
+    return text[:500]
+
+
+def is_stale_delivery_error(error: Any) -> bool:
+    """Return whether a failure proves the target itself is unavailable."""
+    text = str(error or "").lower()
+    if not text or any(marker in text for marker in TRANSIENT_DELIVERY_ERROR_MARKERS):
+        return False
+    return any(marker in text for marker in STALE_DELIVERY_ERROR_MARKERS)
+
+
+def _preserve_delivery_metadata(
+    entries: List[Dict[str, Any]],
+    previous_entries: Any,
+) -> List[Dict[str, Any]]:
+    """Carry proven stale status across live/session directory rebuilds."""
+    if not isinstance(entries, list) or not isinstance(previous_entries, list):
+        return entries
+    previous_by_id = {
+        str(entry.get("id")): entry
+        for entry in previous_entries
+        if isinstance(entry, dict) and entry.get("id") is not None
+    }
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        previous = previous_by_id.get(str(entry.get("id")))
+        if not previous:
+            continue
+        for key in DELIVERY_METADATA_KEYS:
+            if key in previous:
+                entry[key] = previous[key]
+    return entries
+
+
+def _parse_json_prefix(value: Any) -> Optional[Dict[str, Any]]:
+    """Parse a leading JSON object before any appended tool-loop warning."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed, _index = json.JSONDecoder().raw_decode(value.strip())
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _resolve_recovery_target(
+    platforms: Dict[str, List[Dict[str, Any]]],
+    target: Any,
+) -> Optional[tuple[str, str, Optional[str]]]:
+    if not isinstance(target, str) or ":" not in target:
+        return None
+    platform_name, target_ref = target.split(":", 1)
+    platform_name = platform_name.strip().lower()
+    target_ref = target_ref.strip()
+    if not platform_name or not target_ref:
+        return None
+    explicit_match = _EXPLICIT_TOPIC_TARGET_RE.fullmatch(target_ref)
+    if explicit_match:
+        return platform_name, explicit_match.group(1), explicit_match.group(2)
+    query = _normalize_channel_query(target_ref)
+    for channel in platforms.get(platform_name, []):
+        if not isinstance(channel, dict) or channel.get("id") is None:
+            continue
+        entry_id = str(channel["id"])
+        if entry_id == target_ref:
+            return platform_name, entry_id, None
+        if _normalize_channel_query(str(channel.get("name") or "")) == query:
+            return platform_name, entry_id, channel.get("thread_id")
+        if _normalize_channel_query(_channel_target_name(platform_name, channel)) == query:
+            return platform_name, entry_id, channel.get("thread_id")
+    return None
+
+
+def _recent_session_jsonl_paths(limit: int = 200) -> List[Any]:
+    sessions_dir = get_hermes_home() / "sessions"
+    if not sessions_dir.exists():
+        return []
+    try:
+        paths = sorted(
+            sessions_dir.glob("*.jsonl"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    except Exception:
+        return []
+    return list(reversed(paths[:limit]))
+
+
+def _recover_session_delivery_metadata(
+    platforms: Dict[str, List[Dict[str, Any]]],
+) -> Dict[tuple[str, str, Optional[str]], Optional[Dict[str, Any]]]:
+    """Recover stale marks from persisted send_message tool receipts."""
+    states: Dict[tuple[str, str, Optional[str]], Optional[Dict[str, Any]]] = {}
+    for path in _recent_session_jsonl_paths():
+        pending_calls: Dict[str, Dict[str, Any]] = {}
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            continue
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            if event.get("role") == "assistant":
+                for tool_call in event.get("tool_calls") or []:
+                    function = tool_call.get("function") or {}
+                    if function.get("name") != "send_message":
+                        continue
+                    call_id = tool_call.get("id") or tool_call.get("call_id")
+                    arguments = _parse_json_prefix(function.get("arguments"))
+                    if call_id and isinstance(arguments, dict):
+                        pending_calls[str(call_id)] = arguments
+                continue
+            if event.get("role") != "tool" or event.get("name") != "send_message":
+                continue
+            arguments = pending_calls.get(str(event.get("tool_call_id")))
+            if not arguments:
+                continue
+            resolved = _resolve_recovery_target(platforms, arguments.get("target"))
+            if not resolved:
+                continue
+            platform_name, chat_id, thread_id = resolved
+            key = (platform_name, chat_id, str(thread_id) if thread_id else None)
+            result = _parse_json_prefix(event.get("content")) or {}
+            error = result.get("error")
+            if error and is_stale_delivery_error(error):
+                states[key] = {
+                    "delivery_status": "stale",
+                    "stale_reason": "delivery_failed",
+                    "last_delivery_error": _safe_error_text(error),
+                    "last_delivery_failed_at": (
+                        event.get("timestamp") or datetime.now().isoformat()
+                    ),
+                }
+            elif result.get("success"):
+                # Preserve an explicit success receipt so it can clear stale
+                # metadata carried from the previous on-disk directory.
+                states[key] = None
+    return states
+
+
+def _apply_recovered_delivery_metadata(
+    platforms: Dict[str, List[Dict[str, Any]]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    recovered = _recover_session_delivery_metadata(platforms)
+    for platform_name, channels in platforms.items():
+        if not isinstance(channels, list):
+            continue
+        for channel in channels:
+            if not isinstance(channel, dict) or channel.get("id") is None:
+                continue
+            entry_id = str(channel["id"])
+            thread_id = str(channel.get("thread_id")) if channel.get("thread_id") else None
+            recovery_chat_id = entry_id
+            if thread_id and entry_id.endswith(f":{thread_id}"):
+                recovery_chat_id = entry_id[: -(len(thread_id) + 1)]
+            key = (platform_name, recovery_chat_id, thread_id)
+            if key not in recovered:
+                continue
+            metadata = recovered[key]
+            if metadata is None:
+                for metadata_key in DELIVERY_METADATA_KEYS:
+                    channel.pop(metadata_key, None)
+            else:
+                channel.update(metadata)
+    return platforms
+
+
 # ---------------------------------------------------------------------------
 # Build / refresh
 # ---------------------------------------------------------------------------
@@ -147,7 +387,8 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     """
     from gateway.config import Platform
 
-    platforms: Dict[str, List[Dict[str, str]]] = {}
+    previous_platforms = load_directory().get("platforms", {})
+    platforms: Dict[str, List[Dict[str, Any]]] = {}
 
     for platform, adapter in adapters.items():
         try:
@@ -200,6 +441,13 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     # Overlay user-maintained friendly names before persisting.
     _apply_channel_aliases(platforms)
 
+    for platform_name, entries in list(platforms.items()):
+        platforms[platform_name] = _preserve_delivery_metadata(
+            entries,
+            previous_platforms.get(platform_name, []),
+        )
+    platforms = _apply_recovered_delivery_metadata(platforms)
+
     directory = {
         "updated_at": datetime.now().isoformat(),
         "platforms": platforms,
@@ -211,6 +459,82 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
         logger.warning("Channel directory: failed to write: %s", e)
 
     return directory
+
+
+def mark_channel_delivery_failed(
+    platform_name: str,
+    chat_id: str,
+    error: Any,
+    *,
+    thread_id: Optional[str] = None,
+) -> bool:
+    """Mark a cached target stale after a permanent provider rejection."""
+    if not is_stale_delivery_error(error):
+        return False
+    directory = load_directory()
+    channels = directory.get("platforms", {}).get(platform_name, [])
+    if not isinstance(channels, list):
+        return False
+    target_id = _channel_delivery_id(str(chat_id), str(thread_id) if thread_id else None)
+    changed = False
+    for channel in channels:
+        if not isinstance(channel, dict) or str(channel.get("id")) != target_id:
+            continue
+        channel.update({
+            "delivery_status": "stale",
+            "stale_reason": "delivery_failed",
+            "last_delivery_error": _safe_error_text(error),
+            "last_delivery_failed_at": datetime.now().isoformat(),
+        })
+        changed = True
+    if not changed:
+        return False
+    try:
+        atomic_json_write(DIRECTORY_PATH, directory)
+    except Exception as exc:
+        logger.warning(
+            "Channel directory: failed to mark %s:%s stale: %s",
+            platform_name,
+            target_id,
+            exc,
+        )
+        return False
+    return True
+
+
+def mark_channel_delivery_success(
+    platform_name: str,
+    chat_id: str,
+    *,
+    thread_id: Optional[str] = None,
+) -> bool:
+    """Clear stale metadata after a later provider-confirmed delivery."""
+    directory = load_directory()
+    channels = directory.get("platforms", {}).get(platform_name, [])
+    if not isinstance(channels, list):
+        return False
+    target_id = _channel_delivery_id(str(chat_id), str(thread_id) if thread_id else None)
+    changed = False
+    for channel in channels:
+        if not isinstance(channel, dict) or str(channel.get("id")) != target_id:
+            continue
+        for key in DELIVERY_METADATA_KEYS:
+            if key in channel:
+                channel.pop(key, None)
+                changed = True
+    if not changed:
+        return False
+    try:
+        atomic_json_write(DIRECTORY_PATH, directory)
+    except Exception as exc:
+        logger.warning(
+            "Channel directory: failed to clear stale mark for %s:%s: %s",
+            platform_name,
+            target_id,
+            exc,
+        )
+        return False
+    return True
 
 
 def _build_discord(adapter) -> List[Dict[str, str]]:
@@ -577,6 +901,8 @@ def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
 
     # 1. Exact name match, including the display labels shown by send_message(action="list")
     for ch in channels:
+        if _channel_is_stale(ch):
+            continue
         if _normalize_channel_query(ch["name"]) == query:
             return ch["id"]
         if _normalize_channel_query(_channel_target_name(platform_name, ch)) == query:
@@ -586,12 +912,18 @@ def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
     if "/" in query:
         guild_part, ch_part = query.rsplit("/", 1)
         for ch in channels:
+            if _channel_is_stale(ch):
+                continue
             guild = ch.get("guild", "").strip().lower()
             if guild == guild_part and _normalize_channel_query(ch["name"]) == ch_part:
                 return ch["id"]
 
     # 3. Partial prefix match (only if unambiguous)
-    matches = [ch for ch in channels if _normalize_channel_query(ch["name"]).startswith(query)]
+    matches = [
+        ch for ch in channels
+        if not _channel_is_stale(ch)
+        and _normalize_channel_query(ch["name"]).startswith(query)
+    ]
     if len(matches) == 1:
         return matches[0]["id"]
 
@@ -615,6 +947,8 @@ def format_directory_for_display(platforms: Optional[Dict[str, Any]] = None) -> 
         return "No messaging platforms connected or no channels discovered yet."
 
     lines = ["Available messaging targets:\n"]
+    stale_lines: List[str] = []
+    active_count = 0
 
     for plat_name, channels in sorted(platforms.items()):
         if not channels:
@@ -640,19 +974,51 @@ def format_directory_for_display(platforms: Optional[Dict[str, Any]] = None) -> 
             for guild_name, guild_channels in sorted(guilds.items()):
                 lines.append(f"Discord ({guild_name}):")
                 for ch in sorted(guild_channels, key=lambda c: c["name"]):
+                    if _channel_is_stale(ch):
+                        stale_lines.append(_format_stale_target_line(plat_name, ch))
+                        continue
                     lines.append(f"  discord:{_channel_target_name(plat_name, ch)}")
+                    active_count += 1
             if dms:
-                lines.append("Discord (DMs):")
+                active_dms = [ch for ch in dms if not _channel_is_stale(ch)]
                 for ch in dms:
-                    lines.append(f"  discord:{_channel_target_name(plat_name, ch)}")
+                    if _channel_is_stale(ch):
+                        stale_lines.append(_format_stale_target_line(plat_name, ch))
+                if active_dms:
+                    lines.append("Discord (DMs):")
+                    for ch in active_dms:
+                        lines.append(f"  discord:{_channel_target_name(plat_name, ch)}")
+                        active_count += 1
             lines.append("")
         else:
-            lines.append(f"{plat_name.title()}:")
+            active_channels = []
             for ch in channels:
-                lines.append(f"  {plat_name}:{_channel_target_name(plat_name, ch)}")
+                if _channel_is_stale(ch):
+                    stale_lines.append(_format_stale_target_line(plat_name, ch))
+                else:
+                    active_channels.append(ch)
+            if active_channels:
+                lines.append(f"{plat_name.title()}:")
+                for ch in active_channels:
+                    lines.append(f"  {plat_name}:{_channel_target_name(plat_name, ch)}")
+                    active_count += 1
             lines.append("")
 
-    lines.append('Use these as the "target" parameter when sending.')
+    if active_count == 0:
+        lines.append("No currently usable messaging targets are available.")
+        lines.append("")
+    if stale_lines:
+        lines.append("Unavailable stale targets (do not use until refreshed):")
+        lines.extend(stale_lines)
+        lines.append("")
+
+    lines.append('Use only the available targets above as the "target" parameter when sending.')
     lines.append('Bare platform name (e.g. "telegram") sends to home channel.')
 
     return "\n".join(lines)
+
+
+def _format_stale_target_line(platform_name: str, channel: Dict[str, Any]) -> str:
+    label = _channel_target_name(platform_name, channel)
+    error = channel.get("last_delivery_error") or channel.get("stale_reason") or "delivery failed"
+    return f"  {platform_name}:{label} — stale, not currently usable ({error})"

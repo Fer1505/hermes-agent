@@ -634,11 +634,32 @@ BROWSER_CDP_SCHEMA: Dict[str, Any] = {
 }
 
 
+def _browser_cdp_endpoint_available() -> bool:
+    """Return whether the shared high-level CDP transport is configured.
+
+    This reachability check remains independent of the model-facing raw-CDP
+    opt-in because dialog handling uses the same transport without exposing
+    the unrestricted CDP escape hatch.
+    """
+    try:
+        from tools.browser_tool import (  # type: ignore[import-not-found]
+            _get_cdp_override_raw,
+            check_browser_requirements,
+        )
+    except ImportError as exc:  # pragma: no cover — defensive
+        logger.debug("browser CDP endpoint check: browser_tool import failed: %s", exc)
+        return False
+    if not check_browser_requirements():
+        return False
+    return bool(_get_cdp_override_raw())
+
+
 def _browser_cdp_check() -> bool:
     """Availability check for browser_cdp.
 
-    The tool is only offered when the Python side can actually reach a CDP
-    endpoint right now — meaning a static URL is set via ``/browser connect``
+    The tool is only offered when the explicit ``browser.allow_raw_cdp``
+    opt-in is enabled and the Python side can actually reach a CDP endpoint
+    right now — meaning a static URL is set via ``/browser connect``
     (``BROWSER_CDP_URL``) or ``browser.cdp_url`` in ``config.yaml``.
 
     Backends that do *not* currently expose CDP to us — Camofox (REST-only),
@@ -652,19 +673,22 @@ def _browser_cdp_check() -> bool:
     ``registry.register(...)`` calls).
     """
     try:
-        from tools.browser_tool import (  # type: ignore[import-not-found]
-            _get_cdp_override_raw,
-            check_browser_requirements,
-        )
+        from hermes_cli.config import cfg_get, read_raw_config
+        from utils import is_truthy_value
     except ImportError as exc:  # pragma: no cover — defensive
-        logger.debug("browser_cdp check: browser_tool import failed: %s", exc)
+        logger.debug("browser_cdp check: config import failed: %s", exc)
         return False
-    if not check_browser_requirements():
+    try:
+        allow_raw_cdp = is_truthy_value(
+            cfg_get(read_raw_config(), "browser", "allow_raw_cdp"),
+            default=False,
+        )
+    except Exception as exc:  # pragma: no cover — fail closed on config errors
+        logger.debug("browser_cdp check: allow_raw_cdp config read failed: %s", exc)
         return False
-    # Raw (no-I/O) gate: check_fns run during tool-schema assembly at every
-    # startup; resolving the endpoint over HTTP here would block launch when
-    # the configured endpoint is stale/unreachable.
-    return bool(_get_cdp_override_raw())
+    if not allow_raw_cdp:
+        return False
+    return _browser_cdp_endpoint_available()
 
 
 registry.register(

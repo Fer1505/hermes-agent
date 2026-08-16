@@ -7,6 +7,8 @@ any actual MCP servers or API keys.
 
 import argparse
 import os
+import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -56,6 +58,15 @@ def _make_args(**kwargs):
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
+
+
+def _copy_native_test_executable(tmp_path: Path) -> Path:
+    """Create a direct native executable with a non-interpreter basename."""
+    suffix = ".exe" if os.name == "nt" else ""
+    target = tmp_path / f"mcp-test-server{suffix}"
+    shutil.copy2(sys.executable, target)
+    target.chmod(0o700)
+    return target
 
 
 def _seed_config(tmp_path: Path, mcp_servers: dict):
@@ -209,6 +220,7 @@ class TestMcpAdd:
 
     def test_add_stdio_server_with_env(self, tmp_path, capsys, monkeypatch):
         """Stdio servers can persist explicit environment variables."""
+        executable = _copy_native_test_executable(tmp_path)
         fake_tools = [FakeTool("search", "Search repos")]
 
         def mock_probe(name, config, **kw):
@@ -227,9 +239,10 @@ class TestMcpAdd:
 
         cmd_mcp_add(_make_args(
             name="github",
-            mcp_command="npx",
-            args=["@mcp/github"],
+            mcp_command=str(executable),
+            args=["serve"],
             env=["MY_API_KEY=secret123", "DEBUG=true"],
+            authorize_stdio=True,
         ))
         out = capsys.readouterr().out
         assert "Saved" in out
@@ -245,17 +258,18 @@ class TestMcpAdd:
 
 
     def test_add_preset_fills_transport(self, tmp_path, capsys, monkeypatch):
-        """A preset fills in command/args when no explicit transport given."""
+        """An authorized preset fills transport without bypassing stdio policy."""
+        executable = _copy_native_test_executable(tmp_path)
         monkeypatch.setattr(
             "hermes_cli.mcp_config._MCP_PRESETS",
-            {"testmcp": {"command": "npx", "args": ["-y", "test-mcp-server"], "display_name": "Test MCP"}},
+            {"testmcp": {"command": str(executable), "args": ["serve"], "display_name": "Test MCP"}},
         )
         fake_tools = [FakeTool("do_thing", "Does a thing")]
 
         def mock_probe(name, config, **kw):
             assert name == "myserver"
-            assert config["command"] == "npx"
-            assert config["args"] == ["-y", "test-mcp-server"]
+            assert config["command"] == str(executable.resolve())
+            assert config["args"] == ["serve"]
             assert "env" not in config
             return [(t.name, t.description) for t in fake_tools]
 
@@ -267,14 +281,18 @@ class TestMcpAdd:
         from hermes_cli.mcp_config import cmd_mcp_add
         from hermes_cli.config import read_raw_config
 
-        cmd_mcp_add(_make_args(name="myserver", preset="testmcp"))
+        cmd_mcp_add(_make_args(
+            name="myserver",
+            preset="testmcp",
+            authorize_stdio=True,
+        ))
         out = capsys.readouterr().out
         assert "Saved" in out
 
         config = read_raw_config()
         srv = config["mcp_servers"]["myserver"]
-        assert srv["command"] == "npx"
-        assert srv["args"] == ["-y", "test-mcp-server"]
+        assert srv["command"] == str(executable.resolve())
+        assert srv["args"] == ["serve"]
         assert "env" not in srv
 
 
