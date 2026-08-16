@@ -40,6 +40,7 @@ sys.modules.setdefault("telegram.constants", _tg.constants)
 sys.modules.setdefault("telegram.ext", types.ModuleType("telegram.ext"))
 
 from gateway.platforms.base import (  # noqa: E402
+    BusyMessageDisposition,
     MessageEvent,
     MessageType,
     SessionSource,
@@ -120,7 +121,7 @@ async def test_internal_event_does_not_interrupt_busy_session() -> None:
 
     # Returns False so the base adapter silently queues the internal event
     # as a cascading next turn — it must NOT be handled-with-interrupt here.
-    assert handled is False
+    assert handled is BusyMessageDisposition.NOT_HANDLED
     # The active turn must survive.
     parent.interrupt.assert_not_called()
     # No "⚡ Interrupting current task" (or any) ack for a synthetic event.
@@ -147,5 +148,5 @@ async def test_non_internal_event_still_interrupts() -> None:
     with patch("gateway.run.merge_pending_message_event"):
         handled = await runner._handle_active_session_busy_message(event, sk)
 
-    assert handled is True
+    assert handled is BusyMessageDisposition.QUEUED
     parent.interrupt.assert_called_once_with("please stop")

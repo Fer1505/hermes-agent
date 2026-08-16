@@ -25,6 +25,7 @@ sys.modules.setdefault("telegram.constants", _tg.constants)
 sys.modules.setdefault("telegram.ext", types.ModuleType("telegram.ext"))
 
 from gateway.platforms.base import (
+    BusyMessageDisposition,
     MessageEvent,
     MessageType,
     Platform,
@@ -197,7 +198,7 @@ class TestBusySessionAck:
 
         result = await runner._handle_active_session_busy_message(event, sk)
 
-        assert result is True  # handled
+        assert result is BusyMessageDisposition.QUEUED
         # Verify ack was sent
         adapter._send_with_retry.assert_called_once()
         call_kwargs = adapter._send_with_retry.call_args
@@ -259,8 +260,8 @@ class TestBusySessionAck:
         result1 = await runner._handle_active_session_busy_message(first, sk)
         result2 = await runner._handle_active_session_busy_message(second, sk)
 
-        assert result1 is False
-        assert result2 is False
+        assert result1 is BusyMessageDisposition.NOT_HANDLED
+        assert result2 is BusyMessageDisposition.NOT_HANDLED
         assert sk not in adapter._pending_messages
         agent.interrupt.assert_not_called()
         adapter._send_with_retry.assert_not_called()
@@ -388,7 +389,7 @@ class TestBusySessionAck:
 
         result = await runner._handle_active_session_busy_message(event, sk)
 
-        assert result is True
+        assert result is BusyMessageDisposition.CONSUMED
         agent.steer.assert_called_once_with("rapid steer")
         adapter._send_with_retry.assert_not_called()
 
@@ -523,12 +524,12 @@ class TestBusySessionAck:
 
         # First message — should get ack
         result1 = await runner._handle_active_session_busy_message(event1, sk)
-        assert result1 is True
+        assert result1 is BusyMessageDisposition.QUEUED
         assert adapter._send_with_retry.call_count == 1
 
         # Second message within cooldown — should be queued but no ack
         result2 = await runner._handle_active_session_busy_message(event2, sk)
-        assert result2 is True
+        assert result2 is BusyMessageDisposition.QUEUED
         assert adapter._send_with_retry.call_count == 1  # still 1, no new ack
 
         # But interrupt should still be called for both (since we are in interrupt mode)
@@ -654,7 +655,7 @@ class TestBusySessionAck:
         runner._status_action_gerund = lambda: "restarting"
 
         result = await runner._handle_active_session_busy_message(event, sk)
-        assert result is True
+        assert result is BusyMessageDisposition.CONSUMED
 
         call_kwargs = adapter._send_with_retry.call_args
         content = call_kwargs.kwargs.get("content", "")
@@ -675,7 +676,7 @@ class TestBusySessionAck:
         runner.adapters[event.source.platform] = adapter
 
         result = await runner._handle_active_session_busy_message(event, sk)
-        assert result is True
+        assert result is BusyMessageDisposition.QUEUED
         # Should still send ack
         adapter._send_with_retry.assert_called_once()
 
@@ -691,7 +692,7 @@ class TestBusySessionAck:
         runner._running_agents[sk] = MagicMock()
 
         result = await runner._handle_active_session_busy_message(event, sk)
-        assert result is False  # not handled, let default path try
+        assert result is BusyMessageDisposition.NOT_HANDLED
 
 
 class TestBusySessionOnboardingHint:

@@ -385,6 +385,23 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     share it. Only transport-specific code lives here.
     """
 
+    DELIVERY_PROOF_KIND = "message_id"
+
+    @staticmethod
+    def _verified_bridge_result(data: Any, operation: str) -> SendResult:
+        message_id = data.get("messageId") if isinstance(data, dict) else None
+        if not message_id:
+            return SendResult(
+                success=False,
+                error=f"WhatsApp bridge accepted {operation} without a message identifier",
+                raw_response={"delivery_state": "attempted_unverified"},
+            )
+        return SendResult(
+            success=True,
+            message_id=str(message_id),
+            raw_response=data,
+        )
+
     # Default bridge location resolved via shared helper
     _DEFAULT_BRIDGE_DIR = None  # resolved in __init__
     splits_long_messages = True  # send() chunks via truncate_message()
@@ -852,6 +869,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
 
         chat_id = to_whatsapp_jid(chat_id)
+        sent_message_ids: list[str] = []
 
         try:
             import aiohttp
@@ -860,7 +878,6 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self._outgoing_chunk_limit())
 
-            sent_message_ids: list[str] = []
             last_message_id = None
             for idx, chunk in enumerate(chunks):
                 payload: Dict[str, Any] = {
@@ -879,12 +896,22 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        last_message_id = data.get("messageId")
-                        if last_message_id:
-                            sent_message_ids.append(str(last_message_id))
+                        verified = self._verified_bridge_result(data, "text")
+                        if not verified.success:
+                            return verified
+                        last_message_id = verified.message_id
+                        sent_message_ids.append(str(last_message_id))
                     else:
                         error = await resp.text()
-                        return SendResult(success=False, error=error)
+                        return SendResult(
+                            success=False,
+                            error=error,
+                            raw_response=(
+                                {"delivery_state": "attempted_unverified"}
+                                if sent_message_ids
+                                else None
+                            ),
+                        )
 
                 # Small delay between chunks to avoid rate limiting
                 if len(chunks) > 1:
@@ -897,7 +924,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 raw_response={"message_ids": sent_message_ids},
             )
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            return SendResult(
+                success=False,
+                error=str(e),
+                raw_response=(
+                    {"delivery_state": "attempted_unverified"}
+                    if sent_message_ids
+                    else None
+                ),
+            )
 
     async def edit_message(
         self,
@@ -969,11 +1004,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return SendResult(
-                        success=True,
-                        message_id=data.get("messageId"),
-                        raw_response=data,
-                    )
+                    return self._verified_bridge_result(data, "media")
                 else:
                     error = await resp.text()
                     return SendResult(success=False, error=error)
@@ -1016,11 +1047,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return SendResult(
-                        success=True,
-                        message_id=data.get("messageId"),
-                        raw_response=data,
-                    )
+                    return self._verified_bridge_result(data, "poll")
                 error = await resp.text()
                 return SendResult(success=False, error=error)
         except Exception as e:
@@ -1103,11 +1130,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return SendResult(
-                        success=True,
-                        message_id=data.get("messageId"),
-                        raw_response=data,
-                    )
+                    return self._verified_bridge_result(data, "location")
                 error = await resp.text()
                 return SendResult(success=False, error=error)
         except Exception as e:

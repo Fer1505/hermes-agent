@@ -124,7 +124,12 @@ class TestTelegramMultiImage:
         config = PlatformConfig(enabled=True, token="fake-token")
         a = TelegramAdapter(config)
         a._bot = MagicMock()
-        a._bot.send_media_group = AsyncMock(return_value=[MagicMock(message_id=1)])
+        async def _media_group(**kwargs):
+            return [
+                MagicMock(message_id=index + 1)
+                for index, _item in enumerate(kwargs["media"])
+            ]
+        a._bot.send_media_group = AsyncMock(side_effect=_media_group)
         return a
 
     def test_single_batch_under_10_calls_send_media_group_once(self, adapter):
@@ -134,12 +139,14 @@ class TestTelegramMultiImage:
         # Make InputMediaPhoto a concrete class that records its args
         telegram.InputMediaPhoto = MagicMock(side_effect=lambda media, caption=None: {"media": media, "caption": caption})
 
-        _run(adapter.send_multiple_images("12345", images))
+        outcomes = _run(adapter.send_multiple_images("12345", images))
 
         adapter._bot.send_media_group.assert_awaited_once()
         call_kwargs = adapter._bot.send_media_group.call_args.kwargs
         assert call_kwargs["chat_id"] == 12345
         assert len(call_kwargs["media"]) == 3
+        assert len(outcomes) == 3
+        assert all(outcome.success for outcome in outcomes)
 
     def test_batch_over_10_chunks(self, adapter):
         """15 photos → two send_media_group calls (10 + 5)."""
@@ -235,10 +242,30 @@ class TestDiscordMultiImage:
         adapter._is_forum_parent = MagicMock(return_value=False)
 
         images = [(f"file://{p}", "") for p in paths]
-        _run(adapter.send_multiple_images("67890", images))
+        outcomes = _run(adapter.send_multiple_images("67890", images))
 
         mock_channel.send.assert_awaited_once()
         assert len(mock_channel.send.call_args.kwargs["files"]) == 3
+        assert len(outcomes) == 3
+        assert all(outcome.success for outcome in outcomes)
+
+    def test_skipped_local_file_has_explicit_failed_outcome(self, adapter, tmp_path):
+        valid = tmp_path / "valid.png"
+        valid.write_bytes(b"\x89PNG" + b"\x00" * 20)
+        mock_channel = MagicMock()
+        mock_channel.send = AsyncMock(return_value=MagicMock(id=1))
+        adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        adapter._is_forum_parent = MagicMock(return_value=False)
+
+        outcomes = _run(
+            adapter.send_multiple_images(
+                "67890",
+                [(f"file://{valid}", ""), (f"file://{tmp_path / 'missing.png'}", "")],
+            )
+        )
+
+        assert len(outcomes) == 2
+        assert [outcome.success for outcome in outcomes] == [False, True]
 
     def test_batch_over_10_chunks_into_two_messages(self, adapter, tmp_path):
         """15 local images → two channel.send calls (10 + 5)."""
@@ -310,12 +337,14 @@ class TestSlackMultiImage:
             paths.append(p)
 
         images = [(f"file://{p}", "") for p in paths]
-        _run(adapter.send_multiple_images("C12345", images))
+        outcomes = _run(adapter.send_multiple_images("C12345", images))
 
         client = adapter._get_client("C12345")
         client.files_upload_v2.assert_awaited_once()
         kwargs = client.files_upload_v2.await_args.kwargs
         assert len(kwargs["file_uploads"]) == 3
+        assert len(outcomes) == 3
+        assert all(outcome.success for outcome in outcomes)
 
     def test_batch_over_10_chunks(self, adapter, tmp_path):
         paths = []
@@ -369,13 +398,15 @@ class TestMattermostMultiImage:
             paths.append(p)
 
         images = [(f"file://{p}", "") for p in paths]
-        _run(adapter.send_multiple_images("channel123", images))
+        outcomes = _run(adapter.send_multiple_images("channel123", images))
 
         assert adapter._upload_file.await_count == 3
         adapter._api_post.assert_awaited_once()
         payload = adapter._api_post.await_args.args[1]
         assert payload["channel_id"] == "channel123"
         assert len(payload["file_ids"]) == 3
+        assert len(outcomes) == 3
+        assert all(outcome.success for outcome in outcomes)
 
     def test_batch_over_5_chunks(self, adapter, tmp_path):
         """7 images → 2 posts (5 + 2)."""
@@ -429,13 +460,15 @@ class TestEmailMultiImage:
         with patch.object(
             adapter, "_send_email_with_attachments", MagicMock(return_value="<msgid@x>")
         ) as mock_send:
-            _run(adapter.send_multiple_images("user@example.com", images))
+            outcomes = _run(adapter.send_multiple_images("user@example.com", images))
 
         mock_send.assert_called_once()
         to_addr, body, file_paths = mock_send.call_args.args
         assert to_addr == "user@example.com"
         assert len(file_paths) == 3
         assert "alt 0" in body
+        assert len(outcomes) == 3
+        assert all(outcome.success for outcome in outcomes)
 
     def test_remote_urls_linked_in_body(self, adapter, tmp_path):
         """Remote URL images get their URL appended to the body, no attachment."""

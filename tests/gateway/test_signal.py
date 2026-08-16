@@ -707,6 +707,7 @@ class TestSignalSendVoice:
         result = await adapter.send_voice(chat_id="+155****4567", audio_path=str(audio_path))
 
         assert result.success is True
+        assert result.raw_response == {"timestamp": 1234567890}
         assert captured[0]["method"] == "send"
         assert captured[0]["params"]["attachments"] == [str(audio_path)]
         assert captured[0]["params"]["message"] == ""  # caption=None → ""
@@ -796,6 +797,7 @@ class TestSignalSendVideo:
         result = await adapter.send_video(chat_id="+155****4567", video_path=str(vid_path))
 
         assert result.success is True
+        assert result.raw_response == {"timestamp": 1234567890}
         assert captured[0]["method"] == "send"
         assert captured[0]["params"]["attachments"] == [str(vid_path)]
         assert captured[0]["params"]["message"] == ""  # caption=None → ""

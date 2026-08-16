@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import asyncio
 import json
 import os
 from pathlib import Path
 import stat
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -70,6 +71,29 @@ def test_duplicate_provider_retry_is_idempotent_and_payload_change_fails(tmp_pat
             _update(10, "forged replacement"),
             transport="polling_tls",
             authenticated=True,
+        )
+
+
+def test_duplicate_replay_batch_is_capacity_neutral(tmp_path, monkeypatch):
+    monkeypatch.setattr(_INBOX_MODULE, "MAX_ACTIVE_OR_QUARANTINED_ROWS", 2)
+    inbox = _store(tmp_path)
+    assert inbox.persist_updates(
+        [_update(10), _update(11)],
+        transport="polling_tls",
+        authenticated=True,
+    ) == 2
+    for update_id in (10, 11):
+        claim = inbox.claim(update_id, lease_owner=f"worker-{update_id}")
+        assert claim and inbox.complete(claim)
+
+    assert inbox.persist_updates(
+        [_update(10), _update(11)],
+        transport="polling_tls",
+        authenticated=True,
+    ) == 0
+    with pytest.raises(RuntimeError, match="capacity reached"):
+        inbox.persist_update(
+            _update(12), transport="polling_tls", authenticated=True
         )
 
 
@@ -170,7 +194,7 @@ def test_symlinked_inbox_file_is_rejected_without_touching_target(tmp_path):
 def test_schema_attests_inbox_checkpoint_archive_dead_letter_and_effects(tmp_path):
     inbox = _store(tmp_path)
     with inbox._connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
         tables = {
             row[0]
             for row in conn.execute(
@@ -183,6 +207,8 @@ def test_schema_attests_inbox_checkpoint_archive_dead_letter_and_effects(tmp_pat
             "telegram_archive",
             "telegram_dead_letters",
             "telegram_effects",
+            "telegram_epoch_history",
+            "telegram_inbox_operator_audit",
         } <= tables
         columns = {
             row[1] for row in conn.execute("PRAGMA table_info(telegram_inbox)")
@@ -199,7 +225,7 @@ def test_schema_attests_inbox_checkpoint_archive_dead_letter_and_effects(tmp_pat
         } <= columns
 
 
-def test_crash_after_persist_recovers_and_completed_effect_survives_pruning(tmp_path):
+def test_crash_after_persist_recovers_and_effect_prunes_only_after_reset_window(tmp_path):
     now = [100.0]
     inbox = _store(tmp_path, clock=lambda: now[0])
     inbox.persist_update(
@@ -211,10 +237,9 @@ def test_crash_after_persist_recovers_and_completed_effect_survives_pruning(tmp_
     assert claim is not None
     assert inbox.complete(claim)
     now[0] = 1000.0
-    assert inbox.prune_archive(retention_seconds=1) == 1
+    assert inbox.prune_archive(retention_seconds=1) == 0
 
-    # Provider retry after archive retention is still suppressed by the
-    # permanent committed-effect tombstone.
+    # Provider retries inside the seven-day ambiguity window are suppressed.
     assert not inbox.persist_update(
         _update(20), transport="polling_tls", authenticated=True
     )
@@ -243,7 +268,9 @@ def test_expired_claim_retries_then_dead_letters(tmp_path):
     assert inbox.fail(third, RuntimeError("permanent"), max_attempts=3) == "dead_letter"
     assert inbox.counts()["dead_letter"] == 1
     assert inbox.counts()["inbox"] == 0
-    assert inbox.replay_dead_letter(30)
+    assert inbox.replay_dead_letter(
+        30, reason="reviewed transient failure", confirmation="REPLAY:30"
+    )
     assert inbox.counts()["dead_letter"] == 0
     assert inbox.recoverable() == [_update(30)]
 
@@ -312,7 +339,11 @@ def test_operator_replay_explicitly_clears_ambiguous_effect_fence(tmp_path):
     assert inbox.begin_effects([claim])
     assert inbox.fail(claim, "ambiguous") == "dead_letter"
 
-    assert inbox.replay_dead_letter(34)
+    with pytest.raises(PermissionError):
+        inbox.replay_dead_letter(34, reason="reviewed", confirmation="yes")
+    assert inbox.replay_dead_letter(
+        34, reason="owner accepted duplicate risk", confirmation="REPLAY:34"
+    )
     replay = inbox.claim(34, lease_owner="operator-replay")
     assert replay is not None
     assert inbox.begin_effects([replay])
@@ -358,8 +389,7 @@ def test_polling_db_failure_prevents_progress_and_escapes_to_ptb_retry():
     adapter._record_polling_progress.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_authenticated_queue_persists_before_handler_visibility():
+def test_authenticated_queue_persists_before_handler_visibility():
     PlatformConfig, TelegramAdapter, _DurableTelegramUpdateQueue = _adapter_types()
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
     adapter._inbound_transport = "webhook_secret"
@@ -391,8 +421,7 @@ def test_webhook_db_failure_keeps_update_out_of_handler_queue():
     assert queue.empty()
 
 
-@pytest.mark.asyncio
-async def test_durable_handler_claims_once_across_provider_retry(tmp_path):
+def test_durable_handler_claims_once_across_provider_retry(tmp_path):
     PlatformConfig, TelegramAdapter, _ = _adapter_types()
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
     adapter._telegram_inbox = _store(tmp_path)
@@ -407,15 +436,14 @@ async def test_durable_handler_claims_once_across_provider_retry(tmp_path):
 
     wrapped = adapter._durable_handler(effect)
     update = SimpleNamespace(to_dict=lambda: _update(60))
-    await wrapped(update, None)
-    await wrapped(update, None)
+    asyncio.run(wrapped(update, None))
+    asyncio.run(wrapped(update, None))
 
     assert effects == [60]
     assert adapter._telegram_inbox.counts()["archive"] == 1
 
 
-@pytest.mark.asyncio
-async def test_batched_effect_is_not_archived_before_delayed_dispatch(tmp_path):
+def test_batched_effect_is_not_archived_before_delayed_dispatch(tmp_path):
     PlatformConfig, TelegramAdapter, _ = _adapter_types()
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
     adapter._telegram_inbox = _store(tmp_path)
@@ -429,11 +457,441 @@ async def test_batched_effect_is_not_archived_before_delayed_dispatch(tmp_path):
 
     wrapped = adapter._durable_handler(enqueue)
     update = SimpleNamespace(update_id=61, to_dict=lambda: _update(61))
-    await wrapped(update, None)
+    asyncio.run(wrapped(update, None))
     assert adapter._telegram_inbox.counts()["inbox"] == 1
     assert adapter._telegram_inbox.counts()["archive"] == 0
 
-    assert await adapter._begin_inbound_effect(event)
-    await adapter._finish_inbound_effect(event, success=True)
+    assert asyncio.run(adapter._begin_inbound_effect(event))
+    asyncio.run(adapter._finish_inbound_effect(event, success=True))
     assert adapter._telegram_inbox.counts()["inbox"] == 0
     assert adapter._telegram_inbox.counts()["archive"] == 1
+
+
+def _durable_busy_fixture(tmp_path, update_id: int, *, text: str = "follow up"):
+    from gateway.platforms.base import (
+        MessageEvent,
+        MessageType,
+        Platform,
+        SendResult,
+        SessionSource,
+        build_session_key,
+    )
+    from gateway.run import GatewayRunner
+
+    PlatformConfig, TelegramAdapter, _ = _adapter_types()
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    adapter._telegram_inbox = _store(tmp_path)
+    adapter._telegram_inbox.persist_update(
+        _update(update_id, text), transport="polling_tls", authenticated=True
+    )
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(success=True, message_id="provider-message-1")
+    )
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="7",
+        chat_type="dm",
+        user_id="9",
+    )
+    event = MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id=str(update_id),
+        platform_update_id=update_id,
+    )
+    session_key = build_session_key(source)
+
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._running_agents = {session_key: MagicMock()}
+    runner._running_agents_ts = {}
+    runner._pending_messages = {}
+    runner._queued_events = {}
+    runner._busy_ack_ts = {}
+    runner._draining = False
+    runner._restart_requested = False
+    runner._busy_input_mode = "queue"
+    runner._busy_text_mode = "interrupt"
+    runner.session_store = None
+    runner.config = MagicMock()
+    runner._is_user_authorized = lambda _source: True
+    return runner, adapter, event, session_key
+
+
+async def _dispatch_durable_busy(adapter, runner, event, session_key):
+    async def route(_update_obj, _context):
+        adapter._mark_event_inbox_deferred(event)
+        return await runner._handle_active_session_busy_message(event, session_key)
+
+    wrapped = adapter._durable_handler(route)
+    update_obj = SimpleNamespace(
+        update_id=event.platform_update_id,
+        to_dict=lambda: _update(event.platform_update_id, event.text),
+    )
+    return await wrapped(update_obj, None)
+
+
+def _effect_state(adapter, update_id: int) -> str | None:
+    with adapter._telegram_inbox._connect() as conn:
+        row = conn.execute(
+            """SELECT state FROM telegram_effects
+               WHERE profile_id=? AND bot_id=? AND update_id=?""",
+            (
+                adapter._telegram_inbox.profile_id,
+                adapter._telegram_inbox.bot_id,
+                update_id,
+            ),
+        ).fetchone()
+    return str(row[0]) if row is not None else None
+
+
+@pytest.mark.asyncio
+async def test_durable_busy_unauthorized_is_archived_and_cannot_replay(tmp_path):
+    from gateway.platforms.base import BusyMessageDisposition
+
+    runner, adapter, event, session_key = _durable_busy_fixture(tmp_path, 62)
+    runner._is_user_authorized = lambda _source: False
+
+    disposition = await _dispatch_durable_busy(
+        adapter, runner, event, session_key
+    )
+
+    assert disposition is BusyMessageDisposition.CONSUMED
+    assert adapter._telegram_inbox.counts()["archive"] == 1
+    assert adapter._telegram_inbox.recoverable() == []
+    adapter._send_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_durable_busy_plain_approval_commits_only_after_receipt(tmp_path):
+    from gateway.platforms.base import BusyMessageDisposition
+
+    runner, adapter, event, session_key = _durable_busy_fixture(
+        tmp_path, 63, text="yes"
+    )
+    runner._handle_approve_command = AsyncMock(return_value="Approved")
+
+    with patch("tools.approval.has_blocking_approval", return_value=True):
+        disposition = await _dispatch_durable_busy(
+            adapter, runner, event, session_key
+        )
+
+    assert disposition is BusyMessageDisposition.CONSUMED
+    runner._handle_approve_command.assert_awaited_once()
+    adapter._send_with_retry.assert_awaited_once()
+    assert adapter._telegram_inbox.counts()["archive"] == 1
+    assert _effect_state(adapter, 63) == "committed"
+
+
+@pytest.mark.asyncio
+async def test_durable_busy_draining_rejection_is_fenced_and_archived(tmp_path):
+    from gateway.platforms.base import BusyMessageDisposition
+
+    runner, adapter, event, session_key = _durable_busy_fixture(tmp_path, 64)
+    runner._draining = True
+    runner._queue_during_drain_enabled = lambda: False
+
+    disposition = await _dispatch_durable_busy(
+        adapter, runner, event, session_key
+    )
+
+    assert disposition is BusyMessageDisposition.CONSUMED
+    assert "not accepting" in adapter._send_with_retry.await_args.kwargs["content"]
+    assert adapter._telegram_inbox.counts()["archive"] == 1
+    assert _effect_state(adapter, 64) == "committed"
+
+
+@pytest.mark.asyncio
+async def test_durable_busy_steer_is_queued_until_terminal_next_turn(tmp_path):
+    from gateway.platforms.base import BusyMessageDisposition
+
+    runner, adapter, event, session_key = _durable_busy_fixture(tmp_path, 65)
+    runner._busy_input_mode = "steer"
+    running_agent = runner._running_agents[session_key]
+    running_agent.steer = MagicMock(return_value=True)
+
+    disposition = await _dispatch_durable_busy(
+        adapter, runner, event, session_key
+    )
+
+    assert disposition is BusyMessageDisposition.QUEUED
+    running_agent.steer.assert_not_called()
+    adapter._send_with_retry.assert_not_awaited()
+    assert adapter._pending_messages[session_key] is event
+    assert adapter._telegram_inbox.counts()["inbox"] == 1
+    assert adapter._telegram_inbox.counts()["archive"] == 0
+
+    # A process crash before the queued turn starts reclaims the persisted
+    # update; no premature archive can lose the accepted steer text.
+    adapter._telegram_inbox.requeue_inflight()
+    assert [item["update_id"] for item in adapter._telegram_inbox.recoverable()] == [65]
+
+
+@pytest.mark.asyncio
+async def test_durable_busy_queue_suppresses_ack_and_retains_claim(tmp_path, monkeypatch):
+    from gateway.platforms.base import BusyMessageDisposition
+
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+    runner, adapter, event, session_key = _durable_busy_fixture(tmp_path, 66)
+    runner._busy_input_mode = "interrupt"
+    running_agent = runner._running_agents[session_key]
+
+    disposition = await _dispatch_durable_busy(
+        adapter, runner, event, session_key
+    )
+
+    assert disposition is BusyMessageDisposition.QUEUED
+    running_agent.interrupt.assert_not_called()
+    adapter._send_with_retry.assert_not_awaited()
+    assert adapter._telegram_inbox.counts()["inbox"] == 1
+    assert adapter._telegram_inbox.counts()["archive"] == 0
+
+
+@pytest.mark.asyncio
+async def test_durable_busy_full_queue_emits_fenced_rejection(tmp_path, monkeypatch):
+    from gateway.platforms.base import BusyMessageDisposition
+
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+    runner, adapter, event, session_key = _durable_busy_fixture(tmp_path, 67)
+    adapter._pending_messages[session_key] = SimpleNamespace(
+        message_type=event.message_type,
+        media_urls=[],
+    )
+    runner._queued_events[session_key] = [
+        MagicMock() for _ in range(runner._BUSY_QUEUE_MAX_PENDING - 1)
+    ]
+
+    disposition = await _dispatch_durable_busy(
+        adapter, runner, event, session_key
+    )
+
+    assert disposition is BusyMessageDisposition.CONSUMED
+    assert "queue is full" in adapter._send_with_retry.await_args.kwargs["content"]
+    assert adapter._telegram_inbox.counts()["archive"] == 1
+    assert _effect_state(adapter, 67) == "committed"
+
+
+def _callback_payload(update_id: int) -> dict:
+    return {
+        "update_id": update_id,
+        "callback_query": {
+            "id": f"callback-{update_id}",
+            "from": {"id": 9, "is_bot": False, "first_name": "Owner"},
+            "message": {
+                "message_id": update_id,
+                "date": 1,
+                "chat": {"id": 7, "type": "private"},
+                "text": "Approve?",
+            },
+            "data": "ea:once:1",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_callback_crash_after_answer_is_quarantined_not_replayed(
+    tmp_path, monkeypatch
+):
+    PlatformConfig, TelegramAdapter, _ = _adapter_types()
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    adapter._telegram_inbox = _store(tmp_path)
+    payload = _callback_payload(68)
+    adapter._telegram_inbox.persist_update(
+        payload, transport="polling_tls", authenticated=True
+    )
+    adapter._approval_state[1] = "session-key"
+    adapter._is_callback_user_authorized = lambda *_args, **_kwargs: True
+    adapter.resume_typing_for_chat = MagicMock(
+        side_effect=RuntimeError("crash after callback effect")
+    )
+    query = SimpleNamespace(
+        data="ea:once:1",
+        message=SimpleNamespace(
+            chat_id=7,
+            chat=SimpleNamespace(type="private"),
+            message_thread_id=None,
+        ),
+        from_user=SimpleNamespace(id=9, first_name="Owner"),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    update_obj = SimpleNamespace(
+        update_id=68,
+        callback_query=query,
+        to_dict=lambda: payload,
+    )
+    monkeypatch.setattr(
+        "tools.approval.resolve_gateway_approval", lambda *_args: 1
+    )
+    wrapped = adapter._durable_handler(adapter._handle_callback_query)
+
+    with pytest.raises(RuntimeError, match="crash after callback effect"):
+        await wrapped(update_obj, None)
+
+    assert query.answer.await_count == 1
+    assert adapter._telegram_inbox.counts()["dead_letter"] == 1
+    assert adapter._telegram_inbox.counts()["archive"] == 0
+    assert _effect_state(adapter, 68) == "claimed"
+
+    # A provider retry cannot claim or repeat an ambiguous callback effect.
+    assert await wrapped(update_obj, None) is None
+    assert query.answer.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_callback_fence_storage_failure_retries_before_any_effect(tmp_path):
+    PlatformConfig, TelegramAdapter, _ = _adapter_types()
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+    adapter._telegram_inbox = _store(tmp_path)
+    payload = _callback_payload(69)
+    adapter._telegram_inbox.persist_update(
+        payload, transport="polling_tls", authenticated=True
+    )
+    query = SimpleNamespace(
+        data="ea:once:1",
+        message=SimpleNamespace(chat_id=7, chat=SimpleNamespace(type="private")),
+        from_user=SimpleNamespace(id=9, first_name="Owner"),
+        answer=AsyncMock(),
+    )
+    update_obj = SimpleNamespace(
+        update_id=69,
+        callback_query=query,
+        to_dict=lambda: payload,
+    )
+    adapter._telegram_inbox.begin_effects = MagicMock(
+        side_effect=OSError("effect database unavailable")
+    )
+    adapter._schedule_inbox_retry = MagicMock()
+    wrapped = adapter._durable_handler(adapter._handle_callback_query)
+
+    with pytest.raises(OSError, match="effect database unavailable"):
+        await wrapped(update_obj, None)
+
+    assert query.answer.await_count == 0
+    assert adapter._telegram_inbox.counts()["dead_letter"] == 0
+    with adapter._telegram_inbox._connect() as conn:
+        retry_state = conn.execute(
+            """SELECT state FROM telegram_inbox
+               WHERE profile_id=? AND bot_id=? AND update_id=69""",
+            (adapter._telegram_inbox.profile_id, adapter._telegram_inbox.bot_id),
+        ).fetchone()[0]
+    assert retry_state == "retry"
+    adapter._schedule_inbox_retry.assert_called_once_with(1.0)
+
+
+def test_sequence_epoch_resets_only_after_seven_days_idle(tmp_path):
+    now = [10.0]
+    inbox = _store(tmp_path, clock=lambda: now[0])
+    assert inbox.persist_update(_update(900), transport="polling_tls", authenticated=True)
+    claim = inbox.claim(900, lease_owner="worker")
+    assert claim and inbox.complete(claim)
+
+    now[0] += 1
+    assert not inbox.persist_update(_update(900), transport="polling_tls", authenticated=True)
+    assert inbox.checkpoint()["sequence_epoch"] == 0
+
+    now[0] += _INBOX_MODULE.UPDATE_ID_RESET_IDLE_SECONDS + 1
+    assert inbox.persist_update(_update(3), transport="polling_tls", authenticated=True)
+    assert inbox.checkpoint()["sequence_epoch"] == 1
+    assert inbox.record(3)["effect_key"].endswith(":1:3")
+    assert inbox.counts()["epoch_history"] == 1
+    with inbox._connect() as conn:
+        historical = conn.execute(
+            """SELECT sequence_epoch,update_id,payload_json,effect_state
+               FROM telegram_epoch_history
+               WHERE profile_id=? AND bot_id=?""",
+            (inbox.profile_id, inbox.bot_id),
+        ).fetchone()
+    assert tuple(historical) == (
+        0,
+        900,
+        json.dumps(_update(900), sort_keys=True, separators=(",", ":")),
+        "committed",
+    )
+
+
+def test_exact_duplicate_after_idle_never_rotates_or_refreshes_epoch_clock(tmp_path):
+    now = [10.0]
+    inbox = _store(tmp_path, clock=lambda: now[0])
+    assert inbox.persist_update(_update(900), transport="polling_tls", authenticated=True)
+    claim = inbox.claim(900, lease_owner="worker")
+    assert claim and inbox.complete(claim)
+    checkpoint_updated_at = inbox.checkpoint()["updated_at"]
+
+    now[0] += _INBOX_MODULE.UPDATE_ID_RESET_IDLE_SECONDS + 1
+    assert not inbox.persist_update(
+        _update(900), transport="polling_tls", authenticated=True
+    )
+    checkpoint = inbox.checkpoint()
+    assert checkpoint["sequence_epoch"] == 0
+    assert checkpoint["updated_at"] == checkpoint_updated_at
+    assert inbox.counts()["archive"] == 1
+
+    assert inbox.persist_update(_update(3), transport="polling_tls", authenticated=True)
+    assert inbox.checkpoint()["sequence_epoch"] == 1
+
+
+def test_sequence_epoch_reset_never_discards_unresolved_or_quarantined_work(tmp_path):
+    now = [10.0]
+    inbox = _store(tmp_path, clock=lambda: now[0])
+    assert inbox.persist_update(_update(900), transport="polling_tls", authenticated=True)
+
+    now[0] += _INBOX_MODULE.UPDATE_ID_RESET_IDLE_SECONDS + 1
+    with pytest.raises(RuntimeError, match="owner review required"):
+        inbox.persist_update(_update(3), transport="polling_tls", authenticated=True)
+
+    assert inbox.record(900)["state"] == "inbox"
+    assert inbox.record(3) is None
+    assert inbox.checkpoint()["sequence_epoch"] == 0
+
+
+def test_operator_audit_is_bounded_by_retention_and_row_cap(tmp_path, monkeypatch):
+    now = [100.0]
+    inbox = _store(tmp_path, clock=lambda: now[0])
+    monkeypatch.setattr(_INBOX_MODULE, "DEFAULT_MAX_HISTORY_ROWS", 2)
+    for index in range(3):
+        inbox.audit_operator_action(f"inspect-{index}", reason="review")
+
+    inbox.prune_archive(retention_seconds=30 * 24 * 60 * 60)
+
+    assert inbox.counts()["operator_audit"] == 2
+
+
+def test_pre_effect_failures_use_bounded_backoff_before_quarantine(tmp_path):
+    now = [0.0]
+    inbox = _store(tmp_path, clock=lambda: now[0])
+    inbox.persist_update(_update(77), transport="polling_tls", authenticated=True)
+    for attempt in range(1, 4):
+        claim = inbox.claim(77, lease_owner=f"worker-{attempt}")
+        assert claim and claim.attempt == attempt
+        assert inbox.fail(
+            claim,
+            "transient before fence",
+            max_attempts=4,
+            retry_delay=2 ** (attempt - 1),
+        ) == "retry"
+        now[0] += 2 ** (attempt - 1)
+    final = inbox.claim(77, lease_owner="worker-4")
+    assert final and inbox.fail(final, "exhausted", max_attempts=4) == "dead_letter"
+
+
+def test_adapter_retry_timer_honors_persisted_backoff_delay():
+    PlatformConfig, TelegramAdapter, _ = _adapter_types()
+
+    async def scenario():
+        adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+        adapter._app = SimpleNamespace(bot=object())
+        adapter._durable_update_queue = MagicMock()
+        adapter._telegram_inbox = MagicMock()
+        adapter._telegram_inbox.recoverable.return_value = []
+        with patch(
+            "plugins.platforms.telegram.adapter.asyncio.sleep",
+            new=AsyncMock(),
+        ) as sleep:
+            adapter._schedule_inbox_retry(8.0)
+            await asyncio.gather(*list(adapter._background_tasks))
+        sleep.assert_awaited_once_with(8.0)
+
+    asyncio.run(scenario())

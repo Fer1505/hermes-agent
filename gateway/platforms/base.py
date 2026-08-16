@@ -1766,6 +1766,14 @@ class ProcessingOutcome(Enum):
     CANCELLED = "cancelled"
 
 
+class BusyMessageDisposition(Enum):
+    """Whether an active-session input was queued or consumed immediately."""
+
+    NOT_HANDLED = "not_handled"
+    QUEUED = "queued"
+    CONSUMED = "consumed"
+
+
 @dataclass
 class MessageEvent:
     """
@@ -1939,24 +1947,40 @@ class SendResult:
     error_kind: Optional[str] = None
 
 
-_PROVIDER_PROOF_REQUIRED_PLATFORMS = frozenset({
-    "bluebubbles",
-    "photon",
-    "signal",
-    "sms",
-    "telegram",
-    "whatsapp",
-})
+_STANDALONE_DELIVERY_PROOF_CAPABILITIES = {
+    "bluebubbles": "message_id",
+    "photon": "message_id",
+    "signal": "provider_timestamp",
+    "sms": "message_id",
+    "telegram": "message_id",
+    "whatsapp": "message_id",
+    "whatsapp_cloud": "wamid",
+}
 
 
-def provider_delivery_proof_required(platform: Any) -> bool:
+def _delivery_proof_kind(adapter_or_platform: Any) -> str:
+    """Resolve the producer-declared proof capability.
+
+    Live sends pass the adapter, whose class owns this contract. Standalone
+    senders have no adapter instance and use the matching registered transport
+    capability by name.
+    """
+    declared = getattr(adapter_or_platform, "DELIVERY_PROOF_KIND", None)
+    if isinstance(declared, str) and declared:
+        return declared
+    return _STANDALONE_DELIVERY_PROOF_CAPABILITIES.get(
+        _platform_name(adapter_or_platform), "adapter_ack"
+    )
+
+
+def provider_delivery_proof_required(adapter_or_platform: Any) -> bool:
     """Whether an adapter success boolean is insufficient delivery proof."""
-    return _platform_name(platform) in _PROVIDER_PROOF_REQUIRED_PLATFORMS
+    return _delivery_proof_kind(adapter_or_platform) != "adapter_ack"
 
 
-def extract_provider_delivery_proof(result: Any, platform: Any) -> Optional[dict]:
+def extract_provider_delivery_proof(result: Any, adapter_or_platform: Any) -> Optional[dict]:
     """Return a small provider-specific delivery proof, never a raw response."""
-    platform_name = _platform_name(platform)
+    proof_kind = _delivery_proof_kind(adapter_or_platform)
 
     def _value(name: str):
         if isinstance(result, dict):
@@ -1967,15 +1991,11 @@ def extract_provider_delivery_proof(result: Any, platform: Any) -> Optional[dict
         return None
 
     message_id = _value("message_id") or _value("provider_message_id")
-    if message_id:
-        return {"kind": "message_id", "value": str(message_id)}
-    message_ids = _value("message_ids") or _value("continuation_message_ids")
-    if message_ids:
-        values = [str(value) for value in message_ids if value]
-        if values:
-            return {"kind": "message_ids", "values": values}
-
-    if platform_name == "signal":
+    if proof_kind == "wamid":
+        if isinstance(message_id, str) and message_id.startswith("wamid."):
+            return {"kind": "wamid", "value": message_id}
+        return None
+    if proof_kind == "provider_timestamp":
         timestamps = _value("provider_timestamps") or []
         raw = _value("raw_response")
         if isinstance(raw, dict):
@@ -1988,6 +2008,15 @@ def extract_provider_delivery_proof(result: Any, platform: Any) -> Optional[dict
         values = [str(value) for value in timestamps if value]
         if values:
             return {"kind": "provider_timestamp", "values": values}
+        return None
+    if message_id:
+        return {"kind": "message_id", "value": str(message_id)}
+    message_ids = _value("message_ids") or _value("continuation_message_ids")
+    if message_ids:
+        values = [str(value) for value in message_ids if value]
+        if values:
+            return {"kind": "message_ids", "values": values}
+
     return None
 
 
@@ -2388,6 +2417,10 @@ class BasePlatformAdapter(ABC):
     - Handling media
     """
 
+    # Provider acceptance evidence contract. Adapters whose transport can
+    # return an HTTP/RPC success without a provider identifier must override.
+    DELIVERY_PROOF_KIND = "adapter_ack"
+
     # Whether this platform renders triple-backtick fenced code blocks (i.e.
     # ``format_message`` translates/preserves markdown fences into a real code
     # block).  Capability flag for markdown-aware presentation choices.
@@ -2549,7 +2582,9 @@ class BasePlatformAdapter(ABC):
         # registered by a fresher run for the same session.
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
-        self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
+        self._busy_session_handler: Optional[
+            Callable[[MessageEvent, str], Awaitable[BusyMessageDisposition | bool]]
+        ] = None
         # Optional authorization check, registered by GatewayRunner. Used by
         # adapters that fetch external context (e.g. Slack thread history) to
         # mark senders not on the allowlist as unverified in LLM context,
@@ -2991,7 +3026,12 @@ class BasePlatformAdapter(ABC):
         except Exception:
             logger.debug("topic recovery rewrite failed", exc_info=True)
 
-    def set_busy_session_handler(self, handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]]) -> None:
+    def set_busy_session_handler(
+        self,
+        handler: Optional[
+            Callable[[MessageEvent, str], Awaitable[BusyMessageDisposition | bool]]
+        ],
+    ) -> None:
         """Set an optional handler for messages arriving during active sessions."""
         self._busy_session_handler = handler
 
@@ -3400,7 +3440,7 @@ class BasePlatformAdapter(ABC):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> List[SendResult]:
         """Send a batch of images.
 
         Accepts ``http(s)://``, ``file://`` URIs in the first tuple
@@ -3415,6 +3455,7 @@ class BasePlatformAdapter(ABC):
         """
         from urllib.parse import unquote as _unquote
 
+        outcomes: List[SendResult] = []
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
@@ -3448,8 +3489,11 @@ class BasePlatformAdapter(ABC):
                     )
                 if not img_result.success:
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
+                outcomes.append(img_result)
             except Exception as img_err:
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
+                outcomes.append(SendResult(success=False, error=str(img_err)))
+        return outcomes
 
     async def send_image(
         self,
@@ -4349,6 +4393,16 @@ class BasePlatformAdapter(ABC):
             return result
 
         error_str = result.error or ""
+        raw_response = getattr(result, "raw_response", None)
+        if (
+            isinstance(raw_response, dict)
+            and raw_response.get("delivery_state") == "attempted_unverified"
+        ):
+            # Some provider request (or an earlier chunk) may already have
+            # been accepted. Retrying or sending the plain-text fallback here
+            # could duplicate it; the delivery ledger/operator path owns this
+            # explicitly ambiguous outcome.
+            return result
         is_network = result.retryable or self._is_retryable_error(error_str)
 
         # Timeout errors are not safe to retry (message may have been
@@ -5038,7 +5092,11 @@ class BasePlatformAdapter(ABC):
 
             if self._busy_session_handler is not None:
                 try:
-                    if await self._busy_session_handler(event, session_key):
+                    busy_disposition = await self._busy_session_handler(event, session_key)
+                    if busy_disposition in {
+                        BusyMessageDisposition.QUEUED,
+                        BusyMessageDisposition.CONSUMED,
+                    } or busy_disposition is True:
                         return
                 except Exception as e:
                     logger.error("[%s] Busy-session handler failed: %s", self.name, e, exc_info=True)
@@ -5114,18 +5172,36 @@ class BasePlatformAdapter(ABC):
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         # Track delivery outcomes for the processing-complete hook
-        delivery_attempted = False
-        delivery_succeeded = False
+        delivery_outcomes: list[tuple[str, bool]] = []
         effect_started = False
         effect_finished = False
 
-        def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
-            if result is None:
-                return
-            delivery_attempted = True
-            if getattr(result, "success", False):
-                delivery_succeeded = True
+        def _record_delivery(
+            label: str,
+            result,
+            *,
+            expected_count: Optional[int] = None,
+            proof_adapter=None,
+        ) -> bool:
+            """Record every planned artifact; missing outcomes are failures."""
+            proof_source = proof_adapter or self
+            def _confirmed(item) -> bool:
+                if not bool(getattr(item, "success", False)):
+                    return False
+                return bool(
+                    not provider_delivery_proof_required(proof_source)
+                    or extract_provider_delivery_proof(item, proof_source) is not None
+                )
+            if isinstance(result, (list, tuple)):
+                ok = (
+                    bool(result)
+                    and (expected_count is None or len(result) == expected_count)
+                    and all(_confirmed(item) for item in result)
+                )
+            else:
+                ok = (expected_count in (None, 1)) and _confirmed(result)
+            delivery_outcomes.append((label, ok))
+            return ok
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -5314,9 +5390,11 @@ class BasePlatformAdapter(ABC):
                             caption=telegram_tts_caption,
                             metadata=_final_thread_metadata,
                         )
-                        _tts_caption_delivered = bool(
-                            telegram_tts_caption and getattr(tts_result, "success", False)
-                        )
+                        _tts_ok = _record_delivery("tts", tts_result)
+                        _tts_caption_delivered = bool(telegram_tts_caption and _tts_ok)
+                    except Exception as tts_send_err:
+                        _record_delivery("tts", None)
+                        logger.warning("[%s] TTS delivery failed: %s", self.name, tts_send_err)
                     finally:
                         try:
                             os.remove(_tts_path)
@@ -5345,6 +5423,8 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
+                    _obligation_token = None
+                    _delivery_claimed = True
                     if not is_ephemeral_response and not str(
                         event.text or ""
                     ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
@@ -5362,7 +5442,7 @@ class BasePlatformAdapter(ABC):
                                     str(getattr(event, "message_id", "") or ""),
                                     text_content,
                                 )
-                                record_obligation(
+                                _obligation_token = record_obligation(
                                     obligation_id=_obligation_id,
                                     session_key=session_key,
                                     platform=str(
@@ -5373,42 +5453,90 @@ class BasePlatformAdapter(ABC):
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
                                 )
-                                mark_attempting(_obligation_id)
+                                if _obligation_token is not None:
+                                    _delivery_claimed = mark_attempting(
+                                        _obligation_id, _obligation_token
+                                    )
+                                else:
+                                    _obligation_id = None
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
-                    )
-                    _record_delivery(result)
-                    if _obligation_id is not None:
+                    _ledger_heartbeat = None
+                    if (
+                        _delivery_claimed
+                        and _obligation_id is not None
+                        and _obligation_token is not None
+                    ):
+                        async def _renew_obligation() -> None:
+                            from gateway.delivery_ledger import renew_claim
+                            while True:
+                                await asyncio.sleep(30)
+                                renewed = await asyncio.to_thread(
+                                    renew_claim, _obligation_id, _obligation_token
+                                )
+                                if not renewed:
+                                    return
+                        _ledger_heartbeat = asyncio.create_task(_renew_obligation())
+                    try:
+                        if _delivery_claimed:
+                            result = await delivery_adapter._send_with_retry(
+                                chat_id=event.source.chat_id,
+                                content=text_content,
+                                reply_to=_reply_anchor,
+                                metadata=_final_thread_metadata,
+                            )
+                        else:
+                            result = SendResult(
+                                success=True,
+                                raw_response={"delivery_state": "duplicate_suppressed"},
+                            )
+                    finally:
+                        if _ledger_heartbeat is not None:
+                            _ledger_heartbeat.cancel()
+                            try:
+                                await _ledger_heartbeat
+                            except asyncio.CancelledError:
+                                pass
+                    _record_delivery("text", result, proof_adapter=delivery_adapter)
+                    if (
+                        _delivery_claimed
+                        and _obligation_id is not None
+                        and _obligation_token is not None
+                    ):
                         try:
                             from gateway.delivery_ledger import (
                                 mark_delivered,
                                 mark_failed,
                             )
 
-                            _platform = getattr(
-                                event.source.platform, "value", event.source.platform
-                            )
-                            _proof = extract_provider_delivery_proof(result, _platform)
+                            _proof = extract_provider_delivery_proof(result, delivery_adapter)
                             if (
                                 getattr(result, "success", False)
                                 and (
-                                    not provider_delivery_proof_required(_platform)
+                                    not provider_delivery_proof_required(delivery_adapter)
                                     or _proof is not None
                                 )
                             ):
-                                mark_delivered(_obligation_id)
+                                mark_delivered(_obligation_id, _obligation_token)
                             else:
+                                _raw = getattr(result, "raw_response", None)
+                                _delivery_state = (
+                                    _raw.get("delivery_state")
+                                    if isinstance(_raw, dict)
+                                    else None
+                                )
                                 mark_failed(
                                     _obligation_id,
+                                    _obligation_token,
                                     str(
                                         getattr(result, "error", "")
                                         or "provider delivery proof missing"
+                                    ),
+                                    retry_after=getattr(result, "retry_after", None),
+                                    ambiguous=bool(
+                                        getattr(result, "retryable", False) is True
+                                        or _delivery_state == "attempted_unverified"
                                     ),
                                 )
                         except Exception:
@@ -5416,7 +5544,7 @@ class BasePlatformAdapter(ABC):
                                 "delivery ledger update failed", exc_info=True
                             )
 
-                    if result.success:
+                    if result.success and _delivery_claimed:
                         try:
                             await self._after_final_text_response_sent(
                                 event,
@@ -5452,13 +5580,17 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
+                        batch_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(
+                            "image_batch", batch_result, expected_count=len(images)
+                        )
                     except Exception as batch_err:
+                        _record_delivery("image_batch", None)
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
 
@@ -5494,13 +5626,19 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        batch_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(
+                            "local_image_batch",
+                            batch_result,
+                            expected_count=len(_batch),
+                        )
                     except Exception as batch_err:
+                        _record_delivery("local_image_batch", None)
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
                 for media_path, is_voice in _non_image_media:
@@ -5527,9 +5665,11 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
 
+                        _record_delivery(f"media:{ext}", media_result)
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                     except Exception as media_err:
+                        _record_delivery("media", None)
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
                 # Send auto-detected local non-image files as native attachments
@@ -5539,27 +5679,29 @@ class BasePlatformAdapter(ABC):
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            await self.send_video(
+                            local_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
                         else:
-                            await self.send_document(
+                            local_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
+                        _record_delivery(f"local_file:{ext}", local_result)
                     except Exception as file_err:
+                        _record_delivery("local_file", None)
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 
                 # A3 (#29346): if a non-empty response produced nothing
                 # deliverable, fail loudly rather than dropping it in silence.
                 _anything_delivered = (
-                    delivery_attempted or _tts_caption_delivered
-                    or images or local_files or media_files
+                    bool(delivery_outcomes)
                 )
                 if not _anything_delivered and _response_pre_extract.strip():
+                    _record_delivery("unrendered_response", None)
                     logger.error(
                         "[%s] response_delivery_dropped: non-empty response "
                         "(%d chars) produced no delivered message or attachment "
@@ -5568,7 +5710,7 @@ class BasePlatformAdapter(ABC):
                     )
 
             # Determine overall success for the processing hook
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            processing_ok = all(ok for _label, ok in delivery_outcomes)
             await self._run_processing_hook(
                 "on_processing_complete",
                 event,

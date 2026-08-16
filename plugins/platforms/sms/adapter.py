@@ -62,6 +62,7 @@ class SmsAdapter(BasePlatformAdapter):
     Replies are always sent from the configured TWILIO_PHONE_NUMBER.
     """
 
+    DELIVERY_PROOF_KIND = "message_id"
     MAX_MESSAGE_LENGTH = MAX_SMS_LENGTH
 
     def __init__(self, config: PlatformConfig):
@@ -166,6 +167,7 @@ class SmsAdapter(BasePlatformAdapter):
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted)
         last_result = SendResult(success=True)
+        accepted_chunks = 0
 
         url = f"{TWILIO_API_BASE}/{self._account_sid}/Messages.json"
         headers = {
@@ -197,12 +199,32 @@ class SmsAdapter(BasePlatformAdapter):
                             return SendResult(
                                 success=False,
                                 error=f"Twilio {resp.status}: {error_msg}",
+                                raw_response=(
+                                    {"delivery_state": "attempted_unverified"}
+                                    if accepted_chunks
+                                    else None
+                                ),
                             )
                         msg_sid = body.get("sid", "")
+                        if not msg_sid:
+                            return SendResult(
+                                success=False,
+                                error="Twilio accepted SMS without a message SID",
+                                raw_response={"delivery_state": "attempted_unverified"},
+                            )
                         last_result = SendResult(success=True, message_id=msg_sid)
+                        accepted_chunks += 1
                 except Exception as e:
                     logger.error("[sms] send error to %s: %s", redact_phone(chat_id), e)
-                    return SendResult(success=False, error=str(e))
+                    return SendResult(
+                        success=False,
+                        error=str(e),
+                        raw_response=(
+                            {"delivery_state": "attempted_unverified"}
+                            if accepted_chunks
+                            else None
+                        ),
+                    )
         finally:
             # Close session only if we created a fallback (no persistent session)
             if not self._http_session and session:

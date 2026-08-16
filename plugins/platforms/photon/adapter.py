@@ -277,6 +277,7 @@ class PhotonAdapter(BasePlatformAdapter):
     Outbound: loopback POSTs to the sidecar's control channel.
     """
 
+    DELIVERY_PROOF_KIND = "message_id"
     MAX_MESSAGE_LENGTH = _MAX_MESSAGE_LENGTH
 
     def __init__(self, config: PlatformConfig):
@@ -1501,8 +1502,15 @@ class PhotonAdapter(BasePlatformAdapter):
             data = await self._sidecar_call("/send", body)
         except Exception as e:
             return SendResult(success=False, error=str(e))
-        self._record_sent_message(data.get("messageId"))
-        return SendResult(success=True, message_id=data.get("messageId"))
+        message_id = data.get("messageId")
+        if not message_id:
+            return SendResult(
+                success=False,
+                error="Photon accepted text without a message identifier",
+                raw_response={"delivery_state": "attempted_unverified"},
+            )
+        self._record_sent_message(message_id)
+        return SendResult(success=True, message_id=message_id)
 
     async def _sidecar_send_attachment(
         self,
@@ -1550,8 +1558,15 @@ class PhotonAdapter(BasePlatformAdapter):
             data = await self._sidecar_call("/send-attachment", body)
         except Exception as e:
             return SendResult(success=False, error=str(e))
-        self._record_sent_message(data.get("messageId"))
-        return SendResult(success=True, message_id=data.get("messageId"))
+        message_id = data.get("messageId")
+        if not message_id:
+            return SendResult(
+                success=False,
+                error="Photon accepted attachment without a message identifier",
+                raw_response={"delivery_state": "attempted_unverified"},
+            )
+        self._record_sent_message(message_id)
+        return SendResult(success=True, message_id=message_id)
 
     async def _sidecar_call(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
         # Guard: adapter not yet connected (no sidecar address known).

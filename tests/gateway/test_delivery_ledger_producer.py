@@ -156,13 +156,132 @@ class TestProducerHook:
 
         rows = _rows()
         assert len(rows) == 1
-        # Row is stuck in 'attempting' (or failed if retry wrapper caught it):
-        # either way it is non-delivered and recoverable.
+        # Row is stuck in 'attempting' (or failed if the adapter definitively
+        # rejected it). A dead attempting owner is quarantined, never resent.
         assert rows[0][1] in ("attempting", "failed")
         with dl._connect() as conn:
             conn.execute(
                 "UPDATE delivery_obligations SET owner_pid=999999999, owner_started_at=1"
             )
         claimed = dl.sweep_recoverable()
-        assert len(claimed) == 1
-        assert claimed[0]["needs_marker"] is True
+        assert claimed == []
+        assert _rows()[0][1] == "ambiguous"
+
+    @pytest.mark.asyncio
+    async def test_mixed_text_and_image_failure_has_aggregate_failure(self, monkeypatch):
+        adapter = _Adapter()
+        adapter._finish_inbound_effect = AsyncMock()
+        monkeypatch.setattr(
+            type(adapter),
+            "extract_images",
+            staticmethod(lambda response: ([('https://example.test/a.png', 'a')], response)),
+        )
+        monkeypatch.setattr(
+            type(adapter),
+            "extract_local_files",
+            staticmethod(lambda content: ([], content)),
+        )
+        adapter.send_multiple_images = AsyncMock(
+            return_value=[SendResult(success=False, error="image rejected")]
+        )
+
+        event = _event()
+        await _run(adapter, event, response="text plus image")
+
+        adapter._finish_inbound_effect.assert_awaited_once_with(
+            event, success=False, error="runner or provider delivery failed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_image_batch_missing_one_planned_outcome_fails(self, monkeypatch):
+        adapter = _Adapter()
+        adapter._finish_inbound_effect = AsyncMock()
+        monkeypatch.setattr(
+            type(adapter),
+            "extract_images",
+            staticmethod(
+                lambda response: (
+                    [
+                        ("https://example.test/a.png", "a"),
+                        ("https://example.test/b.png", "b"),
+                    ],
+                    response,
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            type(adapter),
+            "extract_local_files",
+            staticmethod(lambda content: ([], content)),
+        )
+        adapter.send_multiple_images = AsyncMock(
+            return_value=[SendResult(success=True, message_id="only-one")]
+        )
+        event = _event()
+
+        await _run(adapter, event, response="text plus two images")
+
+        adapter._finish_inbound_effect.assert_awaited_once_with(
+            event, success=False, error="runner or provider delivery failed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_full_native_image_batch_coverage_succeeds(self, monkeypatch):
+        adapter = _Adapter()
+        adapter._finish_inbound_effect = AsyncMock()
+        monkeypatch.setattr(
+            type(adapter),
+            "extract_images",
+            staticmethod(
+                lambda response: (
+                    [
+                        ("https://example.test/a.png", "a"),
+                        ("https://example.test/b.png", "b"),
+                    ],
+                    response,
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            type(adapter),
+            "extract_local_files",
+            staticmethod(lambda content: ([], content)),
+        )
+        adapter.send_multiple_images = AsyncMock(
+            return_value=[
+                SendResult(success=True, message_id="native-post"),
+                SendResult(success=True, message_id="native-post"),
+            ]
+        )
+        event = _event()
+
+        await _run(adapter, event, response="text plus two images")
+
+        adapter._finish_inbound_effect.assert_awaited_once_with(
+            event, success=True, error=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_attachment_only_success_is_not_based_on_response_truthiness(self, monkeypatch):
+        adapter = _Adapter()
+        adapter._finish_inbound_effect = AsyncMock()
+        monkeypatch.setattr(
+            type(adapter),
+            "extract_images",
+            staticmethod(lambda _response: ([('https://example.test/a.png', 'a')], "")),
+        )
+        monkeypatch.setattr(
+            type(adapter),
+            "extract_local_files",
+            staticmethod(lambda content: ([], content)),
+        )
+        adapter.send_multiple_images = AsyncMock(
+            return_value=[SendResult(success=True, message_id="image-1")]
+        )
+        event = _event()
+
+        await _run(adapter, event, response="attachment directive")
+
+        adapter._finish_inbound_effect.assert_awaited_once_with(
+            event, success=True, error=None
+        )

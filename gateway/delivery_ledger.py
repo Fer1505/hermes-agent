@@ -17,25 +17,28 @@ bounded retention). The gateway writes three checkpoints around the send:
     mark_failed()         state='failed'      on a definitive rejection
 
 On startup and at a bounded periodic cadence, ``sweep_recoverable()`` claims
-rows whose owning process is dead or whose live-owner delivery lease/backoff
-expired, then hands them to the gateway for redelivery. Crash semantics are
-explicit about ambiguity (the contract review of the earlier
-delivery-outbox attempt, #61790, closed it for silently resending
-ambiguous sends):
+pending work from dead owners and definitively failed work after its persisted
+due time. Current renewable leases are never stolen; expired pending work is
+safe to reclaim, while expired attempting work is quarantined. Crash semantics are
+explicit about ambiguity (the contract review of the earlier delivery-outbox
+attempt, #61790, closed it for silently resending ambiguous sends):
 
 - ``pending``     — the send never started: redeliver plainly, no dup risk.
-- ``attempting``  — crashed mid-await: the platform MAY already have the
-  message. Redelivered WITH a visible recovered-reply marker so the
-  contract is honest at-least-once, never a silent duplicate.
+- ``attempting``  — a live process crossed the provider boundary; its renewable
+  token remains exclusive. If the owner dies, the row becomes ``ambiguous``
+  and is quarantined without an automatic provider resend.
 - ``failed``      — definitively rejected once; the restart is a natural
-  retry boundary. Also carries the marker.
+  retry boundary after ``next_attempt_at``. Carries the marker.
+- ``ambiguous``   — timeout, unverified 2xx, or crash after the send boundary;
+  operator review is required and the sweeper never resends it.
 - ``delivered``   — nothing to do; retention prunes.
 
 Poison rows cannot spin: attempts are capped, stale rows expire, and both
 transition to ``abandoned`` (kept briefly for inspection, then pruned).
 
-Everything here is best-effort by design: ledger failures must never block
-or delay an actual send. Callers wrap every call in try/except.
+Ledger availability remains best-effort: callers send normally if recording
+itself fails. Once a durable claim exists, however, token/CAS failures suppress
+duplicate generations rather than weakening the idempotency contract.
 """
 
 from __future__ import annotations
@@ -47,6 +50,7 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -60,17 +64,15 @@ _DB_LOCK = threading.Lock()
 # only matter in the rare recovery path).
 MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
-LIVE_OWNER_LEASE_SECONDS = 5 * 60
+CLAIM_LEASE_SECONDS = 2 * 60
 RETRY_BASE_SECONDS = 60
 RETRY_MAX_SECONDS = 15 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
 
-# Visible prefix for redeliveries that might duplicate an already-received
-# message (crash mid-send / post-rejection retry). Honest at-least-once.
+# Visible prefix for retries after a definitive provider rejection.
 RECOVERED_MARKER = (
-    "♻️ Recovered reply — the gateway restarted during delivery, "
-    "so this may be a duplicate:\n\n"
+    "♻️ Recovered reply — an earlier delivery was rejected and is being retried:\n\n"
 )
 
 
@@ -97,8 +99,31 @@ def _connect() -> sqlite3.Connection:
             updated_at REAL NOT NULL,
             owner_pid INTEGER,
             owner_started_at INTEGER,
+            claim_generation INTEGER NOT NULL DEFAULT 0,
+            claim_token TEXT,
+            lease_due_at REAL,
+            next_attempt_at REAL,
             last_error TEXT
         )"""
+    )
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")
+    }
+    for name, declaration in (
+        ("claim_generation", "INTEGER NOT NULL DEFAULT 0"),
+        ("claim_token", "TEXT"),
+        ("lease_due_at", "REAL"),
+        ("next_attempt_at", "REAL"),
+    ):
+        if name not in columns:
+            conn.execute(
+                f"ALTER TABLE delivery_obligations ADD COLUMN {name} {declaration}"
+            )
+    conn.execute(
+        """UPDATE delivery_obligations
+           SET lease_due_at=updated_at+?
+           WHERE state IN ('pending','attempting') AND lease_due_at IS NULL""",
+        (CLAIM_LEASE_SECONDS,),
     )
     return conn
 
@@ -164,44 +189,142 @@ def record_obligation(
     chat_id: str,
     thread_id: Optional[str],
     content: str,
-) -> None:
+) -> Optional[str]:
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
     pid, started = _owner_stamp()
+    claim_token = uuid.uuid4().hex
     with _DB_LOCK, _connect() as conn:
-        conn.execute(
-            """INSERT OR REPLACE INTO delivery_obligations
+        cursor = conn.execute(
+            """INSERT INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                owner_pid, owner_started_at, claim_generation, claim_token,
+                lease_due_at, next_attempt_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, 1, ?, ?, NULL)
+               ON CONFLICT(obligation_id) DO NOTHING""",
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
-             pid, started),
+             pid, started, claim_token, now + CLAIM_LEASE_SECONDS),
         )
+        if not cursor.rowcount:
+            row = conn.execute(
+                """SELECT claim_token, owner_pid, owner_started_at, state
+                   FROM delivery_obligations WHERE obligation_id=?""",
+                (obligation_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            claim_token = row[0]
     _prune()
+    return claim_token
 
 
-def mark_attempting(obligation_id: str) -> None:
-    _update_state(obligation_id, "attempting")
-
-
-def mark_delivered(obligation_id: str) -> None:
-    _update_state(obligation_id, "delivered")
-
-
-def mark_failed(obligation_id: str, error: str = "") -> None:
-    _update_state(obligation_id, "failed", error=error)
-
-
-def _update_state(obligation_id: str, state: str, error: str = "") -> None:
+def mark_attempting(obligation_id: str, claim_token: str) -> bool:
+    """CAS a claimed pending/failed generation into the provider-send state."""
+    pid, started = _owner_stamp()
     with _DB_LOCK, _connect() as conn:
-        conn.execute(
+        cursor = conn.execute(
             """UPDATE delivery_obligations
-               SET state=?, updated_at=?, last_error=?
-               WHERE obligation_id=?""",
-            (state, time.time(), error[:500] if error else None, obligation_id),
+               SET state='attempting', updated_at=?, lease_due_at=?
+               WHERE obligation_id=? AND claim_token=?
+                 AND owner_pid=? AND (owner_started_at IS ? OR owner_started_at=?)
+                 AND (
+                   state='pending'
+                   OR (state='failed' AND (next_attempt_at IS NULL OR next_attempt_at<=?))
+                 )""",
+            (
+                time.time(),
+                time.time() + CLAIM_LEASE_SECONDS,
+                obligation_id,
+                claim_token,
+                pid,
+                started,
+                started,
+                time.time(),
+            ),
         )
+    return bool(cursor.rowcount)
+
+
+def mark_delivered(obligation_id: str, claim_token: str) -> bool:
+    return _update_state(obligation_id, "delivered", claim_token=claim_token)
+
+
+def mark_failed(
+    obligation_id: str,
+    claim_token: str,
+    error: str = "",
+    *,
+    retry_after: Optional[float] = None,
+    ambiguous: bool = False,
+) -> bool:
+    if ambiguous:
+        return _update_state(
+            obligation_id,
+            "ambiguous",
+            error=error or "provider outcome unknown; operator review required",
+            claim_token=claim_token,
+        )
+    delay = retry_after
+    if delay is None:
+        delay = RETRY_BASE_SECONDS
+    delay = max(0.0, min(RETRY_MAX_SECONDS, float(delay)))
+    return _update_state(
+        obligation_id,
+        "failed",
+        error=error,
+        claim_token=claim_token,
+        next_attempt_at=time.time() + delay,
+    )
+
+
+def renew_claim(
+    obligation_id: str,
+    claim_token: str,
+    *,
+    lease_seconds: float = CLAIM_LEASE_SECONDS,
+) -> bool:
+    """Extend only the caller's current claim; stale generations cannot renew."""
+    with _DB_LOCK, _connect() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations SET lease_due_at=?, updated_at=?
+               WHERE obligation_id=? AND claim_token=?
+                 AND state IN ('pending','attempting')""",
+            (
+                time.time() + max(1.0, float(lease_seconds)),
+                time.time(),
+                obligation_id,
+                claim_token,
+            ),
+        )
+    return bool(cursor.rowcount)
+
+
+def _update_state(
+    obligation_id: str,
+    state: str,
+    *,
+    error: str = "",
+    claim_token: str,
+    next_attempt_at: Optional[float] = None,
+) -> bool:
+    with _DB_LOCK, _connect() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET state=?, updated_at=?, last_error=?, next_attempt_at=?,
+                   lease_due_at=NULL
+               WHERE obligation_id=? AND claim_token=? AND state='attempting'""",
+            (
+                state,
+                time.time(),
+                error[:500] if error else None,
+                next_attempt_at,
+                obligation_id,
+                claim_token,
+            ),
+        )
+    return bool(cursor.rowcount)
 
 
 def sweep_recoverable(
@@ -231,12 +354,36 @@ def sweep_recoverable(
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at, updated_at,
-                      owner_pid, owner_started_at
+                      owner_pid, owner_started_at, claim_generation,
+                      claim_token, lease_due_at, next_attempt_at
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
-             attempts, created_at, updated_at, owner_pid, owner_started_at) in rows:
+             attempts, created_at, updated_at, owner_pid, owner_started_at,
+             generation, previous_token, lease_due_at, next_attempt_at) in rows:
+            owner_alive = _owner_alive(owner_pid, owner_started_at)
+            lease_expired = lease_due_at is not None and now >= lease_due_at
+            if state == "attempting" and (not owner_alive or lease_expired):
+                cursor = conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='ambiguous', updated_at=?, lease_due_at=NULL,
+                           next_attempt_at=NULL,
+                           last_error='provider outcome unknown after lease expiry or owner exit; operator review required'
+                       WHERE obligation_id=? AND state='attempting'
+                         AND claim_generation=? AND (claim_token IS ? OR claim_token=?)""",
+                    (now, oid, generation, previous_token, previous_token),
+                )
+                if cursor.rowcount:
+                    logger.error(
+                        "Delivery obligation %s quarantined: provider outcome unknown after lease expiry or owner exit",
+                        oid,
+                    )
+                continue
+            if state == "attempting":
+                # Current lease + live owner: the provider call is still in
+                # flight and its heartbeat retains exclusive ownership.
+                continue
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
                 cursor = conn.execute(
                     """UPDATE delivery_obligations
@@ -253,18 +400,14 @@ def sweep_recoverable(
                         oid, state, attempts,
                     )
                 continue
-            if _owner_alive(owner_pid, owner_started_at):
-                # A healthy gateway can outlive a failed/pending row forever.
-                # Fresh rows remain owned by their in-flight producer; once the
-                # finite lease/backoff expires, this process may safely reclaim
-                # them. Attempting rows retain the visible duplicate marker.
-                retry_delay = (
-                    min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * (2 ** attempts))
-                    if state == "failed"
-                    else LIVE_OWNER_LEASE_SECONDS
-                )
-                if (now - updated_at) < retry_delay:
-                    continue
+            # A live process retains pending work while its task-level lease is
+            # current. Expiry means that task disappeared; pending is safe to
+            # reclaim because it never crossed the provider boundary. An
+            # expired attempting row was quarantined above, never resent.
+            if owner_alive and state == "pending" and not lease_expired:
+                continue
+            if state == "failed" and next_attempt_at is not None and now < next_attempt_at:
+                continue
             if (
                 deliverable_platforms is not None
                 and platform not in deliverable_platforms
@@ -272,14 +415,20 @@ def sweep_recoverable(
                 # No adapter for this platform this boot — the caller cannot
                 # send, so claiming would spend an attempt on a no-op.
                 continue
+            new_token = uuid.uuid4().hex
             cursor = conn.execute(
                 """UPDATE delivery_obligations
-                   SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
-                       updated_at=?
+                   SET state='pending', owner_pid=?, owner_started_at=?, attempts=attempts+1,
+                       updated_at=?, claim_generation=claim_generation+1,
+                       claim_token=?, lease_due_at=?, next_attempt_at=NULL
                    WHERE obligation_id=? AND state=? AND attempts=?
-                     AND updated_at=? AND (owner_pid IS ? OR owner_pid=?)""",
-                (pid, started, now, oid, state, attempts, updated_at,
-                 owner_pid, owner_pid),
+                     AND updated_at=? AND claim_generation=?
+                     AND (claim_token IS ? OR claim_token=?)""",
+                (
+                    pid, started, now, new_token, now + CLAIM_LEASE_SECONDS,
+                    oid, state, attempts, updated_at, generation,
+                    previous_token, previous_token,
+                ),
             )
             if cursor.rowcount:
                 claimed.append({
@@ -290,9 +439,12 @@ def sweep_recoverable(
                     "thread_id": thread_id,
                     "content": content,
                     # pending = send never started, redeliver plainly;
-                    # attempting/failed = ambiguous or rejected, carry marker.
+                    # Failed means definitively rejected, so carry a visible
+                    # recovery marker. Attempting rows never reach this path.
                     "needs_marker": state != "pending",
                     "attempts": attempts + 1,
+                    "claim_generation": generation + 1,
+                    "claim_token": new_token,
                 })
     return claimed
 
@@ -315,11 +467,8 @@ def _prune(now: Optional[float] = None) -> None:
                 conn.execute(
                     """DELETE FROM delivery_obligations WHERE obligation_id IN (
                          SELECT obligation_id FROM delivery_obligations
-                         ORDER BY CASE state
-                                    WHEN 'delivered' THEN 0
-                                    WHEN 'abandoned' THEN 1
-                                    ELSE 2
-                                  END, updated_at ASC
+                         WHERE state IN ('delivered', 'abandoned')
+                         ORDER BY updated_at ASC
                          LIMIT ?)""",
                     (excess,),
                 )

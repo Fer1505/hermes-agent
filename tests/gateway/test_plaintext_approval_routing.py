@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.base import BusyMessageDisposition, MessageEvent, MessageType
 from gateway.session import SessionSource
 
 
@@ -102,7 +102,7 @@ def test_plaintext_yes_resolves_approval(reply):
         runner._handle_active_session_busy_message(_make_event(reply), session_key)
     )
 
-    assert handled is True
+    assert handled is BusyMessageDisposition.CONSUMED
     assert entry.event.is_set()
     assert entry.result == "once"
     # The user gets a confirmation reply, not silence.
@@ -120,7 +120,7 @@ def test_plaintext_no_denies_approval(reply):
         runner._handle_active_session_busy_message(_make_event(reply), session_key)
     )
 
-    assert handled is True
+    assert handled is BusyMessageDisposition.CONSUMED
     assert entry.event.is_set()
     assert entry.result == "deny"
     adapter._send_with_retry.assert_awaited()
@@ -136,7 +136,7 @@ def test_plaintext_always_maps_to_permanent_choice():
         runner._handle_active_session_busy_message(_make_event("always"), session_key)
     )
 
-    assert handled is True
+    assert handled is BusyMessageDisposition.CONSUMED
     assert entry.result == "always"
     _clear_approval_state()
 
@@ -150,7 +150,7 @@ def test_plaintext_session_maps_to_session_choice():
         runner._handle_active_session_busy_message(_make_event("session"), session_key)
     )
 
-    assert handled is True
+    assert handled is BusyMessageDisposition.CONSUMED
     assert entry.result == "session"
     _clear_approval_state()
 

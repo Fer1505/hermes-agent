@@ -107,6 +107,56 @@ class TestSmsFormatAndTruncate:
         result = adapter.format_message("a\n\n\n\nb")
         assert result == "a\n\nb"
 
+    @pytest.mark.asyncio
+    async def test_partial_chunk_rejection_is_attempted_unverified(self):
+        adapter = self._make_adapter()
+        adapter._http_session = MagicMock()
+        adapter.truncate_message = lambda _text: ["first", "second"]
+
+        class _ResponseContext:
+            def __init__(self, status, body):
+                self.response = MagicMock(status=status)
+                self.response.json = AsyncMock(return_value=body)
+
+            async def __aenter__(self):
+                return self.response
+
+            async def __aexit__(self, *_args):
+                return False
+
+        adapter._http_session.post = MagicMock(
+            side_effect=[
+                _ResponseContext(201, {"sid": "SM-first"}),
+                _ResponseContext(400, {"message": "rejected"}),
+            ]
+        )
+
+        result = await adapter.send("+15551234567", "long response")
+
+        assert result.success is False
+        assert result.raw_response == {"delivery_state": "attempted_unverified"}
+
+    @pytest.mark.asyncio
+    async def test_success_without_sid_is_attempted_unverified(self):
+        adapter = self._make_adapter()
+        adapter._http_session = MagicMock()
+
+        class _ResponseContext:
+            async def __aenter__(self):
+                response = MagicMock(status=201)
+                response.json = AsyncMock(return_value={})
+                return response
+
+            async def __aexit__(self, *_args):
+                return False
+
+        adapter._http_session.post = MagicMock(return_value=_ResponseContext())
+
+        result = await adapter.send("+15551234567", "hello")
+
+        assert result.success is False
+        assert result.raw_response == {"delivery_state": "attempted_unverified"}
+
 
 # ── Echo prevention ────────────────────────────────────────────────
 

@@ -1927,6 +1927,7 @@ from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    BusyMessageDisposition,
     EphemeralReply,
     MessageEvent,
     MessageType,
@@ -5704,10 +5705,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return
+            return False
         # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
         # the single pending slot when consecutive text messages arrived
@@ -5731,7 +5732,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
-            return
+            return True
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
@@ -5739,11 +5740,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
                 self._BUSY_QUEUE_MAX_PENDING,
             )
-            return
+            return False
 
         self._enqueue_fifo(session_key, event, adapter)
+        return True
 
-    async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+    async def _handle_active_session_busy_message(
+        self, event: MessageEvent, session_key: str
+    ) -> BusyMessageDisposition:
+        lifecycle_adapter = self._adapter_for_source(event.source)
+        durable_inbound = bool(
+            event.metadata.get("telegram_inbox_update_ids")
+            or (
+                getattr(event, "platform_update_id", None) is not None
+                and event.source.platform == Platform.TELEGRAM
+            )
+        )
+
+        async def _begin_consumed_effect() -> bool:
+            if not durable_inbound:
+                return True
+            if lifecycle_adapter is None:
+                return False
+            return await lifecycle_adapter._begin_inbound_effect(event)
+
+        async def _finish_consumed_effect(
+            *, success: bool, error: object | None = None
+        ) -> None:
+            if durable_inbound and lifecycle_adapter is not None:
+                await lifecycle_adapter._finish_inbound_effect(
+                    event, success=success, error=error
+                )
+
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
@@ -5758,23 +5786,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event.source.platform.value if event.source.platform else "unknown",
                 session_key,
             )
-            return True  # handled (silently dropped); do not fall through
+            # An unauthorized update is intentionally consumed without any
+            # external effect. Archive its durable receipt so it cannot replay
+            # later as an authorized normal turn.
+            await _finish_consumed_effect(success=True)
+            return BusyMessageDisposition.CONSUMED
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
             adapter = self._adapter_for_source(event.source)
             if not adapter:
-                return True
+                await _finish_consumed_effect(
+                    success=False, error="draining adapter unavailable"
+                )
+                return BusyMessageDisposition.CONSUMED
 
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled():
-                self._queue_or_replace_pending_event(session_key, event)
+                queued = self._queue_or_replace_pending_event(session_key, event)
                 message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
             else:
+                queued = False
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
 
-            await adapter._send_with_retry(
+            if queued and durable_inbound:
+                # Keep the durable claim attached to the queued turn. Sending
+                # a busy ack here would create a separate unfenced provider
+                # effect before that turn's eventual effect boundary.
+                return BusyMessageDisposition.QUEUED
+
+            effect_started = await _begin_consumed_effect() if not queued else False
+            if not queued and not effect_started:
+                return BusyMessageDisposition.CONSUMED
+
+            result = await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
                 content=message,
                 reply_to=(
@@ -5786,7 +5832,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ),
                 metadata=thread_meta,
             )
-            return True
+            if not queued:
+                await _finish_consumed_effect(
+                    success=bool(result.success),
+                    error=None if result.success else "draining response delivery failed",
+                )
+                return BusyMessageDisposition.CONSUMED
+            return BusyMessageDisposition.QUEUED
 
         # --- Approval response routing (#46866) ---
         # When the agent is blocked waiting for a dangerous-command approval,
@@ -5809,6 +5861,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # waiting thread, resume typing, AND return a localized confirmation
         # string.  The busy-handler path does not auto-send that return, so
         # we deliver it ourselves (mirroring the draining-case send above).
+        approval_effect_started = False
         try:
             from tools.approval import has_blocking_approval
             if has_blocking_approval(session_key):
@@ -5828,6 +5881,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _approval_handler = self._handle_approve_command
                     _normalized_args = "session"
                 if _approval_handler is not None:
+                    approval_effect_started = await _begin_consumed_effect()
+                    if not approval_effect_started:
+                        return BusyMessageDisposition.CONSUMED
                     # Synthesize the canonical "/approve [args]" / "/deny"
                     # command text so the slash handlers parse modifiers via
                     # event.get_command_args().  Always use a literal "/" —
@@ -5840,6 +5896,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _synth = f"{_synth} {_normalized_args}"
                     event.text = _synth
                     _reply = await _approval_handler(event)
+                    effect_success = True
                     logger.info(
                         "Approval response via plain text: session=%s verb=%s args=%r",
                         session_key, _verb, _normalized_args,
@@ -5849,14 +5906,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _text, _eph_ttl = _adapter._unwrap_ephemeral(_reply)
                         if _text:
                             _anchor = self._reply_anchor_for_event(event)
-                            await _adapter._send_with_retry(
+                            _send_result = await _adapter._send_with_retry(
                                 chat_id=event.source.chat_id,
                                 content=_text,
                                 reply_to=_anchor,
                                 metadata=self._thread_metadata_for_source(event.source, _anchor),
                             )
-                    return True
-        except Exception:
+                            effect_success = bool(_send_result.success)
+                    await _finish_consumed_effect(
+                        success=effect_success,
+                        error=None if effect_success else "approval response delivery failed",
+                    )
+                    return BusyMessageDisposition.CONSUMED
+        except Exception as approval_error:
+            if approval_effect_started:
+                await _finish_consumed_effect(success=False, error=approval_error)
+                logger.warning(
+                    "Plain-text approval routing failed for session %s after "
+                    "the durable effect fence",
+                    session_key,
+                    exc_info=True,
+                )
+                return BusyMessageDisposition.CONSUMED
             logger.warning(
                 "Plain-text approval routing failed for session %s; "
                 "falling through to busy handling",
@@ -5866,7 +5937,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Normal busy case (agent actively running a task)
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return False  # let default path handle it
+            return BusyMessageDisposition.NOT_HANDLED
 
         # --- Internal synthetic events must never interrupt/steer ---
         # Async-delegation completions (delegate_task(background=true)) and
@@ -5880,7 +5951,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # which queues internal events silently (no interrupt, no ack) so they
         # cascade after the current turn finishes.
         if getattr(event, "internal", False):
-            return False
+            return BusyMessageDisposition.NOT_HANDLED
 
         running_agent = self._running_agents.get(session_key)
 
@@ -5891,7 +5962,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and busy_text_mode == "queue"
             and effective_mode != "steer"
         ):
-            return False
+            return BusyMessageDisposition.NOT_HANDLED
 
         # Steer mode: inject mid-run via running_agent.steer() instead of
         # queueing + interrupting.  If the agent isn't running yet
@@ -5927,7 +5998,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
             )
             effective_mode = "queue"
+        if effective_mode == "interrupt" and durable_inbound:
+            # Interrupting the live agent is itself an irreversible in-memory
+            # effect, but it has no terminal receipt that can be tied to this
+            # inbox row. Preserve crash safety by dispatching durable Telegram
+            # input as a normal queued next turn instead.
+            logger.info(
+                "Routing durable Telegram interrupt input to queued next-turn delivery for %s",
+                session_key,
+            )
+            effective_mode = "queue"
         steered = False
+        consumed_effect_started = False
+        if effective_mode == "steer" and durable_inbound:
+            # `steer()` only acknowledges injection into the live agent; it
+            # does not provide a terminal receipt that the text was consumed
+            # before a crash. Preserve the inbox claim by routing Telegram
+            # durable inputs as queued next turns instead.
+            logger.info(
+                "Routing durable Telegram steer input to queued next-turn delivery for %s",
+                session_key,
+            )
+            effective_mode = "queue"
         if effective_mode == "steer":
             steer_text = (event.text or "").strip()
             can_steer = (
@@ -5937,11 +6029,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and hasattr(running_agent, "steer")
             )
             if can_steer:
+                consumed_effect_started = await _begin_consumed_effect()
+                if not consumed_effect_started:
+                    return BusyMessageDisposition.CONSUMED
                 try:
                     steered = bool(running_agent.steer(steer_text))
                 except Exception as exc:
                     logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
-                    steered = False
+                    await _finish_consumed_effect(success=False, error=exc)
+                    return BusyMessageDisposition.CONSUMED
+                if not steered:
+                    if durable_inbound:
+                        await _finish_consumed_effect(
+                            success=False,
+                            error="steer returned without confirming consumption",
+                        )
+                        return BusyMessageDisposition.CONSUMED
             if not steered:
                 # Fall back to queue (merge into pending messages, no interrupt)
                 effective_mode = "queue"
@@ -5961,10 +6064,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn (#43066 sub-bug 2). The FIFO path gives each text its own
         # turn in arrival order while still preserving photo-burst / album
         # merge semantics for media.
+        queued = False
+        queue_rejected = False
         if not steered:
-            self._queue_or_replace_pending_event(session_key, event)
+            queued = self._queue_or_replace_pending_event(session_key, event)
+            if not queued:
+                queue_rejected = True
+                consumed_effect_started = await _begin_consumed_effect()
+                if not consumed_effect_started:
+                    return BusyMessageDisposition.CONSUMED
 
-        is_queue_mode = effective_mode == "queue"
+        is_queue_mode = effective_mode == "queue" and queued
         is_steer_mode = effective_mode == "steer"
 
         # If not in queue/steer mode, interrupt the running agent immediately.
@@ -5988,13 +6098,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass  # don't let interrupt failure block the ack
 
+        if queued and durable_inbound:
+            # The queued turn retains this durable claim and will cross its
+            # effect fence only when it is actually dispatched. Suppress a
+            # separate busy-ack provider effect in the meantime.
+            return BusyMessageDisposition.QUEUED
+
         # Check if busy ack is disabled — skip sending but still process the input.
         # Placed before debounce so we don't stamp a "last ack" timestamp that was
         # never actually delivered.
         busy_ack_enabled = os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() == "true"
-        if not busy_ack_enabled:
+        force_rejection_ack = durable_inbound and queue_rejected
+        if not busy_ack_enabled and not force_rejection_ack:
             logger.debug("Busy ack suppressed for session %s", session_key)
-            return True  # input still processed, just no ack sent
+            if steered or not queued:
+                await _finish_consumed_effect(success=True)
+                return BusyMessageDisposition.CONSUMED
+            return BusyMessageDisposition.QUEUED
 
         # Debounce before consulting config-heavy display settings. Rapid
         # follow-ups should be processed but should not trigger another config
@@ -6002,8 +6122,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _BUSY_ACK_COOLDOWN = 30
         now = time.time()
         last_ack = self._busy_ack_ts.get(session_key, 0)
-        if now - last_ack < _BUSY_ACK_COOLDOWN:
-            return True  # interrupt sent (if not queue), ack already delivered recently
+        if now - last_ack < _BUSY_ACK_COOLDOWN and not force_rejection_ack:
+            if steered or not queued:
+                await _finish_consumed_effect(success=True)
+                return BusyMessageDisposition.CONSUMED
+            return BusyMessageDisposition.QUEUED
 
         from gateway.display_config import resolve_display_setting
         platform_key = _platform_config_key(event.source.platform)
@@ -6012,7 +6135,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # active run. Some mobile chat setups want that steering to be silent,
         # like STT transcript echo suppression: keep the behavior, drop only
         # the confirmation bubble.
-        if is_steer_mode:
+        if force_rejection_ack:
+            message = (
+                "⏳ Busy queue is full; this message was not accepted. "
+                "Please retry after the current task finishes."
+            )
+        elif is_steer_mode:
             steer_ack_env = os.environ.get("HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED")
             if steer_ack_env is not None:
                 steer_ack_enabled = steer_ack_env.strip().lower() in {"1", "true", "yes", "on"}
@@ -6027,7 +6155,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             if not steer_ack_enabled:
                 logger.debug("Busy steer ack suppressed for session %s", session_key)
-                return True
+                await _finish_consumed_effect(success=True)
+                return BusyMessageDisposition.CONSUMED
 
         self._busy_ack_ts[session_key] = now
 
@@ -6063,7 +6192,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
 
         status_detail = f" ({', '.join(status_parts)})" if status_parts else ""
-        if is_steer_mode:
+        if force_rejection_ack:
+            pass
+        elif is_steer_mode:
             message = (
                 f"⏩ Steered into current run{status_detail}. "
                 f"Your message arrives after the next tool call."
@@ -6121,8 +6252,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         reply_anchor = self._reply_anchor_for_event(event)
         thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+        ack_success = False
         try:
-            await adapter._send_with_retry(
+            ack_result = await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
                 content=message,
                 reply_to=(
@@ -6134,10 +6266,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ),
                 metadata=thread_meta,
             )
+            ack_success = bool(ack_result.success)
         except Exception as e:
             logger.debug("Failed to send busy-ack: %s", e)
-
-        return True
+        if steered or not queued:
+            await _finish_consumed_effect(
+                success=ack_success,
+                error=None if ack_success else "busy response delivery failed",
+            )
+            return BusyMessageDisposition.CONSUMED
+        return BusyMessageDisposition.QUEUED
 
     async def _drain_active_agents(self, timeout: float) -> tuple[Dict[str, Any], bool]:
         snapshot = self._snapshot_running_agents()
@@ -7087,6 +7225,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ledger_enabled,
                 mark_delivered,
                 mark_failed,
+                mark_attempting,
+                renew_claim,
                 sweep_recoverable,
             )
 
@@ -7122,12 +7262,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Platform not connected this boot — leave the row claimed;
                 # attempts cap + stale cutoff bound the retries on later boots.
                 continue
+            claim_token = row["claim_token"]
+            if not mark_attempting(row["obligation_id"], claim_token):
+                logger.warning(
+                    "obligation %s: claim generation changed before send",
+                    row["obligation_id"],
+                )
+                continue
             content = row["content"]
             if row.get("needs_marker"):
                 content = RECOVERED_MARKER + content
             metadata = (
                 {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             )
+            async def _renew_obligation() -> None:
+                while True:
+                    await asyncio.sleep(30)
+                    renewed = await asyncio.to_thread(
+                        renew_claim, row["obligation_id"], claim_token
+                    )
+                    if not renewed:
+                        return
+
+            heartbeat = asyncio.create_task(_renew_obligation())
             try:
                 result = await adapter.send(
                     chat_id=row["chat_id"],
@@ -7140,21 +7297,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     row["obligation_id"], send_err,
                 )
                 result = None
+            finally:
+                heartbeat.cancel()
+                try:
+                    await heartbeat
+                except asyncio.CancelledError:
+                    pass
             try:
                 from gateway.platforms.base import (
                     extract_provider_delivery_proof,
                     provider_delivery_proof_required,
                 )
-                _proof = extract_provider_delivery_proof(result, row["platform"])
+                _proof = extract_provider_delivery_proof(result, adapter)
                 if (
                     result is not None
                     and getattr(result, "success", False)
                     and (
-                        not provider_delivery_proof_required(row["platform"])
+                        not provider_delivery_proof_required(adapter)
                         or _proof is not None
                     )
                 ):
-                    mark_delivered(row["obligation_id"])
+                    mark_delivered(row["obligation_id"], claim_token)
                     redelivered += 1
                     logger.info(
                         "Redelivered recovered final response to %s:%s "
@@ -7163,11 +7326,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         row["obligation_id"], row["attempts"],
                     )
                 else:
+                    _raw = getattr(result, "raw_response", None)
+                    _delivery_state = (
+                        _raw.get("delivery_state")
+                        if isinstance(_raw, dict)
+                        else None
+                    )
                     mark_failed(
                         row["obligation_id"],
+                        claim_token,
                         str(
                             getattr(result, "error", "")
                             or "provider delivery proof missing"
+                        ),
+                        retry_after=getattr(result, "retry_after", None),
+                        ambiguous=bool(
+                            result is None
+                            or getattr(result, "retryable", False) is True
+                            or _delivery_state == "attempted_unverified"
                         ),
                     )
             except Exception:
@@ -22199,17 +22375,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
+                        _edit_result = await _sc.adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
+                        if getattr(_edit_result, "success", False):
+                            response["already_sent"] = True
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
+                        else:
+                            logger.warning(
+                                "Streamed message edit was not confirmed for session %s; normal final delivery remains required.",
+                                session_key or "?",
+                            )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",

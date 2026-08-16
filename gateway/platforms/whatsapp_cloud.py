@@ -200,6 +200,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     syntax). The Baileys adapter does the same.
     """
 
+    DELIVERY_PROOF_KIND = "wamid"
+
     splits_long_messages = True  # send() chunks via truncate_message()
 
     def __init__(self, config: PlatformConfig):
@@ -507,6 +509,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         }
 
         last_message_id: Optional[str] = None
+        accepted_chunk_count = 0
         for idx, chunk in enumerate(chunks):
             payload: Dict[str, Any] = {
                 "messaging_product": "whatsapp",
@@ -522,7 +525,15 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 resp = await self._http_client.post(url, headers=headers, json=payload)
             except Exception as exc:
                 logger.exception("[whatsapp_cloud] send failed")
-                return SendResult(success=False, error=str(exc))
+                return SendResult(
+                    success=False,
+                    error=str(exc),
+                    raw_response=(
+                        {"delivery_state": "attempted_unverified"}
+                        if accepted_chunk_count
+                        else None
+                    ),
+                )
 
             if resp.status_code != 200:
                 # Meta returns structured errors in the body — surface them
@@ -537,15 +548,30 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     resp.status_code,
                     error_msg,
                 )
-                return SendResult(success=False, error=error_msg)
+                return SendResult(
+                    success=False,
+                    error=error_msg,
+                    raw_response=(
+                        {"delivery_state": "attempted_unverified"}
+                        if accepted_chunk_count
+                        else None
+                    ),
+                )
 
             try:
                 data = resp.json()
-                ids = data.get("messages") or []
-                if ids:
-                    last_message_id = ids[0].get("id")
+                ids = data.get("messages") if isinstance(data, dict) else None
+                wamid = ids[0].get("id") if isinstance(ids, list) and ids and isinstance(ids[0], dict) else None
             except Exception:
-                pass
+                wamid = None
+            if not isinstance(wamid, str) or not wamid.startswith("wamid."):
+                return SendResult(
+                    success=False,
+                    error="WhatsApp Cloud accepted the request without a valid wamid delivery proof",
+                    raw_response={"delivery_state": "attempted_unverified"},
+                )
+            last_message_id = wamid
+            accepted_chunk_count += 1
 
         # Remember (chat_id, wamid) -> text so that when the user replies to
         # one of our messages, _build_message_event_from_cloud can resolve the
@@ -1071,10 +1097,16 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         try:
             data = resp.json()
-            ids = data.get("messages") or []
-            wamid = ids[0].get("id") if ids else None
+            ids = data.get("messages") if isinstance(data, dict) else None
+            wamid = ids[0].get("id") if isinstance(ids, list) and ids and isinstance(ids[0], dict) else None
         except Exception:
             wamid = None
+        if not isinstance(wamid, str) or not wamid.startswith("wamid."):
+            return SendResult(
+                success=False,
+                error="WhatsApp Cloud accepted the request without a valid wamid delivery proof",
+                raw_response={"delivery_state": "attempted_unverified"},
+            )
         return SendResult(success=True, message_id=wamid)
 
     async def _send_media_from_path_or_link(

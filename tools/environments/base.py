@@ -181,7 +181,7 @@ def touch_activity_if_due(
 
 
 def ensure_private_directory(path: Path) -> Path:
-    """Create or correct an owner-private directory without following a leaf symlink.
+    """Create an owner-private directory without following any path symlink.
 
     POSIX callers get an exact ``0700`` mode and an owner check through an
     opened directory descriptor, closing the lstat/chmod race. Windows retains
@@ -189,33 +189,77 @@ def ensure_private_directory(path: Path) -> Path:
     """
 
     path = Path(path)
-    if path.is_symlink():
-        raise RuntimeError(f"Refusing symlinked sandbox directory: {path}")
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if path.is_symlink():
-        raise RuntimeError(f"Refusing symlinked sandbox directory: {path}")
-    if not path.is_dir():
-        raise RuntimeError(f"Sandbox path is not a directory: {path}")
 
     if os.name != "posix":
+        if path.is_symlink():
+            raise RuntimeError(f"Refusing symlinked sandbox directory: {path}")
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if path.is_symlink() or not path.is_dir():
+            raise RuntimeError(f"Sandbox path is not a real directory: {path}")
         return path
 
-    flags = os.O_RDONLY
-    flags |= getattr(os, "O_DIRECTORY", 0)
+    absolute = path.absolute()
+    parts = absolute.parts
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise RuntimeError(f"Could not securely open sandbox directory: {path}") from exc
-    try:
-        metadata = os.fstat(descriptor)
+    descriptor = os.open(parts[0], flags)
+
+    def _validate_component(metadata, component_path: Path, *, leaf: bool) -> None:
         if not stat.S_ISDIR(metadata.st_mode):
-            raise RuntimeError(f"Sandbox path is not a directory: {path}")
-        if hasattr(os, "geteuid") and metadata.st_uid != os.geteuid():
-            raise RuntimeError(f"Sandbox directory is not owned by the current user: {path}")
+            raise RuntimeError(
+                f"Sandbox path component is not a directory: {component_path}"
+            )
+        if not hasattr(os, "geteuid"):
+            return
+        euid = os.geteuid()
+        if leaf and metadata.st_uid != euid:
+            raise RuntimeError(
+                f"Sandbox directory is not owned by the current user: {component_path}"
+            )
+        if not leaf and metadata.st_uid not in {0, euid}:
+            raise RuntimeError(f"Sandbox ancestor is not trusted: {component_path}")
+        writable_by_others = bool(metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+        root_sticky = metadata.st_uid == 0 and bool(metadata.st_mode & stat.S_ISVTX)
+        if not leaf and writable_by_others and not root_sticky:
+            raise RuntimeError(
+                f"Sandbox ancestor is writable by another principal: {component_path}"
+            )
+
+    try:
+        _validate_component(os.fstat(descriptor), Path(parts[0]), leaf=False)
+        for index, component in enumerate(parts[1:], start=1):
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                    child = os.open(component, flags, dir_fd=descriptor)
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Could not securely create sandbox directory: {absolute}"
+                    ) from exc
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Refusing symlinked sandbox directory or non-directory path component: "
+                    f"{Path(*parts[:index + 1])}"
+                ) from exc
+            try:
+                _validate_component(
+                    os.fstat(child),
+                    Path(*parts[: index + 1]),
+                    leaf=index == len(parts) - 1,
+                )
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+
+        metadata = os.fstat(descriptor)
+        _validate_component(metadata, absolute, leaf=True)
         os.fchmod(descriptor, 0o700)
         if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o700:
-            raise RuntimeError(f"Sandbox directory is not owner-private: {path}")
+            raise RuntimeError(f"Sandbox directory is not owner-private: {absolute}")
     finally:
         os.close(descriptor)
     return path

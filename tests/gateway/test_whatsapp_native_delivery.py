@@ -92,6 +92,38 @@ async def test_send_tracks_text_chunk_message_ids_in_snake_case_raw_response():
 
 
 @pytest.mark.asyncio
+async def test_send_missing_bridge_message_id_is_attempted_unverified():
+    adapter = _make_adapter()
+    response = MagicMock(status=200)
+    response.json = AsyncMock(return_value={"success": True})
+    adapter._http_session.post = MagicMock(return_value=_AsyncCM(response))
+
+    result = await adapter.send("15551234567", "hello")
+
+    assert result.success is False
+    assert result.raw_response == {"delivery_state": "attempted_unverified"}
+
+
+@pytest.mark.asyncio
+async def test_send_partial_bridge_chunk_failure_is_attempted_unverified():
+    adapter = _make_adapter()
+    first = MagicMock(status=200)
+    first.json = AsyncMock(return_value={"success": True, "messageId": "msg-1"})
+    second = MagicMock(status=500)
+    second.text = AsyncMock(return_value="bridge rejected second chunk")
+    adapter._http_session.post = MagicMock(
+        side_effect=[_AsyncCM(first), _AsyncCM(second)]
+    )
+
+    result = await adapter.send(
+        "15551234567", "x" * (adapter.MAX_MESSAGE_LENGTH + 100)
+    )
+
+    assert result.success is False
+    assert result.raw_response == {"delivery_state": "attempted_unverified"}
+
+
+@pytest.mark.asyncio
 async def test_whatsapp_reply_context_is_structured_not_prerendered():
     adapter = WhatsAppAdapter(
         PlatformConfig(

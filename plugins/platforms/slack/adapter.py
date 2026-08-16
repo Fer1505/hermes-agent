@@ -1851,7 +1851,7 @@ class SlackAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> List[SendResult]:
         """Send a batch of images as a single Slack message with multiple file uploads.
 
         Uses ``files_upload_v2`` with its ``file_uploads`` parameter so all
@@ -1862,29 +1862,33 @@ class SlackAdapter(BasePlatformAdapter):
         The batch limit is 10 file uploads per call (Slack server-side cap).
         """
         if not self._app:
-            return
+            return [
+                SendResult(success=False, error="Slack adapter is not connected")
+                for _image in images
+            ]
         if not images:
-            return
+            return []
 
         try:
             import httpx as _httpx
             from urllib.parse import unquote as _unquote
             from tools.url_safety import is_safe_url as _is_safe_url
         except Exception:
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(chat_id, images, metadata, human_delay)
 
         thread_ts = self._resolve_thread_ts(None, metadata)
 
         CHUNK = 10
         chunks = [images[i : i + CHUNK] for i in range(0, len(images), CHUNK)]
 
+        outcomes: List[SendResult] = []
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
                 await asyncio.sleep(human_delay)
 
             file_uploads: List[Dict[str, Any]] = []
             initial_comment_parts: List[str] = []
+            chunk_outcomes_start = len(outcomes)
             try:
                 async with _httpx.AsyncClient(
                     timeout=30.0, follow_redirects=True
@@ -1899,6 +1903,7 @@ class SlackAdapter(BasePlatformAdapter):
                                 logger.warning(
                                     "[Slack] Skipping missing image: %s", local_path
                                 )
+                                outcomes.append(SendResult(success=False, error="Slack image file not found"))
                                 continue
                             file_uploads.append(
                                 {
@@ -1911,6 +1916,7 @@ class SlackAdapter(BasePlatformAdapter):
                                 logger.warning(
                                     "[Slack] Blocked unsafe image URL in batch"
                                 )
+                                outcomes.append(SendResult(success=False, error="Slack blocked unsafe image URL"))
                                 continue
                             try:
                                 response = await http_client.get(image_url)
@@ -1935,6 +1941,7 @@ class SlackAdapter(BasePlatformAdapter):
                                     safe_url_for_log(image_url),
                                     dl_err,
                                 )
+                                outcomes.append(SendResult(success=False, error=str(dl_err)))
                                 continue
 
                 if not file_uploads:
@@ -1958,8 +1965,12 @@ class SlackAdapter(BasePlatformAdapter):
                     thread_ts=thread_ts,
                 )
                 self._record_uploaded_file_thread(chat_id, thread_ts)
-                _ = result
+                outcomes.extend(
+                    SendResult(success=True, raw_response=result)
+                    for _upload in file_uploads
+                )
             except Exception as e:
+                del outcomes[chunk_outcomes_start:]
                 logger.warning(
                     "[Slack] Multi-image files_upload_v2 failed (chunk %d/%d), falling back to per-image: %s",
                     chunk_idx + 1,
@@ -1967,9 +1978,10 @@ class SlackAdapter(BasePlatformAdapter):
                     e,
                     exc_info=True,
                 )
-                await super().send_multiple_images(
+                outcomes.extend(await super().send_multiple_images(
                     chat_id, chunk, metadata, human_delay=human_delay
-                )
+                ))
+        return outcomes
 
     def _record_uploaded_file_thread(
         self, chat_id: str, thread_ts: Optional[str]

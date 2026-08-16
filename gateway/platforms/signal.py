@@ -255,6 +255,8 @@ def validate_signal_config(config: PlatformConfig) -> bool:
 class SignalAdapter(BasePlatformAdapter):
     """Signal messenger adapter using signal-cli HTTP daemon."""
 
+    DELIVERY_PROOF_KIND = "provider_timestamp"
+
     platform = Platform.SIGNAL
     # Signal has no real edit API for already-sent messages. Mark it explicitly
     # so streaming suppresses the visible cursor instead of leaving a stale tofu
@@ -1181,7 +1183,7 @@ class SignalAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> List[SendResult]:
         """Send a batch of images via chunked Signal RPC calls.
 
         Per-image alt texts are dropped — Signal's send RPC only carries
@@ -1191,7 +1193,7 @@ class SignalAdapter(BasePlatformAdapter):
         the rate-limit scheduler handles inter-batch pacing.
         """
         if not images:
-            return
+            return []
 
         scheduler = get_scheduler()
         logger.info(
@@ -1203,6 +1205,7 @@ class SignalAdapter(BasePlatformAdapter):
         await self._stop_typing_indicator(chat_id)
 
         attachments: List[str] = []
+        outcomes: List[SendResult] = []
         skipped_download = 0
         skipped_missing = 0
         skipped_oversize = 0
@@ -1215,11 +1218,13 @@ class SignalAdapter(BasePlatformAdapter):
                 except Exception as e:
                     logger.warning("Signal: failed to download image %s: %s", image_url, e)
                     skipped_download += 1
+                    outcomes.append(SendResult(success=False, error=str(e)))
                     continue
 
             if not file_path or not Path(file_path).exists():
                 logger.warning("Signal: image file not found for %s", image_url)
                 skipped_missing += 1
+                outcomes.append(SendResult(success=False, error="Signal image file not found"))
                 continue
 
             file_size = Path(file_path).stat().st_size
@@ -1228,6 +1233,7 @@ class SignalAdapter(BasePlatformAdapter):
                     "Signal: image too large (%d bytes), skipping %s", file_size, image_url
                 )
                 skipped_oversize += 1
+                outcomes.append(SendResult(success=False, error="Signal image exceeds attachment limit"))
                 continue
 
             attachments.append(file_path)
@@ -1238,7 +1244,7 @@ class SignalAdapter(BasePlatformAdapter):
                 "(download=%d missing=%d oversize=%d)",
                 len(images), skipped_download, skipped_missing, skipped_oversize,
             )
-            return
+            return outcomes
 
         logger.info(
             "Signal send_multiple_images: %d/%d images valid, sending in chunks",
@@ -1293,6 +1299,14 @@ class SignalAdapter(BasePlatformAdapter):
                                 idx + 1, len(att_batches), n, _rpc_duration,
                                 attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
                             )
+                            outcomes.extend(
+                                SendResult(
+                                    success=True,
+                                    message_id=None,
+                                    raw_response=result,
+                                )
+                                for _attachment in att_batch
+                            )
                         else:
                             logger.error(
                                 "Signal: RPC send failed for batch %d/%d (%d attachments, "
@@ -1310,6 +1324,10 @@ class SignalAdapter(BasePlatformAdapter):
                                 )
                                 await asyncio.sleep(backoff)
                                 continue
+                            outcomes.extend(
+                                SendResult(success=False, error=err_msg)
+                                for _attachment in att_batch
+                            )
                     else:
                         # Assume the server didn't accept the batch, don't deduce tokens
                         logger.error(
@@ -1328,6 +1346,10 @@ class SignalAdapter(BasePlatformAdapter):
                             )
                             await asyncio.sleep(backoff)
                             continue
+                        outcomes.extend(
+                            SendResult(success=False, error="Signal RPC returned no delivery receipt")
+                            for _attachment in att_batch
+                        )
                     break
                 except SignalRateLimitError as e:
                     scheduler.feedback(e.retry_after, n)
@@ -1338,6 +1360,10 @@ class SignalAdapter(BasePlatformAdapter):
                             idx + 1, len(att_batches), n,
                             f"{e.retry_after:.0f}s" if e.retry_after else "unknown",
                         )
+                        outcomes.extend(
+                            SendResult(success=False, error="Signal rate-limit retries exhausted")
+                            for _attachment in att_batch
+                        )
                         break
                     logger.warning(
                         "Signal: rate-limited on batch %d/%d "
@@ -1347,6 +1373,7 @@ class SignalAdapter(BasePlatformAdapter):
                         attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
                         f"{e.retry_after:.0f}s" if e.retry_after else "unknown",
                     )
+        return outcomes
 
     async def _notify_batch_pacing(
         self,
@@ -1412,7 +1439,7 @@ class SignalAdapter(BasePlatformAdapter):
             if not success:
                 return SendResult(success=False, error=err_msg, raw_response=result)
             self._track_sent_timestamp(result)
-            return SendResult(success=True)
+            return SendResult(success=True, raw_response=result)
         return SendResult(success=False, error="RPC send with attachment failed")
 
     async def _send_attachment(
@@ -1454,7 +1481,7 @@ class SignalAdapter(BasePlatformAdapter):
             if not success:
                 return SendResult(success=False, error=err_msg, raw_response=result)
             self._track_sent_timestamp(result)
-            return SendResult(success=True)
+            return SendResult(success=True, raw_response=result)
         return SendResult(success=False, error=f"RPC send {media_label.lower()} failed")
 
     async def send_document(

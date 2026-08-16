@@ -21,7 +21,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
+UPDATE_ID_RESET_IDLE_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_RETENTION_SECONDS = 30 * 24 * 60 * 60
+DEFAULT_MAX_HISTORY_ROWS = 10_000
+MAX_ACTIVE_OR_QUARANTINED_ROWS = 10_000
 _VALID_TRANSPORTS = frozenset({"polling_tls", "webhook_secret"})
 
 
@@ -164,6 +168,7 @@ class TelegramInbox:
                     highest_seen_update_id INTEGER NOT NULL,
                     highest_contiguous_update_id INTEGER NOT NULL,
                     gap_after_update_id INTEGER,
+                    sequence_epoch INTEGER NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY (profile_id, bot_id)
                 );
@@ -223,9 +228,50 @@ class TelegramInbox:
                 CREATE INDEX IF NOT EXISTS telegram_inbox_ready_idx
                 ON telegram_inbox(profile_id, bot_id, state, next_attempt_at, update_id);
 
-                PRAGMA user_version = 1;
+                CREATE TABLE IF NOT EXISTS telegram_inbox_operator_audit (
+                    audit_id TEXT PRIMARY KEY,
+                    profile_id TEXT NOT NULL,
+                    bot_id TEXT NOT NULL,
+                    update_id INTEGER,
+                    action TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    occurred_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS telegram_epoch_history (
+                    profile_id TEXT NOT NULL,
+                    bot_id TEXT NOT NULL,
+                    sequence_epoch INTEGER NOT NULL,
+                    update_id INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL,
+                    archive_id TEXT NOT NULL,
+                    transport TEXT NOT NULL,
+                    provider_sender_id TEXT,
+                    provider_chat_id TEXT,
+                    provider_thread_id TEXT,
+                    received_at REAL NOT NULL,
+                    completed_at REAL NOT NULL,
+                    attempt_count INTEGER NOT NULL,
+                    effect_key TEXT NOT NULL,
+                    effect_state TEXT NOT NULL,
+                    effect_claimed_at REAL,
+                    effect_committed_at REAL,
+                    PRIMARY KEY (profile_id, bot_id, sequence_epoch, update_id),
+                    UNIQUE (profile_id, bot_id, archive_id)
+                );
+
+                PRAGMA user_version = 3;
                 """
             )
+            checkpoint_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(telegram_checkpoints)")
+            }
+            if "sequence_epoch" not in checkpoint_columns:
+                conn.execute(
+                    "ALTER TABLE telegram_checkpoints ADD COLUMN "
+                    "sequence_epoch INTEGER NOT NULL DEFAULT 0"
+                )
 
     @staticmethod
     def _canonical_payload(payload: dict[str, Any]) -> tuple[str, str]:
@@ -233,6 +279,24 @@ class TelegramInbox:
             payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
         )
         return serialized, hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def _cap_operator_audit(self, conn: sqlite3.Connection) -> None:
+        count = conn.execute(
+            """SELECT COUNT(*) FROM telegram_inbox_operator_audit
+               WHERE profile_id=? AND bot_id=?""",
+            (self.profile_id, self.bot_id),
+        ).fetchone()[0]
+        excess = max(0, int(count) - DEFAULT_MAX_HISTORY_ROWS)
+        if excess:
+            conn.execute(
+                """DELETE FROM telegram_inbox_operator_audit
+                   WHERE audit_id IN (
+                     SELECT audit_id FROM telegram_inbox_operator_audit
+                     WHERE profile_id=? AND bot_id=?
+                     ORDER BY occurred_at ASC LIMIT ?
+                   )""",
+                (self.profile_id, self.bot_id, excess),
+            )
 
     @staticmethod
     def _routing_provenance(
@@ -287,7 +351,7 @@ class TelegramInbox:
             raise PermissionError("unauthenticated Telegram update rejected")
 
         normalized: list[
-            tuple[int, str, str, str, str, str | None, str | None, str | None]
+            tuple[int, str, str, str | None, str | None, str | None]
         ] = []
         for payload in updates:
             if not isinstance(payload, dict):
@@ -296,18 +360,12 @@ class TelegramInbox:
             if isinstance(raw_id, bool) or not isinstance(raw_id, int) or raw_id < 0:
                 raise ValueError("Telegram update_id must be a non-negative integer")
             serialized, digest = self._canonical_payload(payload)
-            effect_key = f"telegram:{self.profile_id}:{self.bot_id}:{raw_id}"
-            archive_id = hashlib.sha256(
-                f"{effect_key}:{digest}".encode("utf-8")
-            ).hexdigest()
             sender_id, chat_id, thread_id = self._routing_provenance(payload)
             normalized.append(
                 (
                     raw_id,
                     serialized,
                     digest,
-                    effect_key,
-                    archive_id,
                     sender_id,
                     chat_id,
                     thread_id,
@@ -324,16 +382,11 @@ class TelegramInbox:
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                for (
-                    update_id,
-                    payload_json,
-                    digest,
-                    effect_key,
-                    archive_id,
-                    sender_id,
-                    chat_id,
-                    thread_id,
-                ) in sorted(normalized):
+                epoch = self._prepare_sequence_epoch(
+                    conn, [item[0] for item in normalized], now
+                )
+                existing_digests: dict[int, str] = {}
+                for update_id, _payload_json, digest, *_provenance in normalized:
                     existing = conn.execute(
                         """SELECT payload_sha256 FROM telegram_inbox
                            WHERE profile_id=? AND bot_id=? AND update_id=?
@@ -363,10 +416,50 @@ class TelegramInbox:
                         ),
                     ).fetchone()
                     if existing is not None:
-                        if existing["payload_sha256"] != digest:
+                        existing_digest = str(existing["payload_sha256"])
+                        if existing_digest != digest:
                             raise ValueError(
                                 f"Telegram update_id {update_id} payload changed on replay"
                             )
+                        existing_digests[update_id] = existing_digest
+
+                active_count = conn.execute(
+                    """SELECT
+                         (SELECT COUNT(*) FROM telegram_inbox
+                          WHERE profile_id=? AND bot_id=?) +
+                         (SELECT COUNT(*) FROM telegram_dead_letters
+                          WHERE profile_id=? AND bot_id=?) +
+                         (SELECT COUNT(*) FROM telegram_archive
+                          WHERE profile_id=? AND bot_id=?) +
+                         (SELECT COUNT(*) FROM telegram_epoch_history
+                          WHERE profile_id=? AND bot_id=?)""",
+                    (
+                        self.profile_id, self.bot_id,
+                        self.profile_id, self.bot_id,
+                        self.profile_id, self.bot_id,
+                        self.profile_id, self.bot_id,
+                    ),
+                ).fetchone()[0]
+                novel_count = len(normalized) - len(existing_digests)
+                if int(active_count) + novel_count > MAX_ACTIVE_OR_QUARANTINED_ROWS:
+                    raise RuntimeError(
+                        "Telegram durable inbox capacity reached; owner review required"
+                    )
+                for (
+                    update_id,
+                    payload_json,
+                    digest,
+                    sender_id,
+                    chat_id,
+                    thread_id,
+                ) in sorted(normalized):
+                    effect_key = (
+                        f"telegram:{self.profile_id}:{self.bot_id}:{epoch}:{update_id}"
+                    )
+                    archive_id = hashlib.sha256(
+                        f"{effect_key}:{digest}".encode("utf-8")
+                    ).hexdigest()
+                    if update_id in existing_digests:
                         continue
                     conn.execute(
                         """INSERT INTO telegram_inbox
@@ -390,12 +483,110 @@ class TelegramInbox:
                         ),
                     )
                     inserted += 1
-                self._update_checkpoint(conn, [item[0] for item in normalized], now)
+                if inserted:
+                    self._update_checkpoint(
+                        conn, [item[0] for item in normalized], now, epoch=epoch
+                    )
                 conn.commit()
             except BaseException:
                 conn.rollback()
                 raise
         return inserted
+
+    def _prepare_sequence_epoch(
+        self,
+        conn: sqlite3.Connection,
+        update_ids: list[int],
+        now: float,
+    ) -> int:
+        """Rotate Telegram's update-id namespace after documented long idle.
+
+        Telegram may choose a random update_id after at least one week without
+        updates. A lower id is therefore a new epoch, not necessarily a replay.
+        Rotation removes the old bounded history only after its inactivity
+        window and records an operator-audit event before accepting the new id.
+        """
+        row = conn.execute(
+            """SELECT highest_seen_update_id, updated_at, sequence_epoch
+               FROM telegram_checkpoints WHERE profile_id=? AND bot_id=?""",
+            (self.profile_id, self.bot_id),
+        ).fetchone()
+        if row is None:
+            return 0
+        epoch = int(row["sequence_epoch"] or 0)
+        reset = (
+            now - float(row["updated_at"]) >= UPDATE_ID_RESET_IDLE_SECONDS
+            and min(update_ids) < int(row["highest_seen_update_id"])
+        )
+        if not reset:
+            return epoch
+        unresolved = conn.execute(
+            """SELECT
+                 (SELECT COUNT(*) FROM telegram_inbox
+                  WHERE profile_id=? AND bot_id=?) +
+                 (SELECT COUNT(*) FROM telegram_dead_letters
+                  WHERE profile_id=? AND bot_id=?)""",
+            (
+                self.profile_id,
+                self.bot_id,
+                self.profile_id,
+                self.bot_id,
+            ),
+        ).fetchone()[0]
+        if int(unresolved):
+            raise RuntimeError(
+                "Telegram update_id epoch reset blocked by unresolved inbox or "
+                "quarantine records; owner review required"
+            )
+        audit_id = uuid.uuid4().hex
+        conn.execute(
+            """INSERT INTO telegram_inbox_operator_audit
+               (audit_id,profile_id,bot_id,update_id,action,reason,occurred_at)
+               VALUES (?,?,?,?,?,?,?)""",
+            (
+                audit_id,
+                self.profile_id,
+                self.bot_id,
+                min(update_ids),
+                "sequence_epoch_reset",
+                "provider update_id reset after at least seven days idle",
+                now,
+            ),
+        )
+        self._cap_operator_audit(conn)
+        # The active v1 tables cannot share update_id primary keys across
+        # epochs. Preserve every committed payload and receipt in immutable
+        # epoch history before clearing only the active namespace.
+        conn.execute(
+            """INSERT INTO telegram_epoch_history
+               (profile_id,bot_id,sequence_epoch,update_id,payload_json,
+                payload_sha256,archive_id,transport,provider_sender_id,
+                provider_chat_id,provider_thread_id,received_at,completed_at,
+                attempt_count,effect_key,effect_state,effect_claimed_at,
+                effect_committed_at)
+               SELECT a.profile_id,a.bot_id,?,a.update_id,a.payload_json,
+                      a.payload_sha256,a.archive_id,a.transport,
+                      a.provider_sender_id,a.provider_chat_id,
+                      a.provider_thread_id,a.received_at,a.completed_at,
+                      a.attempt_count,a.effect_key,
+                      COALESCE(e.state,'committed'),e.claimed_at,e.committed_at
+               FROM telegram_archive a
+               LEFT JOIN telegram_effects e
+                 ON e.profile_id=a.profile_id AND e.bot_id=a.bot_id
+                AND e.effect_key=a.effect_key
+               WHERE a.profile_id=? AND a.bot_id=?""",
+            (epoch, self.profile_id, self.bot_id),
+        )
+        for table in ("telegram_effects", "telegram_archive"):
+            conn.execute(
+                f"DELETE FROM {table} WHERE profile_id=? AND bot_id=?",
+                (self.profile_id, self.bot_id),
+            )
+        conn.execute(
+            "DELETE FROM telegram_checkpoints WHERE profile_id=? AND bot_id=?",
+            (self.profile_id, self.bot_id),
+        )
+        return epoch + 1
 
     def persist_update(
         self, payload: dict[str, Any], *, transport: str, authenticated: bool
@@ -407,7 +598,12 @@ class TelegramInbox:
         )
 
     def _update_checkpoint(
-        self, conn: sqlite3.Connection, update_ids: list[int], now: float
+        self,
+        conn: sqlite3.Connection,
+        update_ids: list[int],
+        now: float,
+        *,
+        epoch: int,
     ) -> None:
         row = conn.execute(
             """SELECT highest_seen_update_id, highest_contiguous_update_id
@@ -450,12 +646,13 @@ class TelegramInbox:
         conn.execute(
             """INSERT INTO telegram_checkpoints
                (profile_id,bot_id,highest_seen_update_id,highest_contiguous_update_id,
-                gap_after_update_id,updated_at) VALUES (?,?,?,?,?,?)
+                gap_after_update_id,updated_at,sequence_epoch) VALUES (?,?,?,?,?,?,?)
                ON CONFLICT(profile_id,bot_id) DO UPDATE SET
                  highest_seen_update_id=excluded.highest_seen_update_id,
                  highest_contiguous_update_id=excluded.highest_contiguous_update_id,
                  gap_after_update_id=excluded.gap_after_update_id,
-                 updated_at=excluded.updated_at""",
+                 updated_at=excluded.updated_at,
+                 sequence_epoch=excluded.sequence_epoch""",
             (
                 self.profile_id,
                 self.bot_id,
@@ -463,6 +660,7 @@ class TelegramInbox:
                 contiguous,
                 gap_after,
                 now,
+                epoch,
             ),
         )
 
@@ -823,8 +1021,20 @@ class TelegramInbox:
                 conn.rollback()
                 raise
 
-    def replay_dead_letter(self, update_id: int) -> bool:
-        """Move one operator-selected dead letter back to the durable inbox."""
+    def replay_dead_letter(
+        self,
+        update_id: int,
+        *,
+        reason: str,
+        confirmation: str,
+    ) -> bool:
+        """Owner-confirm and audit one ambiguity-accepting replay."""
+        reason = str(reason).strip()
+        expected = f"REPLAY:{int(update_id)}"
+        if not reason:
+            raise ValueError("operator replay reason is required")
+        if confirmation != expected:
+            raise PermissionError(f"confirmation must exactly equal {expected}")
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -882,6 +1092,21 @@ class TelegramInbox:
                        WHERE profile_id=? AND bot_id=? AND update_id=?""",
                     (self.profile_id, self.bot_id, int(update_id)),
                 )
+                conn.execute(
+                    """INSERT INTO telegram_inbox_operator_audit
+                       (audit_id,profile_id,bot_id,update_id,action,reason,occurred_at)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (
+                        uuid.uuid4().hex,
+                        self.profile_id,
+                        self.bot_id,
+                        int(update_id),
+                        "owner_confirmed_replay",
+                        reason[:500],
+                        float(self._clock()),
+                    ),
+                )
+                self._cap_operator_audit(conn)
                 conn.commit()
                 return True
             except BaseException:
@@ -889,7 +1114,10 @@ class TelegramInbox:
                 raise
 
     def prune_archive(self, *, retention_seconds: float, limit: int = 1000) -> int:
-        cutoff = float(self._clock()) - max(0.0, float(retention_seconds))
+        cutoff = float(self._clock()) - max(
+            UPDATE_ID_RESET_IDLE_SECONDS,
+            max(0.0, float(retention_seconds)),
+        )
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -900,6 +1128,29 @@ class TelegramInbox:
                         ORDER BY completed_at LIMIT ?)""",
                     (self.profile_id, self.bot_id, cutoff, max(1, int(limit))),
                 )
+                conn.execute(
+                    """DELETE FROM telegram_effects
+                       WHERE profile_id=? AND bot_id=? AND state='committed'
+                         AND committed_at<?
+                         AND NOT EXISTS (
+                           SELECT 1 FROM telegram_archive a
+                           WHERE a.profile_id=telegram_effects.profile_id
+                             AND a.bot_id=telegram_effects.bot_id
+                             AND a.effect_key=telegram_effects.effect_key
+                         )""",
+                    (self.profile_id, self.bot_id, cutoff),
+                )
+                conn.execute(
+                    """DELETE FROM telegram_epoch_history
+                       WHERE profile_id=? AND bot_id=? AND completed_at<?""",
+                    (self.profile_id, self.bot_id, cutoff),
+                )
+                conn.execute(
+                    """DELETE FROM telegram_inbox_operator_audit
+                       WHERE profile_id=? AND bot_id=? AND occurred_at<?""",
+                    (self.profile_id, self.bot_id, cutoff),
+                )
+                self._cap_operator_audit(conn)
                 conn.commit()
                 return max(0, int(cursor.rowcount))
             except BaseException:
@@ -910,24 +1161,78 @@ class TelegramInbox:
         with closing(self._connect()) as conn:
             row = conn.execute(
                 """SELECT highest_seen_update_id,highest_contiguous_update_id,
-                          gap_after_update_id,updated_at
+                          gap_after_update_id,updated_at,sequence_epoch
                    FROM telegram_checkpoints WHERE profile_id=? AND bot_id=?""",
                 (self.profile_id, self.bot_id),
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def quarantine_count(self) -> int:
+        with closing(self._connect()) as conn:
+            return int(
+                conn.execute(
+                    """SELECT COUNT(*) FROM telegram_dead_letters
+                       WHERE profile_id=? AND bot_id=?""",
+                    (self.profile_id, self.bot_id),
+                ).fetchone()[0]
+            )
+
+    def list_dead_letters(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT update_id,failed_at,attempt_count,last_error,
+                          payload_sha256,provider_chat_id,provider_thread_id
+                   FROM telegram_dead_letters
+                   WHERE profile_id=? AND bot_id=?
+                   ORDER BY failed_at DESC LIMIT ?""",
+                (self.profile_id, self.bot_id, max(1, min(1000, int(limit)))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def audit_operator_action(
+        self,
+        action: str,
+        *,
+        reason: str,
+        update_id: int | None = None,
+    ) -> None:
+        reason = str(reason).strip()
+        if not reason:
+            raise ValueError("operator audit reason is required")
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """INSERT INTO telegram_inbox_operator_audit
+                   (audit_id,profile_id,bot_id,update_id,action,reason,occurred_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (
+                    uuid.uuid4().hex,
+                    self.profile_id,
+                    self.bot_id,
+                    update_id,
+                    str(action)[:100],
+                    reason[:500],
+                    float(self._clock()),
+                ),
+            )
+            self._cap_operator_audit(conn)
+
     def record(self, update_id: int) -> dict[str, Any] | None:
         """Return one queryable inbox/archive/dead-letter record for audit/replay."""
         with closing(self._connect()) as conn:
-            for state, table in (
-                ("inbox", "telegram_inbox"),
-                ("archive", "telegram_archive"),
-                ("dead_letter", "telegram_dead_letters"),
+            for state, table, extra_columns in (
+                ("inbox", "telegram_inbox", ",attempt_count,last_error"),
+                ("archive", "telegram_archive", ""),
+                (
+                    "dead_letter",
+                    "telegram_dead_letters",
+                    ",attempt_count,last_error",
+                ),
             ):
                 row = conn.execute(
                     f"""SELECT update_id,payload_json,payload_sha256,archive_id,
                                transport,provider_sender_id,provider_chat_id,
                                provider_thread_id,received_at,effect_key
+                               {extra_columns}
                         FROM {table}
                         WHERE profile_id=? AND bot_id=? AND update_id=?""",
                     (self.profile_id, self.bot_id, int(update_id)),
@@ -947,6 +1252,8 @@ class TelegramInbox:
                 ("archive", "telegram_archive"),
                 ("dead_letter", "telegram_dead_letters"),
                 ("effects", "telegram_effects"),
+                ("epoch_history", "telegram_epoch_history"),
+                ("operator_audit", "telegram_inbox_operator_audit"),
             ):
                 result[name] = int(
                     conn.execute(

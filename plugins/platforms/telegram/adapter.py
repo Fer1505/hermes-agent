@@ -641,6 +641,8 @@ class TelegramAdapter(BasePlatformAdapter):
     - Media messages
     """
 
+    DELIVERY_PROOF_KIND = "message_id"
+
     # Telegram message limits
     MAX_MESSAGE_LENGTH = 4096
     supports_code_blocks = True  # Telegram MarkdownV2 renders fenced code blocks
@@ -722,6 +724,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._bot: Optional[Bot] = None
         self._webhook_mode: bool = False
         self._telegram_inbox = None
+        self._inbox_quarantine_count: int = 0
         self._inbound_transport: str = "polling_tls"
         self._durable_update_queue: Optional[_DurableTelegramUpdateQueue] = None
         self._deferred_inbox_update_ids: set[int] = set()
@@ -2486,12 +2489,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 # Duplicate provider delivery, an active lease, or an already
                 # archived/dead-lettered update. All are intentionally no-op.
                 return None
-            # Fence before invoking any Telegram callback. Callback-query ACKs,
-            # downloads, busy-session notices, runner tools, and final sends
-            # may all be externally visible. The later base-runner fence is an
-            # idempotent verification of this same durable receipt.
-            if not self._ensure_telegram_inbox().begin_effects([claim]):
-                return None
             effect_context_token = _INBOX_EFFECT_CONTEXT.set(claim)
             try:
                 result = await callback(update, context)
@@ -2500,10 +2497,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     claim,
                     _redact_telegram_error_text(exc),
                     max_attempts=5,
-                    retry_delay=1.0,
+                    retry_delay=min(60.0, float(2 ** max(0, claim.attempt - 1))),
                 )
                 if disposition == "retry":
-                    self._schedule_inbox_retry()
+                    self._schedule_inbox_retry(
+                        min(60.0, float(2 ** max(0, claim.attempt - 1)))
+                    )
                 raise
             finally:
                 _INBOX_EFFECT_CONTEXT.reset(effect_context_token)
@@ -2520,9 +2519,9 @@ class TelegramAdapter(BasePlatformAdapter):
         update_id = getattr(update, "update_id", None)
         logger.debug("[%s] Ignoring unsupported Telegram update %s", self.name, update_id)
 
-    def _schedule_inbox_retry(self) -> None:
+    def _schedule_inbox_retry(self, delay: float) -> None:
         async def _retry_ready() -> None:
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(max(0.0, min(60.0, float(delay))))
             if not self._app or not self._durable_update_queue:
                 return
             for payload in self._ensure_telegram_inbox().recoverable():
@@ -2567,7 +2566,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if current is not None:
             claims.append(current)
             seen.add(int(current.update_id))
-        for update_id in event.metadata.get("telegram_inbox_update_ids", []):
+        metadata = getattr(event, "metadata", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        for update_id in metadata.get("telegram_inbox_update_ids", []):
             update_id = int(update_id)
             claim = self._deferred_inbox_claims.get(update_id)
             if claim is not None and update_id not in seen:
@@ -2579,10 +2580,10 @@ class TelegramAdapter(BasePlatformAdapter):
         claims = self._inbound_effect_claims(event)
         if not claims:
             return True
-        # `_durable_handler` fenced every claim before entering the Telegram
-        # callback. Reaching the base runner with those claims is therefore a
-        # verification boundary, not a second database claim attempt.
-        return True
+        # This is the last durable boundary immediately before invoking the
+        # agent/command callback, which may issue tools or provider sends.
+        # Exceptions before this point remain safely retryable.
+        return self._ensure_telegram_inbox().begin_effects(claims)
 
     async def _finish_inbound_effect(
         self,
@@ -2601,10 +2602,24 @@ class TelegramAdapter(BasePlatformAdapter):
                         claim,
                         _redact_telegram_error_text(error or "downstream effect failed"),
                         max_attempts=5,
-                        retry_delay=1.0,
+                        retry_delay=min(60.0, float(2 ** max(0, claim.attempt - 1))),
                     )
                     if disposition == "retry":
-                        self._schedule_inbox_retry()
+                        self._schedule_inbox_retry(
+                            min(60.0, float(2 ** max(0, claim.attempt - 1)))
+                        )
+                    elif disposition == "dead_letter":
+                        self._inbox_quarantine_count = self._ensure_telegram_inbox().quarantine_count()
+                        self._write_runtime_status_safe(
+                            "telegram_inbox_quarantine",
+                            gateway_state="degraded",
+                            platform_state="degraded",
+                            error_code="telegram_inbox_ambiguous",
+                            error_message=(
+                                f"{self._inbox_quarantine_count} Telegram update(s) "
+                                "quarantined after an ambiguous downstream effect"
+                            ),
+                        )
             finally:
                 self._deferred_inbox_claims.pop(int(claim.update_id), None)
                 self._deferred_inbox_update_ids.discard(int(claim.update_id))
@@ -2622,6 +2637,14 @@ class TelegramAdapter(BasePlatformAdapter):
             return 0
         inbox = self._ensure_telegram_inbox()
         inbox.requeue_inflight()
+        self._inbox_quarantine_count = inbox.quarantine_count()
+        if self._inbox_quarantine_count:
+            logger.error(
+                "[%s] Telegram durable inbox degraded: %d quarantined update(s); "
+                "inspect with `hermes telegram-inbox list`",
+                self.name,
+                self._inbox_quarantine_count,
+            )
         recovered = inbox.recoverable()
         for payload in recovered:
             update = Update.de_json(payload, self._app.bot)
@@ -4325,6 +4348,17 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
             
             self._mark_connected()
+            if self._inbox_quarantine_count:
+                self._write_runtime_status_safe(
+                    "telegram_inbox_startup_quarantine",
+                    gateway_state="degraded",
+                    platform_state="degraded",
+                    error_code="telegram_inbox_ambiguous",
+                    error_message=(
+                        f"{self._inbox_quarantine_count} Telegram update(s) "
+                        "require owner review"
+                    ),
+                )
             mode = "webhook" if self._webhook_mode else "polling"
             logger.info("[%s] Connected to Telegram (%s mode)", self.name, mode)
 
@@ -6447,6 +6481,12 @@ class TelegramAdapter(BasePlatformAdapter):
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
         """Handle inline keyboard button clicks."""
+        # Callback handlers directly acknowledge/edit provider messages and
+        # resolve local approval/clarify state. Fence the durable update before
+        # any of those non-idempotent effects. A failure after this point is
+        # quarantined by ``_durable_handler`` and is never provider-replayed.
+        if not await self._begin_inbound_effect(update):
+            raise RuntimeError("Telegram callback durable effect claim failed")
         query = update.callback_query
         if not query or not query.data:
             return
@@ -7069,7 +7109,7 @@ class TelegramAdapter(BasePlatformAdapter):
         images: List[tuple],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> List[SendResult]:
         """Send a batch of images natively via Telegram's media group API.
 
         Telegram's ``send_media_group`` bundles up to 10 photos/videos into
@@ -7082,9 +7122,12 @@ class TelegramAdapter(BasePlatformAdapter):
         the base adapter's per-image loop.
         """
         if not self._bot:
-            return
+            return [
+                SendResult(success=False, error="Not connected")
+                for _image in images
+            ]
         if not images:
-            return
+            return []
 
         try:
             from telegram import InputMediaPhoto
@@ -7093,8 +7136,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[%s] InputMediaPhoto unavailable, falling back to per-image send: %s",
                 self.name, exc,
             )
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(chat_id, images, metadata, human_delay)
 
         # Peel off animations — they need send_animation, not send_media_group
         animations: List[tuple] = []
@@ -7106,13 +7148,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 photos.append((image_url, alt_text))
 
         # Animations: route through the base default (per-image send_animation)
+        outcomes: List[SendResult] = []
         if animations:
-            await super().send_multiple_images(
+            outcomes.extend(await super().send_multiple_images(
                 chat_id, animations, metadata, human_delay=human_delay,
-            )
+            ))
 
         if not photos:
-            return
+            return outcomes
 
         from urllib.parse import unquote as _unquote
         _thread = self._metadata_thread_id(metadata)
@@ -7167,7 +7210,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         except Exception:
                             pass
 
-                await self._send_with_dm_topic_reply_anchor_retry(
+                sent_messages = await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_media_group,
                     {
                         "chat_id": normalize_telegram_chat_id(chat_id),
@@ -7181,6 +7224,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     "media group",
                     reset_media=_reset_opened_files,
                 )
+                if not isinstance(sent_messages, (list, tuple)) or not sent_messages:
+                    outcomes.append(
+                        SendResult(success=False, error="Telegram media group returned no message ids")
+                    )
+                else:
+                    outcomes.extend(
+                        SendResult(success=True, message_id=str(message.message_id))
+                        for message in sent_messages
+                        if getattr(message, "message_id", None) is not None
+                    )
             except Exception as e:
                 logger.warning(
                     "[%s] send_media_group failed (chunk %d/%d), falling back to per-image: %s",
@@ -7188,15 +7241,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
                 # Fallback: send each photo in this chunk individually
-                await super().send_multiple_images(
+                outcomes.extend(await super().send_multiple_images(
                     chat_id, chunk, metadata, human_delay=human_delay,
-                )
+                ))
             finally:
                 for fh in opened_files:
                     try:
                         fh.close()
                     except Exception:
                         pass
+        return outcomes
 
     async def send_image_file(
         self,

@@ -310,6 +310,54 @@ class TestSendText:
         assert result.success is False
         assert "boom" in result.error
 
+    @pytest.mark.asyncio
+    async def test_later_chunk_rejection_is_attempted_unverified(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            side_effect=[
+                _mock_httpx_response(200, {"messages": [{"id": "wamid.first"}]}),
+                _mock_httpx_response(
+                    400, {"error": {"message": "rejected", "code": 100}}
+                ),
+            ]
+        )
+
+        result = await adapter.send("15551234567", "a" * 8500)
+
+        assert result.success is False
+        assert result.raw_response == {"delivery_state": "attempted_unverified"}
+
+    @pytest.mark.asyncio
+    async def test_later_chunk_exception_is_attempted_unverified(self):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            side_effect=[
+                _mock_httpx_response(200, {"messages": [{"id": "wamid.first"}]}),
+                RuntimeError("connection lost after accepted prefix"),
+            ]
+        )
+
+        result = await adapter.send("15551234567", "a" * 8500)
+
+        assert result.success is False
+        assert "connection lost" in result.error
+        assert result.raw_response == {"delivery_state": "attempted_unverified"}
+
+
+def test_http_200_without_exact_wamid_is_attempted_unverified():
+    for body in ({}, {"messages": []}, {"messages": [{"id": "not-a-wamid"}]}):
+        adapter = _make_adapter()
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(200, body)
+        )
+        result = asyncio.run(adapter.send("15551234567", "hi"))
+        assert result.success is False
+        assert "valid wamid" in result.error
+        assert result.raw_response == {"delivery_state": "attempted_unverified"}
+
 
 # ---------------------------------------------------------------------------
 # Inbound webhook verify (GET) handshake

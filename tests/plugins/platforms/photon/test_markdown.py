@@ -91,6 +91,23 @@ async def test_sidecar_send_omits_format_when_disabled(
 
 
 @pytest.mark.asyncio
+async def test_sidecar_success_without_message_id_is_attempted_unverified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+
+    async def _missing_receipt(_path: str, _body: Dict[str, Any]) -> Dict[str, Any]:
+        return {"ok": True}
+
+    adapter._sidecar_call = _missing_receipt  # type: ignore[assignment]
+
+    result = await adapter.send("+15551234567", "hello")
+
+    assert result.success is False
+    assert result.raw_response == {"delivery_state": "attempted_unverified"}
+
+
+@pytest.mark.asyncio
 async def test_standalone_send_includes_markdown_format(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

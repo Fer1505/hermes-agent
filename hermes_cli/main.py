@@ -404,6 +404,10 @@ from hermes_cli.subcommands.model import build_model_parser
 from hermes_cli.subcommands.setup import build_setup_parser
 from hermes_cli.subcommands.postinstall import build_postinstall_parser
 from hermes_cli.subcommands.whatsapp import build_whatsapp_parser
+from hermes_cli.subcommands.telegram_inbox import (
+    build_telegram_inbox_parser,
+    cmd_telegram_inbox,
+)
 from hermes_cli.subcommands.slack import build_slack_parser
 from hermes_cli.subcommands.login import build_login_parser
 from hermes_cli.subcommands.logout import build_logout_parser
@@ -13557,6 +13561,9 @@ def main():
     # whatsapp command  (parser built in hermes_cli/subcommands/whatsapp.py)
     # =========================================================================
     build_whatsapp_parser(subparsers, cmd_whatsapp=cmd_whatsapp)
+    build_telegram_inbox_parser(
+        subparsers, cmd_telegram_inbox=cmd_telegram_inbox
+    )
 
     # =========================================================================
     # whatsapp-cloud command (official Meta Cloud API; complement to Baileys)

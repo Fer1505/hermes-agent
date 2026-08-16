@@ -26,6 +26,7 @@ sys.modules.setdefault("telegram.constants", _tg.constants)
 sys.modules.setdefault("telegram.ext", types.ModuleType("telegram.ext"))
 
 from gateway.platforms.base import (
+    BusyMessageDisposition,
     MessageEvent,
     MessageType,
     SessionSource,
@@ -129,7 +130,7 @@ class TestBusySessionAuthBypass:
         )
 
         # Must return True (handled = dropped)
-        assert result is True
+        assert result is BusyMessageDisposition.CONSUMED
         # Must NOT queue the message
         assert sk not in adapter._pending_messages
         # Must NOT interrupt the running agent
@@ -160,7 +161,7 @@ class TestBusySessionAuthBypass:
         )
 
         # Should return True (handled) but message is queued/processed
-        assert result is True
+        assert result is BusyMessageDisposition.QUEUED
         # The message should be merged into pending
         assert sk in adapter._pending_messages
 
@@ -188,7 +189,7 @@ class TestBusySessionAuthBypass:
         )
 
         # Auth check fires before drain logic — dropped
-        assert result is True
+        assert result is BusyMessageDisposition.CONSUMED
         # No drain acknowledgment sent
         adapter._send_with_retry.assert_not_called()
 
@@ -213,7 +214,7 @@ class TestBusySessionAuthBypass:
             runner, event, sk
         )
 
-        assert result is True
+        assert result is BusyMessageDisposition.CONSUMED
         # steer() must NOT have been called with attacker's text
         running_agent.steer.assert_not_called()
         # Nothing queued

@@ -114,6 +114,7 @@ def _normalize_server_url(raw: str) -> str:
 # ---------------------------------------------------------------------------
 
 class BlueBubblesAdapter(BasePlatformAdapter):
+    DELIVERY_PROOF_KIND = "message_id"
     platform = Platform.BLUEBUBBLES
     SUPPORTS_MESSAGE_EDITING = False
     MAX_MESSAGE_LENGTH = MAX_TEXT_LENGTH
@@ -524,7 +525,13 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         try:
             res = await self._api_post("/api/v1/chat/new", payload)
             data = res.get("data") or {}
-            msg_id = data.get("guid") or data.get("messageGuid") or "ok"
+            msg_id = data.get("guid") or data.get("messageGuid")
+            if not msg_id:
+                return SendResult(
+                    success=False,
+                    error="BlueBubbles accepted chat creation without a message identifier",
+                    raw_response={"delivery_state": "attempted_unverified"},
+                )
             return SendResult(success=True, message_id=str(msg_id), raw_response=res)
         except Exception as exc:
             return SendResult(success=False, error=str(exc))
@@ -561,6 +568,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             else:
                 chunks.extend(self.truncate_message(para, max_length=self.MAX_MESSAGE_LENGTH))
         last = SendResult(success=True)
+        accepted_chunks = 0
         for chunk in chunks:
             guid = await self._resolve_chat_guid(chat_id)
             if not guid:
@@ -572,6 +580,11 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 return SendResult(
                     success=False,
                     error=f"BlueBubbles chat not found for target: {chat_id}",
+                    raw_response=(
+                        {"delivery_state": "attempted_unverified"}
+                        if accepted_chunks
+                        else None
+                    ),
                 )
             payload: Dict[str, Any] = {
                 "chatGuid": guid,
@@ -585,12 +598,27 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             try:
                 res = await self._api_post("/api/v1/message/text", payload)
                 data = res.get("data") or {}
-                msg_id = data.get("guid") or data.get("messageGuid") or "ok"
+                msg_id = data.get("guid") or data.get("messageGuid")
+                if not msg_id:
+                    return SendResult(
+                        success=False,
+                        error="BlueBubbles accepted text without a message identifier",
+                        raw_response={"delivery_state": "attempted_unverified"},
+                    )
                 last = SendResult(
                     success=True, message_id=str(msg_id), raw_response=res
                 )
+                accepted_chunks += 1
             except Exception as exc:
-                return SendResult(success=False, error=str(exc))
+                return SendResult(
+                    success=False,
+                    error=str(exc),
+                    raw_response=(
+                        {"delivery_state": "attempted_unverified"}
+                        if accepted_chunks
+                        else None
+                    ),
+                )
         return last
 
     # ------------------------------------------------------------------
@@ -641,6 +669,12 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             if result.get("status") == 200:
                 rdata = result.get("data") or {}
                 msg_id = rdata.get("guid") if isinstance(rdata, dict) else None
+                if not msg_id:
+                    return SendResult(
+                        success=False,
+                        error="BlueBubbles accepted attachment without a message identifier",
+                        raw_response={"delivery_state": "attempted_unverified"},
+                    )
                 return SendResult(
                     success=True, message_id=msg_id, raw_response=result
                 )

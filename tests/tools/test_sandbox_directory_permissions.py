@@ -66,6 +66,29 @@ def test_symlinked_sandbox_leaf_is_rejected_without_changing_target(
     assert _mode(target) == 0o755
 
 
+def test_symlinked_intermediate_component_is_rejected_without_creating_child(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "outside"
+    target.mkdir(mode=0o755)
+    link = tmp_path / "sandbox-parent"
+    link.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="symlinked sandbox directory"):
+        base.ensure_private_directory(link / "docker" / "workspace")
+
+    assert not (target / "docker").exists()
+
+
+def test_nonsticky_world_writable_ancestor_is_rejected(tmp_path: Path) -> None:
+    unsafe = tmp_path / "unsafe-parent"
+    unsafe.mkdir(mode=0o700)
+    unsafe.chmod(0o777)
+
+    with pytest.raises(RuntimeError, match="writable by another principal"):
+        base.ensure_private_directory(unsafe / "private-child")
+
+
 def test_foreign_owned_directory_fails_before_chmod(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -86,7 +109,52 @@ def test_foreign_owned_directory_fails_before_chmod(
     monkeypatch.setattr(base.os, "fstat", foreign_fstat)
     monkeypatch.setattr(base.os, "fchmod", lambda _descriptor, mode: fchmod_calls.append(mode))
 
-    with pytest.raises(RuntimeError, match="not owned by the current user"):
+    with pytest.raises(RuntimeError, match="not trusted|not owned by the current user"):
         base.ensure_private_directory(sandbox)
 
     assert fchmod_calls == []
+
+
+def test_rejected_child_descriptor_is_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sandbox = tmp_path / "foreign-leaf"
+    sandbox.mkdir(mode=0o700)
+    real_open = os.open
+    real_close = os.close
+    real_fstat = os.fstat
+    rejected_fd: list[int] = []
+    closed: list[int] = []
+
+    def tracking_open(component, flags, *args, **kwargs):
+        descriptor = real_open(component, flags, *args, **kwargs)
+        if str(component) == sandbox.name:
+            rejected_fd.append(descriptor)
+        return descriptor
+
+    def foreign_leaf_fstat(descriptor: int):
+        observed = real_fstat(descriptor)
+        if rejected_fd and descriptor == rejected_fd[-1]:
+            return type(
+                "ForeignStat",
+                (),
+                {"st_mode": observed.st_mode, "st_uid": os.geteuid() + 1},
+            )()
+        return observed
+
+    def tracking_close(descriptor: int):
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(base.os, "open", tracking_open)
+    monkeypatch.setattr(base.os, "fstat", foreign_leaf_fstat)
+    monkeypatch.setattr(base.os, "close", tracking_close)
+
+    with pytest.raises(RuntimeError, match="not owned by the current user"):
+        base.ensure_private_directory(sandbox)
+
+    assert rejected_fd
+    assert rejected_fd[-1] in closed
+    with pytest.raises(OSError):
+        real_fstat(rejected_fd[-1])

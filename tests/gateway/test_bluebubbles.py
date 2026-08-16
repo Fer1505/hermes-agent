@@ -104,6 +104,51 @@ class TestBlueBubblesHelpers:
         assert result.success is True
         assert sent == ["first thought", "second thought"]
 
+    @pytest.mark.asyncio
+    async def test_send_missing_message_identifier_is_attempted_unverified(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter(monkeypatch)
+
+        async def fake_resolve_chat_guid(_chat_id):
+            return "iMessage;-;user@example.com"
+
+        async def fake_api_post(_path, _payload):
+            return {"data": {}}
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+
+        result = await adapter.send("user@example.com", "hello")
+
+        assert result.success is False
+        assert result.raw_response == {"delivery_state": "attempted_unverified"}
+
+    @pytest.mark.asyncio
+    async def test_send_partial_chunk_failure_is_attempted_unverified(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter(monkeypatch)
+        calls = 0
+
+        async def fake_resolve_chat_guid(_chat_id):
+            return "iMessage;-;user@example.com"
+
+        async def fake_api_post(_path, _payload):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {"data": {"guid": "msg-1"}}
+            raise RuntimeError("second bubble failed")
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+
+        result = await adapter.send("user@example.com", "first\n\nsecond")
+
+        assert result.success is False
+        assert result.raw_response == {"delivery_state": "attempted_unverified"}
+
     def test_format_message_strips_markdown(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         assert adapter.format_message("**Hello** `world`") == "Hello world"

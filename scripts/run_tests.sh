@@ -65,13 +65,33 @@ else
   exit 1
 fi
 
-
 # ── Live-gateway plugin (computed before we drop env) ───────────────────────
 EXTRA_PYTHONPATH=""
 EXTRA_PYTEST_PLUGINS=""
 if [ -f "$HOME/.hermes/pytest_live_guard.py" ]; then
   EXTRA_PYTHONPATH="$HOME/.hermes"
   EXTRA_PYTEST_PLUGINS="pytest_live_guard"
+fi
+
+# An explicitly named, read-only dependency overlay may be used for functional
+# verification when no single local interpreter is dependency-complete. Do not
+# inherit ambient PYTHONPATH across the clean-env boundary.
+if [ -n "${HERMES_TEST_PYTHONPATH:-}" ]; then
+  if [ -n "$EXTRA_PYTHONPATH" ]; then
+    EXTRA_PYTHONPATH="$HERMES_TEST_PYTHONPATH:$EXTRA_PYTHONPATH"
+  else
+    EXTRA_PYTHONPATH="$HERMES_TEST_PYTHONPATH"
+  fi
+fi
+
+# Validate the canonical suite environment before compile/collection. A
+# partial environment otherwise turns missing plugins and core/adapter imports
+# into thousands of misleading test failures.
+if [ -n "$EXTRA_PYTHONPATH" ]; then
+  PYTHONPATH="$EXTRA_PYTHONPATH" \
+    "$PYTHON" "$SCRIPT_DIR/test_environment_preflight.py" "$@"
+else
+  "$PYTHON" "$SCRIPT_DIR/test_environment_preflight.py" "$@"
 fi
 
 
