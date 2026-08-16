@@ -4393,11 +4393,7 @@ class BasePlatformAdapter(ABC):
             return result
 
         error_str = result.error or ""
-        raw_response = getattr(result, "raw_response", None)
-        if (
-            isinstance(raw_response, dict)
-            and raw_response.get("delivery_state") == "attempted_unverified"
-        ):
+        if self._delivery_attempted_unverified(result):
             # Some provider request (or an earlier chunk) may already have
             # been accepted. Retrying or sending the plain-text fallback here
             # could duplicate it; the delivery ledger/operator path owns this
@@ -4435,6 +4431,13 @@ class BasePlatformAdapter(ABC):
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
+                if self._delivery_attempted_unverified(result):
+                    # A retry can itself accept an early provider chunk before
+                    # losing exact completion proof. That ambiguity is just as
+                    # terminal as it is on the initial attempt: another retry,
+                    # a failure notice, or the plain-text fallback could all
+                    # duplicate the accepted prefix.
+                    return result
                 error_str = result.error or ""
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
@@ -4464,6 +4467,15 @@ class BasePlatformAdapter(ABC):
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
         return fallback_result
+
+    @staticmethod
+    def _delivery_attempted_unverified(result: "SendResult") -> bool:
+        """Whether a send result may already include provider-side effects."""
+        raw_response = getattr(result, "raw_response", None)
+        return bool(
+            isinstance(raw_response, dict)
+            and raw_response.get("delivery_state") == "attempted_unverified"
+        )
 
     @staticmethod
     def _merge_caption(existing_text: Optional[str], new_text: str) -> str:

@@ -206,6 +206,30 @@ class TestSendWithRetryNetworkRetry:
         assert len(adapter._send_calls) == 3
         assert "plain text" in adapter._send_calls[-1][1].lower()
 
+    @pytest.mark.asyncio
+    async def test_retry_attempted_unverified_stops_without_retry_or_fallback(self):
+        """An ambiguous retry may have delivered a prefix and is terminal."""
+        adapter = _StubAdapter()
+        ambiguous = SendResult(
+            success=False,
+            error="later chunk rejected after provider accepted first chunk",
+            retryable=True,
+            raw_response={"delivery_state": "attempted_unverified"},
+        )
+        adapter._send_results = [
+            SendResult(success=False, error="ConnectError", retryable=True),
+            ambiguous,
+            SendResult(success=True, message_id="must-not-send"),
+        ]
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await adapter._send_with_retry(
+                "chat1", "hello", max_retries=3, base_delay=0
+            )
+
+        assert result is ambiguous
+        assert len(adapter._send_calls) == 2
+
 
 # ---------------------------------------------------------------------------
 # _send_with_retry — all retries exhausted → user notification
