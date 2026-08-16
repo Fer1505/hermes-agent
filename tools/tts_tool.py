@@ -58,7 +58,7 @@ from typing import Callable, Dict, Any, Iterator, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 from hermes_cli._subprocess_compat import windows_hide_flags
-from hermes_constants import display_hermes_home
+from hermes_constants import display_hermes_home, get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,73 @@ _TTS_CONTROL_DIRECTIVE = re.compile(
 def _strip_tts_control_directives(text: str) -> str:
     """Remove delivery/control markers that must never be spoken aloud."""
     return _TTS_CONTROL_DIRECTIVE.sub(" ", text)
+
+
+def _path_is_linklike(path: Path) -> bool:
+    """Return whether a path is a symlink or Windows directory junction."""
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    return bool(is_junction and is_junction())
+
+
+def _validated_application_audio_cache() -> Optional[Path]:
+    """Return the exact selected Hermes audio cache when it cannot escape.
+
+    ``HERMES_HOME`` itself may be a symlink, but no component below it may be
+    a symlink or junction.  Only the canonical ``cache/audio`` layout and the
+    contentful legacy ``audio_cache`` layout are eligible.
+    """
+    try:
+        lexical_home = Path(os.path.abspath(get_hermes_home().expanduser()))
+        # Resolve the selected default from the active profile at call time.
+        # ``HERMES_HOME`` is profile-scoped and can legitimately change after
+        # this module is imported (for example in the gateway and test
+        # harnesses), so the import-time display constant is not authoritative.
+        selected = Path(os.path.abspath(Path(_get_default_output_dir()).expanduser()))
+        relative = selected.relative_to(lexical_home)
+        if relative.parts not in {("cache", "audio"), ("audio_cache",)}:
+            return None
+        resolved_home = lexical_home.resolve(strict=False)
+        expected = resolved_home.joinpath(*relative.parts)
+        current = resolved_home
+        for part in relative.parts:
+            current = current / part
+            if current.exists() and _path_is_linklike(current):
+                return None
+        if selected.resolve(strict=False) != expected:
+            return None
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return expected
+
+
+def _prepare_application_audio_cache() -> Optional[Path]:
+    """Create/tighten the selected application cache and revalidate it."""
+    cache_root = _validated_application_audio_cache()
+    if cache_root is None:
+        return None
+    try:
+        cache_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if _validated_application_audio_cache() != cache_root:
+            return None
+        os.chmod(cache_root, 0o700)
+    except OSError:
+        return None
+    return cache_root
+
+
+def _is_application_owned_audio_output(path: Path) -> bool:
+    """Return whether *path* is inside the exact validated default cache."""
+    cache_root = _validated_application_audio_cache()
+    if cache_root is None:
+        return False
+    try:
+        candidate = path.expanduser().resolve(strict=False)
+        candidate.relative_to(cache_root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return candidate != cache_root
 
 
 def _set_private_audio_permissions(path: str) -> None:
@@ -3157,6 +3224,7 @@ def _text_to_speech_single(
     instructions: Optional[str] = None,
     provider: Optional[str] = None,
     tts_config_override: Optional[Dict[str, Any]] = None,
+    _application_owned_output: bool = False,
 ) -> str:
     """Synthesize one provider-safe text chunk and return one final-encoded file.
 
@@ -3241,9 +3309,26 @@ def _text_to_speech_single(
             file_path = _configured_command_tts_output_path(
                 file_path, command_provider_config
             )
-        from agent.file_safety import is_write_approval_required, is_write_denied
+        from agent.file_safety import (
+            ProtectedFileOperation,
+            decide_protected_control_file,
+            is_write_approval_required,
+            is_write_denied,
+        )
 
-        if is_write_denied(str(file_path)) or is_write_approval_required(str(file_path)):
+        application_owned_output = (
+            _application_owned_output
+            and _is_application_owned_audio_output(file_path)
+        )
+        protected_control = not decide_protected_control_file(
+            ProtectedFileOperation.WRITE,
+            file_path,
+        ).allowed
+        if (
+            protected_control
+            or (not application_owned_output and is_write_denied(str(file_path)))
+            or is_write_approval_required(str(file_path))
+        ):
             return json.dumps({
                 "success": False,
                 "error": (
@@ -3253,8 +3338,12 @@ def _text_to_speech_single(
             }, ensure_ascii=False)
     else:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        out_dir = Path(DEFAULT_OUTPUT_DIR)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = _prepare_application_audio_cache()
+        if out_dir is None:
+            return tool_error(
+                "Default audio cache is not an owner-private, non-link path under the active Hermes home",
+                success=False,
+            )
         if command_provider_config is not None:
             fmt = _get_command_tts_output_format(command_provider_config)
             file_path = out_dir / f"tts_{timestamp}.{fmt}"
@@ -3589,6 +3678,7 @@ def text_to_speech_tool(
     delivery_profile = _resolve_audio_delivery_profile(platform, tts_config)
 
     # Determine output path (single-chunk short-circuit uses the final path).
+    application_owned_output = output_path is None
     if output_path:
         from tools.path_security import has_traversal_component
         if has_traversal_component(output_path):
@@ -3616,8 +3706,12 @@ def text_to_speech_tool(
             }, ensure_ascii=False)
     else:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        out_dir = Path(DEFAULT_OUTPUT_DIR)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = _prepare_application_audio_cache()
+        if out_dir is None:
+            return tool_error(
+                "Default audio cache is not an owner-private, non-link path under the active Hermes home",
+                success=False,
+            )
         if command_provider_config is not None:
             fmt = _get_command_tts_output_format(command_provider_config)
             base_path = out_dir / f"tts_{timestamp}.{fmt}"
@@ -3647,6 +3741,7 @@ def text_to_speech_tool(
                 instructions=instructions,
                 provider=provider,
                 tts_config_override=tts_config,
+                _application_owned_output=application_owned_output,
             )
             try:
                 chunk_result = json.loads(raw_result)
