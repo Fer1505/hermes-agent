@@ -736,6 +736,17 @@ memory:
   # For exit/reset, only fires if the session had at least this many user turns.
   flush_min_turns: 6        # Min user turns to trigger flush on exit/reset (0 = disabled)
 
+  # Optional external-provider containment and durable write-mirror bounds.
+  provider_prefetch_timeout_seconds: 5.0
+  provider_circuit_cooldown_seconds: 30.0
+  provider_circuit_failure_threshold: 3
+  provider_write_outbox_enabled: true
+  provider_write_outbox_max_entries: 1000
+  provider_write_outbox_max_bytes: 8388608
+  provider_write_outbox_max_age_seconds: 604800
+  provider_write_outbox_retry_base_seconds: 1.0
+  provider_write_outbox_retry_max_seconds: 300.0
+
 # =============================================================================
 # Session Reset Policy (Messaging Platforms)
 # =============================================================================

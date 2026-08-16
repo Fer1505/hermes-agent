@@ -1,4 +1,9 @@
-"""DingTalk Device Flow authorization."""
+"""DingTalk Device Flow authorization.
+
+The official registration portal currently uses DingTalk's OpenClaw-branded
+onboarding template. Hermes discloses that provenance to the operator while
+keeping the source value overrideable for future portal contracts.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +23,7 @@ REGISTRATION_BASE_URL = os.environ.get(
     "DINGTALK_REGISTRATION_BASE_URL", "https://oapi.dingtalk.com"
 ).rstrip("/")
 
-REGISTRATION_SOURCE = os.environ.get("DINGTALK_REGISTRATION_SOURCE", "hermes")
+REGISTRATION_SOURCE = os.environ.get("DINGTALK_REGISTRATION_SOURCE", "openClaw")
 
 
 # ── API helpers ────────────────────────────────────────────────────────────
@@ -224,6 +229,8 @@ def dingtalk_qr_auth() -> Optional[Tuple[str, str]]:
 
     print()
     print_info("  Initializing DingTalk device authorization...")
+    print_info("  Note: the scan page is branded 'OpenClaw' — DingTalk's")
+    print_info("        ecosystem onboarding bridge. Safe to use.")
 
     try:
         reg = begin_registration()

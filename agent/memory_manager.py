@@ -31,8 +31,10 @@ import logging
 import re
 import inspect
 import threading
+import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -48,6 +50,17 @@ logger = logging.getLogger(__name__)
 # running past this window dies with the interpreter.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+_DEFAULT_CIRCUIT_COOLDOWN_S = 30.0
+_DEFAULT_CIRCUIT_FAILURE_THRESHOLD = 3
+
+
+@dataclass
+class _ProviderRecallState:
+    """Manager-owned failure and circuit state for one provider."""
+
+    consecutive_failures: int = 0
+    circuit_open_until: float = 0.0
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
@@ -375,6 +388,9 @@ class MemoryManager:
         self,
         *,
         external_prefetch_timeout: Optional[float] = None,
+        prefetch_timeout_s: Optional[float] = None,
+        circuit_cooldown_s: float = _DEFAULT_CIRCUIT_COOLDOWN_S,
+        circuit_failure_threshold: int = _DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
         write_outbox_enabled: bool = True,
         write_outbox_max_entries: int = 1000,
         write_outbox_max_bytes: int = 8 * 1024 * 1024,
@@ -385,15 +401,28 @@ class MemoryManager:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
+        if external_prefetch_timeout is not None and prefetch_timeout_s is not None:
+            raise ValueError(
+                "external_prefetch_timeout and prefetch_timeout_s are aliases; "
+                "set only one"
+            )
+        configured_prefetch_timeout = (
+            prefetch_timeout_s
+            if prefetch_timeout_s is not None
+            else external_prefetch_timeout
+        )
         self._external_prefetch_timeout = (
             _EXTERNAL_PREFETCH_TIMEOUT_S
-            if external_prefetch_timeout is None
-            else float(external_prefetch_timeout)
+            if configured_prefetch_timeout is None
+            else float(configured_prefetch_timeout)
         )
         if self._external_prefetch_timeout <= 0:
             raise ValueError("external_prefetch_timeout must be positive")
         self._external_prefetch_threads: Dict[str, threading.Thread] = {}
         self._external_prefetch_lock = threading.Lock()
+        self._provider_recall_states: Dict[str, _ProviderRecallState] = {}
+        self._circuit_cooldown_s = max(0.0, float(circuit_cooldown_s))
+        self._circuit_failure_threshold = max(1, int(circuit_failure_threshold))
         self._write_outbox_enabled = bool(write_outbox_enabled)
         self._write_outbox_max_entries = max(1, int(write_outbox_max_entries))
         self._write_outbox_max_bytes = max(1024, int(write_outbox_max_bytes))
@@ -459,6 +488,7 @@ class MemoryManager:
             self._has_external = True
 
         self._providers.append(provider)
+        self._provider_recall_states.setdefault(provider.name, _ProviderRecallState())
 
         # Core tool names are reserved — a memory provider must never register
         # a tool that shadows a built-in (e.g. ``clarify``, ``delegate_task``).
@@ -583,6 +613,19 @@ class MemoryManager:
         if provider.name == "builtin":
             return provider.prefetch(query, session_id=session_id)
 
+        state = self._provider_recall_states.setdefault(
+            provider.name, _ProviderRecallState()
+        )
+        now = time.monotonic()
+        with state.lock:
+            if now < state.circuit_open_until:
+                logger.debug(
+                    "Memory provider '%s' recall circuit open for %.2fs; skipping",
+                    provider.name,
+                    state.circuit_open_until - now,
+                )
+                return ""
+
         result_box: Dict[str, str] = {}
         error_box: Dict[str, Exception] = {}
 
@@ -617,9 +660,20 @@ class MemoryManager:
 
         thread.join(self._external_prefetch_timeout)
         if thread.is_alive():
+            with state.lock:
+                # A timed-out call is inherently ambiguous and remains in
+                # flight. Open immediately, regardless of the ordinary error
+                # threshold, so no further recall calls accumulate behind it.
+                state.consecutive_failures = max(
+                    state.consecutive_failures + 1,
+                    self._circuit_failure_threshold,
+                )
+                state.circuit_open_until = (
+                    time.monotonic() + self._circuit_cooldown_s
+                )
             logger.warning(
-                "Memory provider '%s' prefetch timed out after %.1fs; skipping it until "
-                "the stuck call returns",
+                "Memory provider '%s' prefetch timed out after %.1fs; recall "
+                "circuit opened",
                 provider.name,
                 self._external_prefetch_timeout,
             )
@@ -629,7 +683,16 @@ class MemoryManager:
             if self._external_prefetch_threads.get(provider.name) is thread:
                 self._external_prefetch_threads.pop(provider.name, None)
         if error_box:
+            with state.lock:
+                state.consecutive_failures += 1
+                if state.consecutive_failures >= self._circuit_failure_threshold:
+                    state.circuit_open_until = (
+                        time.monotonic() + self._circuit_cooldown_s
+                    )
             raise error_box["value"]
+        with state.lock:
+            state.consecutive_failures = 0
+            state.circuit_open_until = 0.0
         return result_box.get("value", "")
 
     def describe_recall(self) -> str:
@@ -667,9 +730,23 @@ class MemoryManager:
     def provider_health(self) -> Dict[str, Dict[str, Any]]:
         """Return bounded provider and durable-write health metadata."""
         health: Dict[str, Dict[str, Any]] = {}
+        now = time.monotonic()
         for provider in self._providers:
+            recall_state = self._provider_recall_states.setdefault(
+                provider.name, _ProviderRecallState()
+            )
+            with self._external_prefetch_lock:
+                inflight = self._external_prefetch_threads.get(provider.name)
+                prefetch_inflight = bool(inflight and inflight.is_alive())
+            with recall_state.lock:
+                recall_health = {
+                    "prefetch_inflight": prefetch_inflight,
+                    "consecutive_failures": recall_state.consecutive_failures,
+                    "circuit_open": now < recall_state.circuit_open_until,
+                }
             provider_health: Dict[str, Any] = {
                 "available": bool(provider.is_available()),
+                **recall_health,
                 "memory_write_delivery": self._provider_memory_write_delivery_contract(
                     provider
                 ),
@@ -707,6 +784,13 @@ class MemoryManager:
 
         def _run() -> None:
             for provider in providers:
+                if provider.name != "builtin":
+                    state = self._provider_recall_states.setdefault(
+                        provider.name, _ProviderRecallState()
+                    )
+                    with state.lock:
+                        if time.monotonic() < state.circuit_open_until:
+                            continue
                 try:
                     provider.queue_prefetch(clean_query, session_id=session_id)
                 except Exception as e:

@@ -53,6 +53,24 @@ def test_canonical_scope_preflights_canonical_dependency_set(monkeypatch):
     }
 
 
+def test_wecom_xml_dependency_is_canonical_and_explicitly_focused_gated(
+    monkeypatch,
+):
+    def fake_import(name):
+        if name == "defusedxml":
+            raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr(preflight.importlib, "import_module", fake_import)
+
+    assert preflight.missing_requirements("focused") == []
+    assert (
+        "defusedxml",
+        "wecom",
+        "defusedxml",
+        "ModuleNotFoundError",
+    ) in preflight.missing_requirements("canonical")
+
+
 def test_invalid_scope_fails_closed():
     import pytest
 

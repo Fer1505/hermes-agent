@@ -1779,7 +1779,35 @@ def init_agent(
             if _mem_provider_name and _mem_provider_name.strip():
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+                agent._memory_manager = _MemoryManager(
+                    prefetch_timeout_s=mem_config.get(
+                        "provider_prefetch_timeout_seconds", 5.0
+                    ),
+                    circuit_cooldown_s=mem_config.get(
+                        "provider_circuit_cooldown_seconds", 30.0
+                    ),
+                    circuit_failure_threshold=mem_config.get(
+                        "provider_circuit_failure_threshold", 3
+                    ),
+                    write_outbox_enabled=mem_config.get(
+                        "provider_write_outbox_enabled", True
+                    ),
+                    write_outbox_max_entries=mem_config.get(
+                        "provider_write_outbox_max_entries", 1000
+                    ),
+                    write_outbox_max_bytes=mem_config.get(
+                        "provider_write_outbox_max_bytes", 8 * 1024 * 1024
+                    ),
+                    write_outbox_max_age_seconds=mem_config.get(
+                        "provider_write_outbox_max_age_seconds", 7 * 24 * 60 * 60
+                    ),
+                    write_outbox_retry_base_seconds=mem_config.get(
+                        "provider_write_outbox_retry_base_seconds", 1.0
+                    ),
+                    write_outbox_retry_max_seconds=mem_config.get(
+                        "provider_write_outbox_retry_max_seconds", 300.0
+                    ),
+                )
                 _mp = _load_mem(_mem_provider_name)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)

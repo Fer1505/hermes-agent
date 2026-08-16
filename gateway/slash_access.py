@@ -170,20 +170,18 @@ def _keys_for_scope(scope: str) -> Tuple[str, str]:
 def policy_from_extra(extra: dict, scope: str) -> SlashAccessPolicy:
     """Build a policy from a platform's ``extra`` dict for one scope.
 
-    Admin identity is platform-wide: the historical ``allow_admin_from`` key and
-    the group-specific compatibility key both feed the same admin set. That keeps
-    DM and group lanes from disagreeing about who is an operator. Command
-    allowlists remain scope-specific, except that DM scope falls back to the group
-    command list when the DM command list is unset. That preserves the common
-    configuration where operators list the same regular-user commands once.
+    DM scope falls back to group scope keys ONLY for ``user_allowed_commands``
+    when the DM scope didn't specify its own. This keeps the common case
+    (operator wants the same command set DM and group) ergonomic without
+    forcing duplication. Admin lists are NOT cross-scope: an admin in
+    DMs is not implicitly an admin in a group.
     """
-    cmd_key = _keys_for_scope(scope)[1]
-    admin_ids = _coerce_id_list(extra.get("allow_admin_from")) | _coerce_id_list(
-        extra.get("group_allow_admin_from")
-    )
-    if scope == "dm" and cmd_key not in extra:
-        cmd_key = "group_user_allowed_commands"
+    admin_key, cmd_key = _keys_for_scope(scope)
+    admin_ids = _coerce_id_list(extra.get(admin_key))
     cmds = _coerce_command_list(extra.get(cmd_key))
+
+    if scope == "dm" and not cmds:
+        cmds = _coerce_command_list(extra.get("group_user_allowed_commands"))
 
     enabled = bool(admin_ids)
     return SlashAccessPolicy(

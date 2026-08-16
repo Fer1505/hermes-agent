@@ -48,4 +48,4 @@ jobs:
         run: npm ci
 
       - name: Run JavaScript CI gate
-        run: npm run ci:js
+        run: npm run check

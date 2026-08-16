@@ -5,6 +5,11 @@ from xml.etree import ElementTree as ET
 
 import pytest
 
+pytest.importorskip(
+    "defusedxml",
+    reason="WeCom callback XML hardening requires the declared [wecom] extra",
+)
+
 from gateway.config import PlatformConfig
 from plugins.platforms.wecom.callback_adapter import WecomCallbackAdapter
 from plugins.platforms.wecom.wecom_crypto import WXBizMsgCrypt
@@ -197,5 +202,4 @@ class TestWecomCallbackBodySizeLimit:
         oversized = b"<xml>" + b"A" * (_MAX_BODY + 1) + b"</xml>"
         response = await adapter._handle_callback(self._request(oversized))
         assert response.status == 413
-
 

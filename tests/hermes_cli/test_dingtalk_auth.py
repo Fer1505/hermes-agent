@@ -55,13 +55,19 @@ class TestBeginRegistration:
                 "interval": 2,
             },
         ]
-        with patch("hermes_cli.dingtalk_auth._api_post", side_effect=responses):
+        with patch(
+            "hermes_cli.dingtalk_auth._api_post", side_effect=responses
+        ) as api_post:
             result = begin_registration()
 
         assert result["device_code"] == "dev-xyz"
         assert "verification_uri_complete" in result
         assert result["interval"] == 2
         assert result["expires_in"] == 7200
+        assert api_post.call_args_list[0].args == (
+            "/app/registration/init",
+            {"source": "openClaw"},
+        )
 
     def test_missing_nonce_raises(self):
         from hermes_cli.dingtalk_auth import begin_registration, RegistrationError
@@ -165,5 +171,4 @@ class TestConfigOverrides:
         import hermes_cli.dingtalk_auth as mod
         importlib.reload(mod)
         assert mod.REGISTRATION_BASE_URL == "https://oapi.dingtalk.com"
-
 

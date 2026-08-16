@@ -269,7 +269,10 @@ class TestMemoryManager:
 
 
     def test_external_prefetch_timeout_skips_stuck_provider(self):
-        mgr = MemoryManager(external_prefetch_timeout=0.01)
+        mgr = MemoryManager(
+            external_prefetch_timeout=0.01,
+            circuit_cooldown_s=60.0,
+        )
         builtin = FakeMemoryProvider("builtin")
         builtin._prefetch_result = "builtin memory"
         external = BlockingPrefetchProvider("hy-memory")
@@ -293,6 +296,7 @@ class TestMemoryManager:
         assert result == "builtin memory"
         assert elapsed < 0.2
         assert external.prefetch_queries == ["query"]
+        assert mgr.provider_health()["hy-memory"]["circuit_open"] is True
 
         external.release.set()
 
@@ -304,11 +308,53 @@ class TestMemoryManager:
         ):
             time.sleep(0.01)
 
+        # Simulate the cooldown elapsing after the stuck daemon exits.
+        mgr._provider_recall_states[external.name].circuit_open_until = 0.0
         result = mgr.prefetch_all("query 3")
 
         assert result == "builtin memory\n\nlate external memory"
         assert external.prefetch_queries == ["query", "query 3"]
         assert external.name not in mgr._external_prefetch_threads
+
+    def test_external_prefetch_error_opens_circuit_and_success_resets_health(self):
+        mgr = MemoryManager(
+            prefetch_timeout_s=0.2,
+            circuit_cooldown_s=60.0,
+            circuit_failure_threshold=2,
+        )
+        provider = FakeMemoryProvider("unstable")
+        calls = []
+
+        def _prefetch(query, *, session_id=""):
+            calls.append((query, session_id))
+            if len(calls) <= 2:
+                raise RuntimeError("provider offline")
+            return "recovered memory"
+
+        provider.prefetch = _prefetch
+        mgr.add_provider(provider)
+
+        assert mgr.prefetch_all("one", session_id="s") == ""
+        first = mgr.provider_health()["unstable"]
+        assert first["consecutive_failures"] == 1
+        assert first["circuit_open"] is False
+
+        assert mgr.prefetch_all("two", session_id="s") == ""
+        opened = mgr.provider_health()["unstable"]
+        assert opened["consecutive_failures"] == 2
+        assert opened["circuit_open"] is True
+
+        assert mgr.prefetch_all("suppressed", session_id="s") == ""
+        assert calls == [("one", "s"), ("two", "s")]
+        mgr.queue_prefetch_all("also suppressed", session_id="s")
+        assert mgr.flush_pending(timeout=1.0)
+        assert provider.queued_prefetches == []
+
+        mgr._provider_recall_states["unstable"].circuit_open_until = 0.0
+        assert mgr.prefetch_all("three", session_id="s") == "recovered memory"
+        recovered = mgr.provider_health()["unstable"]
+        assert recovered["consecutive_failures"] == 0
+        assert recovered["circuit_open"] is False
 
 
 

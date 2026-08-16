@@ -505,17 +505,15 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
       keep those rows.
     * Children of deleted parents are orphaned, not cascade-deleted.
 
-    Like the single-session ``DELETE /api/sessions/{id}`` endpoint
-    below, this doesn't pass a ``sessions_dir`` through — the on-disk
-    transcript / request-dump cleanup is wired at the CLI/agent layer
-    but the web server historically leaves file cleanup to the next
-    prune-on-startup pass. Matching that pre-existing trade-off keeps
-    the two delete endpoints' DB-vs-disk behaviour consistent.
+    Primary rows and profile-scoped artifacts are deleted together; a
+    transient filesystem failure remains in the durable purge queue.
     """
     def _delete() -> int:
         db = _open_session_db_for_profile(profile, read_only=False)
         try:
-            return db.delete_empty_sessions()
+            return db.delete_empty_sessions(
+                sessions_dir=_sessions_dir_for_profile(profile)
+            )
         finally:
             db.close()
 
@@ -675,7 +673,9 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
             sid = db.resolve_session_id(session_id)
             if not sid:
                 return {"ok": True, "already_absent": True}
-            db.delete_session(sid)
+            db.delete_session(
+                sid, sessions_dir=_sessions_dir_for_profile(profile)
+            )
             return {"ok": True}
         finally:
             db.close()

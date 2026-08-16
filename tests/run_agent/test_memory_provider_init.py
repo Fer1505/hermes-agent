@@ -94,6 +94,73 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
     assert "status_callback" not in provider.init_kwargs
 
 
+def test_aiagent_wires_memory_recall_and_outbox_profile_config():
+    provider = RecordingMemoryProvider()
+    captured = {}
+    cfg = {
+        "memory": {
+            "provider": "recording",
+            "provider_prefetch_timeout_seconds": 1.25,
+            "provider_circuit_cooldown_seconds": 9.5,
+            "provider_circuit_failure_threshold": 4,
+            "provider_write_outbox_enabled": False,
+            "provider_write_outbox_max_entries": 17,
+            "provider_write_outbox_max_bytes": 4096,
+            "provider_write_outbox_max_age_seconds": 90,
+            "provider_write_outbox_retry_base_seconds": 0.25,
+            "provider_write_outbox_retry_max_seconds": 4.0,
+        },
+        "agent": {},
+    }
+
+    class RecordingManager:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.providers = []
+
+        def add_provider(self, memory_provider):
+            self.providers.append(memory_provider)
+
+        def initialize_all(self, **kwargs):
+            return len(self.providers)
+
+        def get_all_tool_schemas(self):
+            return []
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("agent.memory_manager.MemoryManager", RecordingManager),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+        )
+
+    assert agent._memory_manager is not None
+    assert captured == {
+        "prefetch_timeout_s": 1.25,
+        "circuit_cooldown_s": 9.5,
+        "circuit_failure_threshold": 4,
+        "write_outbox_enabled": False,
+        "write_outbox_max_entries": 17,
+        "write_outbox_max_bytes": 4096,
+        "write_outbox_max_age_seconds": 90,
+        "write_outbox_retry_base_seconds": 0.25,
+        "write_outbox_retry_max_seconds": 4.0,
+    }
+
+
 class CoreShadowProvider:
     """Provider that tries to register tools shadowing built-in core tools."""
 
@@ -134,5 +201,4 @@ def test_core_tool_names_rejected_from_memory_routing_table():
     assert "clarify" not in schema_names
     assert "delegate_task" not in schema_names
     assert "honcho_search" in schema_names
-
 

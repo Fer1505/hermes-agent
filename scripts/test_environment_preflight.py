@@ -21,9 +21,10 @@ REQUIRED_IMPORTS = (
     ("aiohttp", "messaging", "aiohttp"),
     ("httpx", "core", "httpx[socks]"),
     ("aiosqlite", "matrix", "aiosqlite"),
+    ("defusedxml", "wecom", "defusedxml"),
 )
 
-FOCUSED_EXCLUDED_IMPORTS = frozenset({"mcp", "aiosqlite"})
+FOCUSED_EXCLUDED_IMPORTS = frozenset({"mcp", "aiosqlite", "defusedxml"})
 
 
 def selected_requirements(scope: str) -> tuple[tuple[str, str, str], ...]:
@@ -60,7 +61,8 @@ def main() -> int:
     if not missing:
         if scope == "focused":
             print(
-                "notice: focused Hermes preflight excludes mcp and aiosqlite; "
+                "notice: focused Hermes preflight excludes mcp, aiosqlite, "
+                "and defusedxml; "
                 "this is partial functional evidence, not canonical suite parity.",
                 file=sys.stderr,
             )

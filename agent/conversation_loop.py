@@ -898,6 +898,30 @@ _EMPTY_TOOL_RESPONSE_NUDGE = (
     "results above and continue with the task."
 )
 
+_EMPTY_RESPONSE_CONTEXT_RETRY_LIMIT = 3
+_EMPTY_RESPONSE_TURN_RETRY_LIMIT = 6
+
+
+def _claim_empty_response_retry(
+    agent: Any,
+    *,
+    truly_empty: bool,
+    has_structured: bool,
+    prefill_exhausted: bool,
+) -> bool:
+    """Atomically consume one per-context and whole-turn empty retry slot."""
+    total = int(getattr(agent, "_empty_content_retries_total", 0) or 0)
+    if not (
+        truly_empty
+        and (not has_structured or prefill_exhausted)
+        and agent._empty_content_retries < _EMPTY_RESPONSE_CONTEXT_RETRY_LIMIT
+        and total < _EMPTY_RESPONSE_TURN_RETRY_LIMIT
+    ):
+        return False
+    agent._empty_content_retries += 1
+    agent._empty_content_retries_total = total + 1
+    return True
+
 
 # Shared recovery hint appended to every content-policy refusal message. Both
 # the HTTP-200 refusal path (``finish_reason=content_filter``) and the
@@ -7246,8 +7270,12 @@ def run_conversation(
                         _has_structured
                         and agent._thinking_prefill_retries >= 2
                     )
-                    if _truly_empty and (not _has_structured or _prefill_exhausted) and agent._empty_content_retries < 3:
-                        agent._empty_content_retries += 1
+                    if _claim_empty_response_retry(
+                        agent,
+                        truly_empty=_truly_empty,
+                        has_structured=_has_structured,
+                        prefill_exhausted=_prefill_exhausted,
+                    ):
                         wait_time = jittered_backoff(
                             agent._empty_content_retries,
                             base_delay=5.0,
@@ -7255,8 +7283,11 @@ def run_conversation(
                         )
                         logger.warning(
                             "Empty response (no content or reasoning) — "
-                            "retry %d/3 in %.1fs (model=%s)",
-                            agent._empty_content_retries, wait_time, agent.model,
+                            "retry %d/3 (turn total %d/6) in %.1fs (model=%s)",
+                            agent._empty_content_retries,
+                            agent._empty_content_retries_total,
+                            wait_time,
+                            agent.model,
                         )
                         agent._buffer_status(
                             f"⚠️ Empty response from model — retrying "

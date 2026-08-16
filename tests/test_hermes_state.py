@@ -710,12 +710,12 @@ class TestFTS5Search:
         db.append_message("s1", role="user", content="after")
 
         statements = []
-        read_conn = db._get_read_conn() or db._conn
-        traced_connections = [db._conn]
-        if read_conn is not db._conn:
-            traced_connections.append(read_conn)
-        for conn in traced_connections:
-            conn.set_trace_callback(statements.append)
+        # This assertion is about projection query shape, not WAL pooling.
+        # Route the test through the stable writer connection so a pooled
+        # connection checked out after instrumentation cannot hide statements.
+        wal_active = db._wal_active
+        db._wal_active = False
+        db._conn.set_trace_callback(statements.append)
 
         def context_query_count():
             normalized = (" ".join(sql.upper().split()) for sql in statements)
@@ -740,8 +740,8 @@ class TestFTS5Search:
             assert default[0]["context"]
             assert context_query_count() == 2
         finally:
-            for conn in traced_connections:
-                conn.set_trace_callback(None)
+            db._conn.set_trace_callback(None)
+            db._wal_active = wal_active
 
     def test_sanitize_fts5_query_strips_dangerous_chars(self):
         """Unit test for _sanitize_fts5_query static method."""
@@ -2561,6 +2561,8 @@ class TestAutoMaintenance:
         # Transcript files mimicking real gateway/CLI layout
         (sessions_dir / "old1.json").write_text("{}")
         (sessions_dir / "old1.jsonl").write_text("{}\n")
+        (sessions_dir / "session_old1.json").write_text("{}")
+        (sessions_dir / "session_old1.jsonl").write_text("{}\n")
         (sessions_dir / "old2.jsonl").write_text("{}\n")
         (sessions_dir / "request_dump_old1_001.json").write_text("{}")
         (sessions_dir / "new.jsonl").write_text("{}\n")  # active, must survive
@@ -2573,10 +2575,105 @@ class TestAutoMaintenance:
         # Pruned transcript files are gone
         assert not (sessions_dir / "old1.json").exists()
         assert not (sessions_dir / "old1.jsonl").exists()
+        assert not (sessions_dir / "session_old1.json").exists()
+        assert not (sessions_dir / "session_old1.jsonl").exists()
         assert not (sessions_dir / "old2.jsonl").exists()
         assert not (sessions_dir / "request_dump_old1_001.json").exists()
         # Active session's transcript is untouched
         assert (sessions_dir / "new.jsonl").exists()
+
+    def test_file_purge_failure_survives_restart_and_replays(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "state.db"
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        artifact = sessions_dir / "session_retry-me.json"
+        artifact.write_text("sensitive")
+        original = SessionDB._remove_session_artifacts
+
+        first = SessionDB(db_path=db_path)
+        first.create_session(session_id="retry-me", source="cli")
+        monkeypatch.setattr(
+            SessionDB,
+            "_remove_session_artifacts",
+            staticmethod(lambda _root, _component: ["simulated:PermissionError"]),
+        )
+        assert first.delete_session("retry-me", sessions_dir=sessions_dir)
+        queued = first._conn.execute(
+            "SELECT attempts, last_error FROM session_file_purges "
+            "WHERE session_id = ?",
+            ("retry-me",),
+        ).fetchone()
+        assert queued is not None
+        assert queued["attempts"] >= 1
+        assert "PermissionError" in queued["last_error"]
+        assert artifact.exists()
+        first.close()
+
+        monkeypatch.setattr(
+            SessionDB, "_remove_session_artifacts", staticmethod(original)
+        )
+        second = SessionDB(db_path=db_path)
+        try:
+            assert second.get_session("retry-me") is None
+            assert not artifact.exists()
+            assert second.drain_session_file_purges(sessions_dir) == {
+                "queued": 0,
+                "completed": 0,
+                "pending": 0,
+            }
+        finally:
+            second.close()
+
+    def test_corrupt_queue_component_cannot_escape_sessions_directory(
+        self, db, tmp_path
+    ):
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        outside = tmp_path / "outside.json"
+        outside.write_text("preserve")
+        db._conn.execute(
+            "INSERT INTO session_file_purges "
+            "(session_id, safe_component, enqueued_at) VALUES (?, ?, ?)",
+            ("legitimate", "../../outside", time.time()),
+        )
+        db._conn.commit()
+
+        assert db.drain_session_file_purges(sessions_dir) == {
+            "queued": 1,
+            "completed": 1,
+            "pending": 0,
+        }
+        assert outside.read_text() == "preserve"
+
+    def test_auto_maintenance_retries_purge_even_when_db_sweep_is_throttled(
+        self, db, tmp_path, monkeypatch
+    ):
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        self._make_old_ended(db, "retry-on-skip", days_old=100)
+        artifact = sessions_dir / "retry-on-skip.jsonl"
+        artifact.write_text("sensitive")
+        original = db._remove_session_artifacts
+        monkeypatch.setattr(
+            db,
+            "_remove_session_artifacts",
+            lambda _root, _component: ["simulated:PermissionError"],
+        )
+        first = db.maybe_auto_prune_and_vacuum(
+            retention_days=90, sessions_dir=sessions_dir
+        )
+        assert first["pruned"] == 1
+        assert first["file_purges_pending"] == 1
+
+        monkeypatch.setattr(db, "_remove_session_artifacts", original)
+        second = db.maybe_auto_prune_and_vacuum(
+            retention_days=90, sessions_dir=sessions_dir
+        )
+        assert second["skipped"] is True
+        assert second["file_purges_pending"] == 0
+        assert not artifact.exists()
 
 
 
