@@ -1765,6 +1765,20 @@ def restore_primary_runtime(agent) -> bool:
             "Primary runtime restored for new turn: %s (%s)",
             agent.model, agent.provider,
         )
+        # Fallback transparency (operator directive 2026-08-19): a fallback
+        # switch is announced to the user, so the switch BACK must be too —
+        # otherwise the user can't tell whether replies are still coming from
+        # the degraded model. One-shot, and only when this session actually
+        # announced a fallback (a restore after a silent, never-activated
+        # chain reset must stay silent).
+        if getattr(agent, "_fallback_switch_announced", False):
+            agent._fallback_switch_announced = False
+            try:
+                agent._emit_status(
+                    f"✅ Back on the default model: {agent.model} via {agent.provider}"
+                )
+            except Exception:
+                pass
         return True
     except Exception as e:
         logger.warning("Failed to restore primary runtime: %s", e)

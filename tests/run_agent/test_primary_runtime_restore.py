@@ -155,6 +155,35 @@ class TestRestorePrimaryRuntime:
         assert agent.model == original_model
         assert agent.provider == original_provider
 
+    def test_restore_announces_return_to_default_after_announced_fallback(self):
+        """Fallback transparency (2026-08-19): an announced switch to the
+        fallback model must be followed by an announced switch back."""
+        agent = _make_agent(
+            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+        )
+        mock_client = _mock_resolve()
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
+            agent._try_activate_fallback()
+        assert getattr(agent, "_fallback_switch_announced", False) is True
+
+        emitted = []
+        agent._emit_status = emitted.append
+        with patch("run_agent.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+        assert any("Back on the default model" in m for m in emitted)
+        # one-shot: flag cleared, a second restore cycle stays silent
+        assert agent._fallback_switch_announced is False
+
+    def test_silent_reset_does_not_announce_restore(self):
+        """A chain reset with no announced fallback must not claim a return."""
+        agent = _make_agent(
+            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+        )
+        emitted = []
+        agent._emit_status = emitted.append
+        assert agent._restore_primary_runtime() is False
+        assert emitted == []
+
     def test_resets_fallback_index(self):
         """After restore, the full fallback chain should be available again."""
         agent = _make_agent(

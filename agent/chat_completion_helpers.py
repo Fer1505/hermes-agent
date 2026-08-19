@@ -2824,6 +2824,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             f"🔄 Switched to fallback model: {old_model} via {old_provider} "
             f"→ {fb_model} via {fb_provider}"
         )
+        # Mark the switch as user-announced (the notice above surfaces on the
+        # success path; on terminal failure the buffered trace is flushed, so
+        # the user sees it either way). restore_primary_runtime uses this to
+        # announce the switch back to the default model — fallback service is
+        # never silent in either direction (operator directive 2026-08-19).
+        agent._fallback_switch_announced = True
         logger.info(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,
