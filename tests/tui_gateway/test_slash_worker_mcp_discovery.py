@@ -16,23 +16,35 @@ import time
 import pytest
 import yaml
 
-pytest.importorskip("mcp.server.fastmcp")
+_mcp_server_mod = pytest.importorskip("mcp.server")
+
+if not hasattr(_mcp_server_mod, "MCPServer"):
+    # `mcp.server.MCPServer` replaced `mcp.server.fastmcp.FastMCP` in mcp 2.0.
+    # Skip rather than fail on a FastMCP-era SDK: the probe below is written
+    # against the 2.x API, and the pinned version provides it.
+    pytest.skip(
+        "profile-local MCP discovery probe requires mcp >= 2.0 (MCPServer)",
+        allow_module_level=True,
+    )
 
 
 def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     profile_home = tmp_path / "profile-home"
     profile_home.mkdir()
     marker = "profile-local-61922"
-    server = tmp_path / "fastmcp_probe.py"
+    server = tmp_path / "mcp_probe.py"
+    # Ephemeral-port HTTP probe (NOT stdio like upstream): the Olympus fork
+    # gates stdio MCP servers behind operator authorization, so this test
+    # exercises discovery through the ungated streamable-http path.
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     server.write_text(
         textwrap.dedent(
             f"""
-            from mcp.server.fastmcp import FastMCP
+            from mcp.server import MCPServer
 
-            mcp = FastMCP("profileprobe", host="127.0.0.1", port={port})
+            mcp = MCPServer("profileprobe", host="127.0.0.1", port={port})
 
             @mcp.tool()
             def hermes_61922_profile_probe() -> str:
