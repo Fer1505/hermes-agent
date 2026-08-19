@@ -2327,8 +2327,6 @@ def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> 
 # Used as a fallback when the live probe fails (no token, network error).
 # Longest keys first so substring match picks the most specific entry.
 _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
-    # Verified against the authenticated Codex /models catalog on 2026-07-12.
-    "gpt-5.6-sol": 372_000,
     "gpt-5.1-codex-max": 272_000,
     "gpt-5.1-codex-mini": 272_000,
     "gpt-5.3-codex": 272_000,
@@ -2340,7 +2338,11 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
     "gpt-5.3-codex-spark": 128_000,
     "gpt-5.2-codex": 272_000,
     "gpt-5.4-mini": 272_000,
-    "gpt-5.6-sol": 372_000,
+    # The catalog advertised 372K for sol during July 2026 (the fork pinned
+    # that at the time), then moved back to 272K — trust the current
+    # advertisement here; the verified-above-advertised table below restores
+    # the live-proven 900K exactly when this stale 272K is what resolves.
+    "gpt-5.6-sol": 272_000,
     "gpt-5.6-terra": 272_000,
     "gpt-5.6-luna": 272_000,
     "gpt-5.5": 272_000,
