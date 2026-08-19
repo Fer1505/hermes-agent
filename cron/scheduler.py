@@ -630,6 +630,99 @@ def _bad_human_facing_cron_output_reason(
     return None
 
 
+_STYLE_GATE_DEFAULT_CEILING = 3000  # chars; Olympus ">3k chars → attachment" rule
+_STYLE_GATE_TAKEAWAY_TARGET = 300   # keep accumulating paragraphs until this
+_STYLE_GATE_TAKEAWAY_LIMIT = 700    # hard cap for the takeaway
+
+
+def _cron_outbound_length_ceiling(job: dict) -> int:
+    """Resolve the outbound chat-length ceiling for one job.
+
+    Per-job ``outbound_length_ceiling`` wins, then config
+    ``cron.outbound_length_ceiling``, then the default. 0 disables the gate.
+    """
+    raw = job.get("outbound_length_ceiling")
+    if raw is None:
+        try:
+            cfg = load_config() or {}
+            raw = (cfg.get("cron") or {}).get("outbound_length_ceiling")
+        except Exception:
+            raw = None
+    if raw is None:
+        return _STYLE_GATE_DEFAULT_CEILING
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return _STYLE_GATE_DEFAULT_CEILING
+
+
+def _style_gate_takeaway(text: str) -> str:
+    """Lead takeaway for a long report: first paragraph(s), sentence-trimmed."""
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    picked: list[str] = []
+    total = 0
+    for para in paragraphs:
+        picked.append(para)
+        total += len(para)
+        if total >= _STYLE_GATE_TAKEAWAY_TARGET:
+            break
+    takeaway = "\n\n".join(picked)
+    if len(takeaway) > _STYLE_GATE_TAKEAWAY_LIMIT:
+        cut = takeaway[:_STYLE_GATE_TAKEAWAY_LIMIT]
+        # Prefer ending on a sentence; fall back to a word boundary.
+        sentence_end = max(cut.rfind(". "), cut.rfind(".\n"), cut.rfind("! "), cut.rfind("? "))
+        if sentence_end >= _STYLE_GATE_TAKEAWAY_TARGET // 2:
+            takeaway = cut[: sentence_end + 1]
+        else:
+            takeaway = cut[: cut.rfind(" ")].rstrip() + "…"
+    return takeaway.strip()
+
+
+def _apply_cron_outbound_style_gate(job: dict, content: str) -> str:
+    """Stage-4 plain-talk gate: a long cron chat send becomes a short takeaway
+    with the full report attached as a document.
+
+    Server-side because doctrine is pressure-defeasible: the model is asked to
+    keep chat replies short, but only this chokepoint guarantees it. Fails
+    open — any error returns the content unchanged so delivery never breaks.
+    """
+    try:
+        ceiling = _cron_outbound_length_ceiling(job)
+        if ceiling <= 0 or not content:
+            return content
+        from gateway.platforms.base import BasePlatformAdapter
+
+        media_files, text = BasePlatformAdapter.extract_media(content)
+        text = text.strip()
+        if len(text) <= ceiling:
+            return content
+
+        from cron.jobs import _job_output_dir
+
+        out_dir = _job_output_dir(str(job.get("id", "unknown")))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        report_path = out_dir / f"report-{stamp}.md"
+        report_path.write_text(text + "\n", encoding="utf-8")
+
+        parts = [
+            _style_gate_takeaway(text),
+            "",
+            "Full report attached.",
+            "[[as_document]]",
+            f"MEDIA:{report_path}",
+        ]
+        # Attachments the agent itself requested still ride along.
+        parts.extend(f"MEDIA:{path}" for path, _is_voice in media_files)
+        return "\n".join(parts)
+    except Exception:
+        logger.warning(
+            "Outbound style gate failed open for job '%s'", job.get("id"),
+            exc_info=True,
+        )
+        return content
+
+
 def _format_rejected_cron_output(
     output: str, final_response: str, reason: str
 ) -> str:
@@ -2689,6 +2782,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
     except Exception:
         pass
+
+    # Stage-4 plain-talk gate (Olympus): long chat sends become a takeaway
+    # plus the full report as a document attachment. Applied to the agent's
+    # content before any wrapper framing; fails open.
+    content = _apply_cron_outbound_style_gate(job, content)
 
     if wrap_response:
         task_name = job.get("name", job["id"])

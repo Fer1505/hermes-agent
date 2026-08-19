@@ -679,6 +679,13 @@ def _break_member(monkeypatch, failing_member: str) -> None:
     monkeypatch.setattr(zipfile.ZipFile, "open", _patched)
 
 
+@pytest.mark.skip(
+    reason="Olympus fork: overlay import into a nonempty home is refused "
+    "outright (all-or-nothing staged restore only), so upstream's per-member "
+    "atomic-overlay invariants are unreachable. The refusal contract is "
+    "pinned by test_nonempty_target_rejected_* above; the staged flow has "
+    "its own coverage. Class body kept upstream-identical for merge hygiene."
+)
 class TestImportAtomicWrites:
     """`hermes import` must never leave a user's file truncated.
 

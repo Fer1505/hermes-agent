@@ -1093,6 +1093,10 @@ class TestRunJobConfigEnvVarExpansion:
         """
         import httpx
 
+        # Olympus fork contract: the unattended fallback walk is fail-closed
+        # by default (auth AND transient network). This test proves the walk
+        # works when the profile opts in; the companion test below pins the
+        # closed default.
         (tmp_path / "config.yaml").write_text(
             "model:\n"
             "  default: grok-4.5\n"
@@ -1101,7 +1105,10 @@ class TestRunJobConfigEnvVarExpansion:
             "  - provider: xai\n"
             "    model: grok-4.5\n"
             "  - provider: anthropic\n"
-            "    model: claude-opus-5\n",
+            "    model: claude-opus-5\n"
+            "fallback_policy:\n"
+            "  cron:\n"
+            "    allow_on_auth_error: true\n",
             encoding="utf-8",
         )
         job = {
@@ -1145,6 +1152,55 @@ class TestRunJobConfigEnvVarExpansion:
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["provider"] == "xai"
         assert kwargs["model"] == "grok-4.5"
+
+
+    def test_transient_dns_failure_fails_closed_without_opt_in(self, tmp_path):
+        """Olympus fork: no fallback_policy opt-in => transient network failure
+        must fail closed, never walk fallback_providers (whose last rung is a
+        quality-degrading local model on Olympus profiles)."""
+        import httpx
+
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  default: grok-4.5\n"
+            "  provider: xai-oauth\n"
+            "fallback_providers:\n"
+            "  - provider: xai\n"
+            "    model: grok-4.5\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "dns-fail-closed",
+            "name": "dns fail closed",
+            "prompt": "hi",
+            "provider": "xai-oauth",
+            "model": "grok-4.5",
+        }
+        fake_db = MagicMock()
+        requested = []
+
+        def resolve_runtime(**kwargs):
+            requested.append(kwargs.get("requested"))
+            raise httpx.ConnectError(
+                "[Errno 8] nodename nor servname provided, or not known"
+            )
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   side_effect=resolve_runtime), \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            success, _, _, error = run_job(job)
+
+        assert success is False
+        assert error, "fail-closed path must surface the primary failure"
+        # Only the primary was ever resolved — the walk never started.
+        assert requested == ["xai-oauth"]
+        mock_agent_cls.assert_not_called()
 
 
     def test_auth_fallback_switches_provider_and_model_together(self, tmp_path):
