@@ -13430,7 +13430,19 @@ ipcMain.handle('hermes:api', async (_event, request) => {
   const mutatingProfile = deletingProfile || profileRenameFromRequest(request)?.oldName || null
 
   if (!mutatingProfile) {
-    return handleHermesApiRequest(request)
+    return handleHermesApiRequest(request).catch(error => {
+      // Strand-diagnosis tap (2026-08-20): the "Couldn't load this session"
+      // incident hid the failing request behind Electron's generic IPC error
+      // line. Persist the exact path/profile/error so the next occurrence is
+      // diagnosable from disk regardless of how the app was launched.
+      try {
+        const line = `${new Date().toISOString()} ${request?.method || 'GET'} ${request?.path} profile=${request?.profile ?? ''} -> ${String(error?.message || error).slice(0, 300)}\n`
+        fs.appendFileSync(path.join(app.getPath('logs'), 'hermes-api-errors.log'), line)
+      } catch {
+        /* never break the request path over diagnostics */
+      }
+      throw error
+    })
   }
 
   const releaseProfileDeletion = profileDeletionGate.acquire(mutatingProfile)
