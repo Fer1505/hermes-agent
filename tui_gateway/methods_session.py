@@ -2995,7 +2995,7 @@ def _(rid, params: dict) -> dict:
                 profile_name=(
                     Path(session["profile_home"]).name
                     if session.get("profile_home")
-                    else None
+                    else __import__("tui_gateway.server", fromlist=["_launch_profile_name"])._launch_profile_name()
                 ),
             )
             # Copy the whole parent history in bounded-chunk transactions —

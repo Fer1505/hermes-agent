@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import queue
 import subprocess
 import sys
@@ -1512,6 +1513,30 @@ def _db_unavailable_error(rid, *, code: int):
 # (a ContextVar override) for the duration of the call so config/skills/model and
 # message persistence all resolve to the right profile. Omitted/own profile → the
 # launch profile (unchanged for single-profile and per-profile-remote setups).
+def _launch_profile_name() -> "str | None":
+    """Name of the profile this backend was launched as, or None for the
+    default home.
+
+    Bot Mode aggregates session rows from many per-profile backends into one
+    UI; a NULL profile_name (the old "launch profile" convention) degrades to
+    "default" there, and message hydration then queries the wrong store —
+    the renderer strands on "Couldn't load this session" (2026-08-20).
+    Sessions must be self-describing even when they belong to the launch
+    profile. The bare default home (~/.hermes) still returns None: its rows
+    genuinely belong to the default profile.
+    """
+    home = os.environ.get("HERMES_HOME", "")
+    if not home:
+        return None
+    home_path = Path(home).expanduser()
+    name = home_path.name
+    if home_path.parent.name != "profiles":
+        return None
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", name):
+        return None
+    return name
+
+
 def _profile_home(profile: str | None) -> Path | None:
     """Resolve a named profile's home on THIS host, or None for the launch profile."""
     name = (profile or "").strip()
@@ -3009,7 +3034,7 @@ def _ensure_session_db_row(session: dict) -> None:
             # Self-describing rows: aggregators that merge multiple profile DBs
             # into one list can't rely on which file a row came from alone. NULL
             # means the launch/default profile (matches run_agent's convention).
-            profile_name=Path(profile_home).name if profile_home else None,
+            profile_name=Path(profile_home).name if profile_home else _launch_profile_name(),
         )
         # A session can be born hidden (session.create hidden=true, or a
         # session.set_hidden that arrived before the row existed): apply the
