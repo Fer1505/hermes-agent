@@ -1941,13 +1941,26 @@ def get_active_profile_name() -> str:
     if resolved == default_resolved:
         return "default"
 
-    profiles_root = _get_profiles_root().resolve()
+    profiles_root = _get_profiles_root()
     try:
-        rel = resolved.relative_to(profiles_root)
+        rel = resolved.relative_to(profiles_root.resolve())
         parts = rel.parts
         if len(parts) == 1 and _PROFILE_ID_RE.match(parts[0]):
             return parts[0]
     except ValueError:
+        pass
+
+    # Registered-by-symlink profiles: ``<profiles_root>/<name>`` may be a
+    # symlink to a home elsewhere on disk (e.g. a repo-managed profiles
+    # tree). ``relative_to`` on resolved paths can't see that membership, so
+    # sessions created under such a home were stamped ``"custom"`` — a name
+    # no profile resolver can round-trip (the 2026-08-20 Desktop hydration
+    # 404s). Match the resolved home against each entry's resolved target.
+    try:
+        for entry in profiles_root.iterdir():
+            if _PROFILE_ID_RE.match(entry.name) and entry.resolve() == resolved:
+                return entry.name
+    except OSError:
         pass
 
     return "custom"
