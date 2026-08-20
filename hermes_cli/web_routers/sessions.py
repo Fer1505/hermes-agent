@@ -141,15 +141,17 @@ def get_sessions(
                 exclude_children=True,
             )
             now = time.time()
-            # Same ownership contract as get_session_detail: rows are stamped
-            # with the serving profile even when the request wasn't explicitly
-            # scoped, so default-profile rows never circulate unowned.
-            row_profile = profile_name or _cron_default_profile()
+            # Same ownership contract as get_session_detail: every row leaves
+            # stamped. The row's own profile_name wins when present (it is the
+            # owner, whatever scope the request carried); unstamped rows fall
+            # back to the serving profile so they never circulate unowned.
+            scope_profile = profile_name or _cron_default_profile()
             for s in sessions:
                 s["is_active"] = (
                     s.get("ended_at") is None
                     and (now - s.get("last_active", s.get("started_at", 0))) < 300
                 )
+                row_profile = (s.get("profile_name") or "").strip() or scope_profile
                 s["profile"] = row_profile
                 s["is_default_profile"] = row_profile == "default"
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
@@ -561,13 +563,16 @@ async def get_session_detail(session_id: str, profile: Optional[str] = None):
         session = db.get_session(sid) if sid else None
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
-        # Always stamp the owning profile — the serving profile is known even
-        # when the request carries no ``?profile=`` (it's this process's own
-        # profile). Stamping only on explicit ``?profile=`` left rows for the
-        # default/primary profile systematically unowned, so multi-profile
-        # clients resolved them to whichever gateway happened to be active
-        # (cross-profile open asymmetry, #67603 family).
-        session["profile"] = (
+        # Stamp the owning profile. The row's own ``profile_name`` is the
+        # truth and wins when present: clients echo this stamp back as
+        # ``?profile=`` on follow-up reads (messages, resume), and a stamp
+        # derived from the REQUEST scope instead of the row's owner routes
+        # those follow-ups to the wrong store — the 2026-08-20 Desktop
+        # "Couldn't load this session" strand (detail 200 → messages 404).
+        # Rows without a stamp keep the serving-profile fallback: leaving
+        # them unowned resolved them to whichever gateway happened to be
+        # active (cross-profile open asymmetry, #67603 family).
+        session["profile"] = (session.get("profile_name") or "").strip() or (
             _cron_profile_home(profile)[0] if profile else _cron_default_profile()
         )
         session["is_default_profile"] = session["profile"] == "default"
