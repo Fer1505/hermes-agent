@@ -69,12 +69,12 @@ def test_ledger_operations_close_every_connection(monkeypatch, tmp_path):
     opened, closed = _track_connections(monkeypatch)
 
     oid = dl.compute_obligation_id("sess", "msg", "content")
-    dl.record_obligation(
+    token = dl.record_obligation(
         obligation_id=oid, session_key="sess", platform="telegram",
         chat_id="123", thread_id=None, content="hello",
     )
-    dl.mark_attempting(oid)
-    dl.mark_delivered(oid)
+    dl.mark_attempting(oid, token)
+    dl.mark_delivered(oid, token)
     dl.sweep_recoverable()
     dl.debug_rows()
 

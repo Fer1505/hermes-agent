@@ -75,6 +75,8 @@ def test_expired_cloud_session_is_replaced_without_reusing_dead_cdp(monkeypatch)
         "bb_session_id": "browser-session-new",
         "cdp_url": "ws://browser-use.example/devtools/browser/new",
         "expires_at": "2999-01-01T00:05:00Z",
+        # Real providers always report features; the fork's _validate_cloud_session requires it.
+        "features": {"browser_use": True},
     }
     monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
     monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "")

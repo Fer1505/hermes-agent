@@ -21,6 +21,7 @@ from tools.environments.base import (
     _popen_bash,
     _save_json_store,
     ensure_private_directory,
+    sanitize_task_id_for_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -183,7 +184,13 @@ class SingularityEnvironment(BaseEnvironment):
 
         if self._persistent:
             overlay_base = ensure_private_directory(_get_scratch_dir() / "hermes-overlays")
-            self._overlay_dir = ensure_private_directory(overlay_base / f"overlay-{task_id}")
+            # A raw session-key task_id carries colons and other characters
+            # that are unsafe in host path components (same class of bug as
+            # the docker -v mount failure); route it through the shared
+            # sanitizer so all backends agree on the mapping.
+            self._overlay_dir = ensure_private_directory(
+                overlay_base / f"overlay-{sanitize_task_id_for_path(task_id)}"
+            )
 
         self._start_instance()
         self.init_session()

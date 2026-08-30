@@ -156,7 +156,7 @@ class TestConfiguredCamofoxIdentity:
                 patch("tools.browser_camofox.load_config", return_value=config),
                 patch(
                     "tools.browser_camofox.requests.post",
-                    return_value=_mock_response(json_data={"tabId": "scoped-tab"}),
+                    return_value=_mock_response(json_data={"tabId": "scoped-tab", "url": "https://example.com"}),
                 ) as mock_post,
             ):
                 result = json.loads(

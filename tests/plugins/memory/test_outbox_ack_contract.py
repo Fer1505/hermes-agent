@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -201,10 +201,10 @@ def test_openviking_outbox_delivery_is_synchronous_and_stable(monkeypatch):
     assert "mw_contract_event" not in payload["content"]
     assert len(payload["uri"].rsplit("mem_", 1)[1].split(".md", 1)[0]) == 24
     assert provider._memory_write_threads == set()
-    get.assert_called_once_with(
-        "/api/v1/content/read",
-        params={"uri": payload["uri"]},
-    )
+    # Upstream's canonical user-scoped URIs may resolve the user space with a
+    # status GET on the same client; the ack contract is about the readback.
+    readbacks = [c for c in get.call_args_list if c.args and c.args[0] == "/api/v1/content/read"]
+    assert readbacks == [call("/api/v1/content/read", params={"uri": payload["uri"]})]
 
     post.side_effect = RuntimeError("offline")
     with pytest.raises(RuntimeError, match="offline"):
@@ -242,7 +242,7 @@ def test_openviking_outbox_replay_replaces_existing_uri_and_reads_back(monkeypat
         "replace",
     ]
     assert post.call_args_list[0].args[1]["uri"] == post.call_args_list[1].args[1]["uri"]
-    get.assert_called_once()
+    assert len([c for c in get.call_args_list if c.args and c.args[0] == "/api/v1/content/read"]) == 1
 
 
 def test_openviking_outbox_rejects_mismatched_readback(monkeypatch):
