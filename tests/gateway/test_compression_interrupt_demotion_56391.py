@@ -7,6 +7,7 @@ parent and fork orphaned compression siblings.
 """
 
 from __future__ import annotations
+from gateway.platforms.base import BusyMessageDisposition
 
 import sys
 import threading
@@ -128,7 +129,7 @@ class TestBusyHandlerDemotesInterruptForCompression:
 
         handled = await runner._handle_active_session_busy_message(event, sk)
 
-        assert handled is True
+        assert handled is not BusyMessageDisposition.NOT_HANDLED
         parent.interrupt.assert_not_called()
         assert adapter._pending_messages.get(sk) is event
 

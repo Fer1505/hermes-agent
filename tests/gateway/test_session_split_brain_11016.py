@@ -23,6 +23,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import (
+    SendResult,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
@@ -58,6 +59,7 @@ def _make_adapter():
 
     async def _mock_send_retry(chat_id, content, **kwargs):
         adapter.sent_responses.append(content)
+        return SendResult(success=True)
 
     adapter._send_with_retry = _mock_send_retry
     return adapter

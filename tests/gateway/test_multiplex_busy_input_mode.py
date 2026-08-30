@@ -8,6 +8,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import (
+    BusyMessageDisposition,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
@@ -132,7 +133,7 @@ async def test_secondary_profile_busy_mode_controls_live_busy_behavior(
 
     result = await runner._handle_active_session_busy_message(event, session_key)
 
-    assert result is handled
+    assert (result is not BusyMessageDisposition.NOT_HANDLED) is handled
     assert adapter._busy_text_mode == expected_text_mode
     if expected_action == "queue":
         agent.steer.assert_not_called()
@@ -203,7 +204,7 @@ async def test_secondary_profile_busy_mode_controls_busy_handler_restart_drain(
     event = _event(profile="research")
     session_key = runner._session_key_for_source(event.source)
 
-    assert await runner._handle_active_session_busy_message(event, session_key) is True
+    assert await runner._handle_active_session_busy_message(event, session_key) is not BusyMessageDisposition.NOT_HANDLED
     assert (session_key in adapter._pending_messages) is queued
 
 
@@ -286,7 +287,7 @@ async def test_secondary_legacy_busy_text_mode_is_profile_specific(tmp_path):
     agent._active_children = []
     runner._running_agents[session_key] = agent
 
-    assert await runner._handle_active_session_busy_message(event, session_key) is False
+    assert await runner._handle_active_session_busy_message(event, session_key) is BusyMessageDisposition.NOT_HANDLED
     assert adapter._busy_text_mode == "queue"
     agent.interrupt.assert_not_called()
 
@@ -304,7 +305,7 @@ async def test_default_busy_mode_is_unchanged_by_secondary_profile(tmp_path, mon
     agent._active_children = []
     runner._running_agents[session_key] = agent
 
-    assert await runner._handle_active_session_busy_message(event, session_key) is True
+    assert await runner._handle_active_session_busy_message(event, session_key) is not BusyMessageDisposition.NOT_HANDLED
     agent.interrupt.assert_called_once_with("follow up")
     agent.steer.assert_not_called()
     assert runner._busy_input_mode == "interrupt"

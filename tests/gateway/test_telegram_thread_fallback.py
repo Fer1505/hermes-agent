@@ -9,6 +9,7 @@ avoid retrying with a partial topic route that can render outside the lane.
 """
 
 import sys
+from gateway.platforms.base import BusyMessageDisposition
 import socket
 import types
 from types import SimpleNamespace
@@ -348,7 +349,7 @@ async def test_gateway_runner_busy_ack_replies_to_triggering_message_for_telegra
     runner._busy_input_mode = "interrupt"
     runner._is_user_authorized = lambda _source: True
 
-    assert await runner._handle_active_session_busy_message(event, session_key) is True
+    assert await runner._handle_active_session_busy_message(event, session_key) is not BusyMessageDisposition.NOT_HANDLED
 
     assert adapter.calls
     assert adapter.calls[0]["reply_to"] == "463"

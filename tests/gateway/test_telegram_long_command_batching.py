@@ -22,6 +22,7 @@ def _make_adapter():
     from plugins.platforms.telegram.adapter import TelegramAdapter
 
     adapter = object.__new__(TelegramAdapter)
+    adapter._deferred_inbox_update_ids = set()
     adapter.platform = Platform.TELEGRAM
     adapter.config = PlatformConfig(enabled=True, token="fake-token", extra={})
     adapter._bot = SimpleNamespace(id=999, username="test_bot")
