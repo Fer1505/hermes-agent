@@ -259,7 +259,7 @@ describe('active transcript refresh', () => {
 
     // Behavior assertions:
     expect(updaterCallCount).toBeGreaterThan(0)
-    expect(getLatestSessionMessages).toHaveBeenCalledWith(TILE_STORED_ID)
+    expect(getLatestSessionMessages).toHaveBeenCalledWith(TILE_STORED_ID, undefined)
   })
 
   it('skips the tile fetch entirely when nothing changed (signature-gated)', async () => {

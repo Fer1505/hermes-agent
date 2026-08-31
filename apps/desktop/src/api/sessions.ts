@@ -10,7 +10,7 @@ import type {
   SessionSearchResponse
 } from '@/types/hermes'
 
-import { capabilityScoped, getApiRequestConnection, hermesApi, type ProfileScope, profileScoped } from './client'
+import { capabilityScoped, getApiRequestConnection, getApiRequestProfile, hermesApi, type ProfileScope, profileScoped } from './client'
 
 const SESSION_LIST_REQUEST_TIMEOUT_MS = 60_000
 
@@ -438,6 +438,30 @@ export async function fetchStoredTranscriptAcrossBackends(id: string): Promise<S
     return await getLatestSessionMessages(id)
   } catch {
     // Not on the ambient store — probe the registered backends below.
+  }
+
+  // Local per-profile stores next: profile-owned chats (every bot chat) live
+  // in their own state.db, unreachable unscoped — the ambient read above only
+  // lands on the primary's launch profile. A by-id read per profile is the
+  // same side-effect-free 404-on-miss probe as the connection loop below.
+  try {
+    const { $profiles } = await import('@/store/profile')
+
+    for (const profile of $profiles.get()) {
+      const name = profile.name?.trim()
+
+      if (!name || name === getApiRequestProfile()) {
+        continue
+      }
+
+      try {
+        return await getLatestSessionMessages(id, name)
+      } catch {
+        // Not on this profile (or its backend is unreachable); try the next.
+      }
+    }
+  } catch {
+    // Profile store unavailable — fall through to the connection probe.
   }
 
   const { $connectionsRegistry } = await import('@/store/connection-registry-state')

@@ -17,6 +17,8 @@ import {
   $selectedStoredSessionId,
   $sessions,
   getSessionOwnerHint,
+  knownSessionOwner,
+  ownerLookupSessionRows,
   sessionMatchesStoredId,
   setCurrentCwd
 } from '@/store/session'
@@ -82,6 +84,26 @@ export interface ActiveTranscriptRefreshDeps {
  * tick bursts only the final tick lands updates; that is intended, since each
  * tick re-reads from storage anyway.
  */
+/** REST read scope for a tile's transcript refresh: the tile's exact owner
+ *  route when present (bot chats always carry one), else the listed row /
+ *  owner hint — the sync half of resumeTile's owner ladder. A miss stays
+ *  unscoped, which only resolves on a single-profile install; a per-profile
+ *  store 404s an unscoped read (#67603 family), and resumeTile's async probe
+ *  stamps the owner into $sessions for the next tick. */
+function tileTranscriptScope(tile: { ownerRoute?: SessionProfileRoute; storedSessionId: string }): ProfileScope {
+  const route = tile.ownerRoute
+
+  if (route) {
+    return { connectionId: route.connectionId, profile: route.targetProfile ?? route.profile }
+  }
+
+  const owner = knownSessionOwner(ownerLookupSessionRows(), tile.storedSessionId)
+
+  return owner && typeof owner === 'object'
+    ? { connectionId: owner.connectionId, profile: owner.targetProfile ?? owner.profile }
+    : owner
+}
+
 export async function reconcileTileTranscripts({
   requestSequenceRef,
   busyRef,
@@ -92,7 +114,7 @@ export async function reconcileTileTranscripts({
   busyRef: MutableRefObject<boolean>
   requestSequenceRef: MutableRefObject<number>
   signatureRef: MutableRefObject<Map<string, string>>
-  tiles?: Array<{ storedSessionId: string; runtimeId?: string }>
+  tiles?: Array<{ ownerRoute?: SessionProfileRoute; runtimeId?: string; storedSessionId: string }>
   updateSessionState: (
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,
@@ -128,7 +150,7 @@ export async function reconcileTileTranscripts({
       : $sessionTiles.get().some(t => t.storedSessionId === storedSessionId && t.runtimeId === runtimeSessionId)
 
     try {
-      const latest = await getLatestSessionMessages(storedSessionId)
+      const latest = await getLatestSessionMessages(storedSessionId, tileTranscriptScope(tile))
 
       if (requestId !== requestSequenceRef.current || busyRef.current || !stillPresent) {
         // Tile closed or superseded mid-read — discard AND prune its
