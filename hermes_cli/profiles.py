@@ -984,14 +984,61 @@ def set_profile_display_name(profile_name: str, display_name: str) -> str:
 # CRUD operations
 # ---------------------------------------------------------------------------
 
+def _default_home_is_dormant_scaffolding(default_home: Path) -> bool:
+    """True when the pre-profile default home is only profile scaffolding.
+
+    All three must hold: the sticky active_profile points at a named profile
+    (so bare ``hermes`` never lands here), no gateway is running from this
+    home, and the home has no recorded sessions (neither sessions.json
+    entries nor state.db session rows). Any error means "not dormant" so the
+    entry is never hidden on doubt.
+    """
+    try:
+        if get_active_profile() == "default":
+            return False
+        if _check_gateway_running(default_home):
+            return False
+        sessions_file = default_home / "sessions" / "sessions.json"
+        if sessions_file.exists():
+            import json as _json
+
+            try:
+                payload = _json.loads(sessions_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return False
+            if isinstance(payload, dict) and payload:
+                return False
+        state_db = default_home / "state.db"
+        if state_db.exists():
+            import sqlite3 as _sqlite3
+
+            try:
+                conn = _sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
+                try:
+                    row = conn.execute("select count(*) from sessions").fetchone()
+                finally:
+                    conn.close()
+            except _sqlite3.Error:
+                return False
+            if row and int(row[0] or 0) > 0:
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def list_profiles() -> List[ProfileInfo]:
     """Return info for all profiles, including the default."""
     profiles = []
     wrapper_dir = _get_wrapper_dir()
 
-    # Default profile
+    # Default profile — unless it is dormant scaffolding. On profile-mode
+    # deployments the default home survives only to host profiles/, the sticky
+    # active_profile pointer, and shared caches; when the sticky redirects to a
+    # named profile, no gateway runs here, and no session was ever recorded,
+    # presenting it as an agent paints a phantom bot in every agent list.
     default_home = _get_default_hermes_home()
-    if default_home.is_dir():
+    if default_home.is_dir() and not _default_home_is_dormant_scaffolding(default_home):
         model, provider = _read_config_model(default_home)
         dist_name, dist_version, dist_source = _read_distribution_meta(default_home)
         meta = read_profile_meta(default_home)
