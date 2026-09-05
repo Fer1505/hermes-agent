@@ -1,6 +1,6 @@
 ---
 name: github-workflows
-description: "Class-level GitHub work: auth, repos, issues, PRs, reviews, CI, and repo inspection."
+description: "Manage GitHub repositories, issues, PRs, and CI."
 version: 1.0.0
 author: Hermes Agent
 license: MIT

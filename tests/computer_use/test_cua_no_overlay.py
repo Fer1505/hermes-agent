@@ -245,7 +245,11 @@ class TestEmbeddedDaemonOverlayFlag:
         ) as popen, patch.object(
             cua_backend.subprocess, "run", return_value=status,
         ), patch.object(cua_backend.threading, "Thread"):
-            daemon.start()
+            # The private macOS launch/signature path has separate coverage.
+            # Keep this overlay-argument fixture independent of installed apps.
+            with patch.object(cua_backend, "_embedded_daemon_spawn_command",
+                              side_effect=lambda driver, args, **kw: [driver, *args]):
+                daemon.start()
 
         command = popen.call_args.args[0]
         assert command[:2] == ["/usr/bin/cua-driver", "serve"]

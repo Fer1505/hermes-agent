@@ -1,6 +1,6 @@
 ---
 name: ml-evaluation-operations
-description: "Evaluate ML/LLM systems with experiment tracking, sweeps, artifacts, and lm-eval benchmarks."
+description: "Evaluate ML models and track benchmark experiments."
 version: 1.0.0
 author: Hermes Agent
 license: MIT

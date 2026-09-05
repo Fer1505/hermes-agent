@@ -6,6 +6,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from hermes_cli import web_server
+from tests.hermes_cli.test_dashboard_auth_middleware import gated_app, _complete_stub_login
 
 
 def _client_with_app_state():
@@ -90,14 +91,16 @@ def _seed_file(client, root, name="out/hello.txt"):
 
 
 
-def test_download_authenticates_via_query_token(forced_files_client):
-    client, root = forced_files_client
+def test_download_authenticates_via_session_cookie(forced_files_client, gated_app):
+    _, root = forced_files_client
+    client = gated_app
+    _complete_stub_login(client)
     file_path = _seed_file(client, root, name="out/demo.mp4")
     active_content = _seed_file(client, root, name="out/page.html")
 
-    # Drop the session header so only the ?token= query param authenticates —
-    # mirrors a browser/shell-opened download that can't set the session header.
-    del client.headers[web_server._SESSION_HEADER_NAME]
+    # Current gated dashboards use the verified session cookie, not the
+    # obsolete browser-visible bearer token. Query tokens grant no authority.
+    client.headers.pop(web_server._SESSION_HEADER_NAME, None)
 
     ok = client.get(
         "/api/files/download",
@@ -124,21 +127,23 @@ def test_download_authenticates_via_query_token(forced_files_client):
     )
     assert rejected.status_code == 415
 
+    client.cookies.clear()
     assert client.get(
-        "/api/files/download", params={"path": str(file_path), "token": "nope"}
+        "/api/files/download", params={"path": str(file_path), "token": web_server._SESSION_TOKEN}
     ).status_code == 401
     assert client.get(
         "/api/files/download", params={"path": str(file_path)}
     ).status_code == 401
 
 
-def test_stream_requires_header_auth_and_supports_ranges(forced_files_client):
-    client, root = forced_files_client
+def test_stream_requires_session_auth_and_supports_ranges(forced_files_client, gated_app):
+    _, root = forced_files_client
+    client = gated_app
+    _complete_stub_login(client)
     file_path = _seed_file(client, root, name="out/demo.mp4")
 
-    # Electron's main-process proxy supplies the connection credential as a
-    # header. Unlike browser-visible download links, the stream endpoint must
-    # not accept credentials in its URL.
+    # Gated mode requires the authenticated session; a URL token alone
+    # cannot grant access to the stream.
     params = {"path": str(file_path)}
 
     full = client.get("/api/files/stream", params=params)
@@ -166,7 +171,8 @@ def test_stream_requires_header_auth_and_supports_ranges(forced_files_client):
     assert head.headers["content-length"] == "5"
     assert head.headers["x-content-type-options"] == "nosniff"
 
-    del client.headers[web_server._SESSION_HEADER_NAME]
+    client.cookies.clear()
+    client.headers.pop(web_server._SESSION_HEADER_NAME, None)
     assert client.get(
         "/api/files/stream",
         params={"path": str(file_path), "token": web_server._SESSION_TOKEN},
@@ -184,14 +190,16 @@ def test_stream_rejects_non_media_active_content(forced_files_client):
         assert response.json()["detail"] == "Unsupported media type"
 
 
-def test_query_token_does_not_authenticate_other_endpoints(forced_files_client):
-    client, root = forced_files_client
+def test_query_token_does_not_authenticate_other_endpoints(forced_files_client, gated_app):
+    _, root = forced_files_client
+    client = gated_app
+    _complete_stub_login(client)
     file_path = _seed_file(client, root)
 
-    del client.headers[web_server._SESSION_HEADER_NAME]
+    client.cookies.clear()
+    client.headers.pop(web_server._SESSION_HEADER_NAME, None)
 
-    # The query-token escape hatch is scoped to downloads only; it must not
-    # unlock the rest of the API surface.
+    # The obsolete query token must not unlock a gated API surface.
     leaked = client.get(
         "/api/files/read",
         params={"path": str(file_path), "token": web_server._SESSION_TOKEN},
@@ -373,5 +381,4 @@ def test_credential_dir_trees_blocked_on_subdir_descent(forced_files_client):
     # is filtered because the parent component is a credential dir.
     mcp_listing = client.get("/api/files", params={"path": str(mcp_dir)})
     assert [e["name"] for e in mcp_listing.json()["entries"]] == []
-
 

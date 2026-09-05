@@ -82,7 +82,7 @@ class TelegramInbox:
             ) from exc
         try:
             metadata = os.fstat(directory_fd)
-            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():  # windows-footgun: ok — non-POSIX returns above
                 raise RuntimeError(
                     f"Telegram inbox directory is not owned by the current user: {parent}"
                 )
@@ -103,7 +103,7 @@ class TelegramInbox:
             ) from exc
         try:
             metadata = os.fstat(file_fd)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():  # windows-footgun: ok — non-POSIX returns above
                 raise RuntimeError(
                     f"Telegram inbox is not an owner-controlled regular file: {self.db_path}"
                 )

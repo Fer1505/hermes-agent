@@ -325,7 +325,7 @@ def ensure_private_directory(path: Path) -> Path:
             )
         if not hasattr(os, "geteuid"):
             return
-        euid = os.geteuid()
+        euid = os.geteuid()  # windows-footgun: ok — hasattr guard immediately above
         if leaf and metadata.st_uid != euid:
             raise RuntimeError(
                 f"Sandbox directory is not owned by the current user: {component_path}"

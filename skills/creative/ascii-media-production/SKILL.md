@@ -1,6 +1,6 @@
 ---
 name: ascii-media-production
-description: "Class-level ASCII art and ASCII video production, from static text art to cinematic animations."
+description: "Create ASCII art, video, and text animations."
 version: 1.0.0
 author: Hermes Agent
 license: MIT

@@ -180,7 +180,7 @@ class TestMissingProviderKeyBlocks:
                 raise AuthError("no key")
             return {**_RUNTIME, "provider": "openrouter"}
 
-        job = _job()
+        job = _job(allow_auth_fallback=True)
         with cron_jobs.use_cron_store(tmp_path):
             cron_jobs.save_jobs([job])
             success, output, final_response, error, agent_constructed = \

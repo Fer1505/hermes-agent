@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from agent.skill_utils import iter_skill_index_files
 
 REPO = Path(__file__).resolve().parents[2]
 MARKETING = re.compile(
@@ -31,9 +32,11 @@ GRANDFATHER: dict[str, set[str]] = {
 
 
 def _skill_paths():
+    # Enforce every active skill, using the same discovery rules as runtime.
+    # Archived and support documents are retained data, not active skills.
     return sorted(
-        list(REPO.glob("skills/**/SKILL.md"))
-        + list(REPO.glob("optional-skills/**/SKILL.md"))
+        list(iter_skill_index_files(REPO / "skills", "SKILL.md"))
+        + list(iter_skill_index_files(REPO / "optional-skills", "SKILL.md"))
     )
 
 

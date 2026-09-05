@@ -9,7 +9,7 @@ import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SUPPORTED_NODE_RANGE = ">=22.22.0"
+SUPPORTED_NODE_RANGE = "^22.22.0 || ^24.11.0 || >=26.0.0"
 
 
 def _load_json(path: str) -> dict:

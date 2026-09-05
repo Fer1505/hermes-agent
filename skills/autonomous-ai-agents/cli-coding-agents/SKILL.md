@@ -1,6 +1,6 @@
 ---
 name: cli-coding-agents
-description: "Delegate coding work to CLI agents such as Codex, Claude Code, and OpenCode."
+description: "Delegate coding work to Codex, Claude Code, or OpenCode."
 version: 1.0.0
 author: Hermes Agent
 license: MIT

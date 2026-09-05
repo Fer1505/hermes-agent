@@ -1,6 +1,6 @@
 ---
 name: kanban-operations
-description: "Kanban task orchestration and worker execution patterns for agent teams."
+description: "Coordinate Kanban tasks and agent worker handoffs."
 version: 1.0.0
 author: Hermes Agent
 license: MIT

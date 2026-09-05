@@ -5,17 +5,18 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hermes_cli import web_server
+from tests.hermes_cli.test_dashboard_auth_middleware import gated_app, _complete_stub_login
 
 
-def test_ssh_ownership_endpoint_requires_token_and_returns_exact_nonce(monkeypatch):
+def test_ssh_ownership_endpoint_requires_session_and_returns_exact_nonce(monkeypatch, gated_app):
     token = "t" * 64
     nonce = "0123456789abcdef"
     monkeypatch.setattr(web_server, "_SESSION_TOKEN", token)
     monkeypatch.setattr(web_server, "_SSH_OWNER_NONCE", nonce)
-    web_server.app.state.auth_required = False
-    client = TestClient(web_server.app)
+    client = gated_app
 
     assert client.get("/api/ssh/ownership").status_code == 401
+    _complete_stub_login(client)
     response = client.get(
         "/api/ssh/ownership",
         headers={"X-Hermes-Session-Token": token},

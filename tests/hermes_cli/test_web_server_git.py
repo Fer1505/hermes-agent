@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import web_server
+from tests.hermes_cli.test_dashboard_auth_middleware import gated_app
 
 pytest.importorskip("starlette.testclient")
 from starlette.testclient import TestClient
@@ -98,8 +99,8 @@ def test_worktree_add_initializes_plain_folder(client, tmp_path):
 
 
 
-def test_git_endpoints_require_auth(repo):
-    unauth = TestClient(web_server.app)
+def test_git_endpoints_require_auth(repo, gated_app):
+    unauth = gated_app
 
     assert unauth.get("/api/git/status", params={"path": str(repo)}).status_code == 401
     assert unauth.post("/api/git/review/stage", json={"path": str(repo)}).status_code == 401

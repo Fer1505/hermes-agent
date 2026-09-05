@@ -14066,15 +14066,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     ) -> Dict[str, int]:
         """Replay durable profile-local session artifact deletion work."""
         result = {"queued": 0, "completed": 0, "pending": 0}
-        with self._lock:
+        with self._read_ctx() as conn:
             if sessions_dir is None:
-                row = self._conn.execute(
+                row = conn.execute(
                     "SELECT COUNT(*) FROM session_file_purges"
                 ).fetchone()
                 result["queued"] = int(row[0]) if row else 0
                 result["pending"] = result["queued"]
                 return result
-            rows = self._conn.execute(
+            rows = conn.execute(
                 "SELECT session_id, safe_component FROM session_file_purges "
                 "ORDER BY enqueued_at, session_id LIMIT ?",
                 (max(1, min(int(limit), 10000)),),
@@ -14127,8 +14127,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 failure_text,
             )
 
-        with self._lock:
-            pending_row = self._conn.execute(
+        with self._read_ctx() as conn:
+            pending_row = conn.execute(
                 "SELECT COUNT(*) FROM session_file_purges"
             ).fetchone()
         result["pending"] = int(pending_row[0]) if pending_row else 0

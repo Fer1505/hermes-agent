@@ -35,11 +35,12 @@ def test_redacts_email_addresses():
 
 
 
-def test_does_not_mangle_code_review_shaped_text():
-    """Advisory text is often code-review shaped. Line numbers, timestamps,
-    bare digit runs, git SHAs, IPs, versions, and source-code assignments must
-    survive redaction byte-identical — a false positive here corrupts the
-    guidance the aggregator acts on."""
+def test_preserves_code_except_ambiguous_phone_shaped_identifiers():
+    """Keep code structure while retaining Olympus's conservative phone guard.
+
+    Ten-digit strings remain ambiguous even after labels such as id or epoch;
+    those labels must not become a way to disclose phone numbers to reviewers.
+    """
     text = (
         "Line 1274: off-by-one at src/moa_loop.py:1274\n"
         "commit 3428e70c599cbfbe240172b4ee1118dbc18a78ca\n"
@@ -50,7 +51,8 @@ def test_does_not_mangle_code_review_shaped_text():
         '"apiKey": "test-fixture"\n'
         "timeout = 1234567890\n"
     )
-    assert _redact_reference_text(text) == text
+    expected = text.replace("1234567890", "[REDACTED PHONE]").replace("5551234567", "[REDACTED PHONE]")
+    assert _redact_reference_text(text) == expected
 
 
 

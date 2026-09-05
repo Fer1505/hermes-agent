@@ -1,6 +1,6 @@
 ---
 name: apple-app-automation
-description: "Class-level macOS Apple app automation: Notes, Reminders, Messages, Find My, and GUI fallbacks."
+description: "Automate Apple apps on macOS with consent checks."
 version: 1.0.0
 author: Hermes Agent
 license: MIT

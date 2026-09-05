@@ -12,6 +12,7 @@ duplicate/not-found error envelopes.
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,22 @@ def hermes_root(tmp_path, monkeypatch):
 def _call(method, params=None):
     handler = server._methods[method]
     return handler(1, params or {})
+
+
+def _stdio_config(root, name, profile=None, env=None):
+    """Authorize an inert native binary only in the fixture's target profile."""
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from hermes_cli.mcp_security import authorize_operator_stdio_entry
+    executable = shutil.which("true") or shutil.which("whoami")
+    assert executable
+    entry = {"command": executable}
+    if env:
+        entry["env"] = env
+    token = set_hermes_home_override(root / "profiles" / profile if profile else root)
+    try:
+        return authorize_operator_stdio_entry(name, entry)
+    finally:
+        reset_hermes_home_override(token)
 
 
 def _result(resp):
@@ -88,13 +105,13 @@ def test_list_reflects_the_scoped_profile(hermes_root):
     _result(
         _call(
             "mcp.servers.add",
-            {"profile": "work", "name": "svc-a", "config": {"command": "svc-a-bin"}},
+            {"profile": "work", "name": "svc-a", "config": _stdio_config(hermes_root, "svc-a", "work")},
         )
     )
     _result(
         _call(
             "mcp.servers.add",
-            {"profile": "other", "name": "svc-b", "config": {"command": "svc-b-bin"}},
+            {"profile": "other", "name": "svc-b", "config": _stdio_config(hermes_root, "svc-b", "other")},
         )
     )
 
@@ -107,7 +124,7 @@ def test_list_reflects_the_scoped_profile(hermes_root):
     # stdio transport surfaced correctly.
     work_server = _result(_call("mcp.servers.list", {"profile": "work"}))["servers"][0]
     assert work_server["transport"] == "stdio"
-    assert work_server["command"] == "svc-a-bin"
+    assert work_server["command"] == (shutil.which("true") or shutil.which("whoami"))
 
 
 def test_set_api_key_writes_env_and_header_to_right_profile(hermes_root):
@@ -152,7 +169,7 @@ def test_set_api_key_stdio_references_env_block(hermes_root):
     _result(
         _call(
             "mcp.servers.add",
-            {"profile": "work", "name": "localtool", "config": {"command": "localtool-bin"}},
+            {"profile": "work", "name": "localtool", "config": _stdio_config(root, "localtool", "work", {"LOCALTOOL_TOKEN": "${LOCALTOOL_TOKEN}"})},
         )
     )
     resp = _result(
@@ -180,14 +197,14 @@ def test_remove_scoped_to_profile(hermes_root):
     _result(
         _call(
             "mcp.servers.add",
-            {"profile": "work", "name": "temp", "config": {"command": "temp-bin"}},
+            {"profile": "work", "name": "temp", "config": _stdio_config(root, "temp", "work")},
         )
     )
     # Same-named server in a different profile must be unaffected by the remove.
     _result(
         _call(
             "mcp.servers.add",
-            {"profile": "other", "name": "temp", "config": {"command": "temp-bin"}},
+            {"profile": "other", "name": "temp", "config": _stdio_config(root, "temp", "other")},
         )
     )
 
@@ -203,12 +220,12 @@ def test_add_duplicate_and_missing_errors(hermes_root):
     _result(
         _call(
             "mcp.servers.add",
-            {"profile": "work", "name": "dup", "config": {"command": "dup-bin"}},
+            {"profile": "work", "name": "dup", "config": _stdio_config(hermes_root, "dup", "work")},
         )
     )
     dup = _call(
         "mcp.servers.add",
-        {"profile": "work", "name": "dup", "config": {"command": "dup-bin"}},
+        {"profile": "work", "name": "dup", "config": _stdio_config(hermes_root, "dup", "work")},
     )
     assert "error" in dup
     assert dup["error"]["code"] == 4090
@@ -236,7 +253,7 @@ def test_default_profile_add_when_profile_omitted(hermes_root):
     _result(
         _call(
             "mcp.servers.add",
-            {"name": "rootsvc", "config": {"command": "rootsvc-bin"}},
+            {"name": "rootsvc", "config": _stdio_config(root, "rootsvc")},
         )
     )
     # Omitted profile → launch/default profile == HERMES_HOME root config.yaml.

@@ -6,6 +6,7 @@ import time
 from urllib.parse import urlencode
 
 import pytest
+from tests.hermes_cli.test_dashboard_auth_middleware import gated_app
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -58,7 +59,8 @@ def _recv_until(conn, frame_type: str, *, status: str | None = None) -> dict:
     raise AssertionError(f"Timed out waiting for {frame_type} frame")
 
 
-def test_console_ws_rejects_missing_or_bad_token(console_client):
+def test_console_ws_rejects_missing_or_bad_token(console_client, gated_app):
+    console_client = gated_app
     with pytest.raises(WebSocketDisconnect) as exc:
         with console_client.websocket_connect("/api/console"):
             pass

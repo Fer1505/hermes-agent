@@ -1,6 +1,6 @@
 ---
 name: audio-music-production
-description: "Class-level audio and music work: songwriting, AI music generation, AudioCraft, and spectrogram analysis."
+description: "Create and analyze audio, songs, and generated music."
 version: 1.0.0
 author: Hermes Agent
 license: MIT

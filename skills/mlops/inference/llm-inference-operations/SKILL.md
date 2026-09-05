@@ -1,6 +1,6 @@
 ---
 name: llm-inference-operations
-description: "Run and serve open-weight LLMs locally or in production with llama.cpp/GGUF and vLLM."
+description: "Serve open-weight models with llama.cpp and vLLM."
 version: 1.0.0
 author: Hermes Agent
 license: MIT

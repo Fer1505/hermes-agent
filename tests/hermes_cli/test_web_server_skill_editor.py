@@ -12,6 +12,7 @@ gap for headless/VPS users. These tests pin:
   PUT /api/cron/jobs/{id} can update the list.
 """
 import pytest
+from tests.hermes_cli.test_dashboard_auth_middleware import gated_app
 
 
 SKILL_MD = """---
@@ -154,10 +155,11 @@ class TestEditorEndpointsAuth:
         ],
     )
     def test_endpoints_401_without_token(
-        self, client, isolated_profiles, method, path, kwargs
+        self, client, isolated_profiles, method, path, kwargs, gated_app
     ):
         from hermes_cli.web_server import _SESSION_HEADER_NAME
 
+        client = gated_app
         client.headers.pop(_SESSION_HEADER_NAME, None)
         resp = getattr(client, method)(path, **kwargs)
         assert resp.status_code == 401

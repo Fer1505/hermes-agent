@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import web_server
+from tests.hermes_cli.test_dashboard_auth_middleware import gated_app
 
 pytest.importorskip("starlette.testclient")
 from starlette.testclient import TestClient
@@ -77,8 +78,8 @@ def test_fs_download_rejects_sensitive_files(client, tmp_path):
     assert response.status_code == 403
 
 
-def test_fs_endpoints_require_auth(tmp_path):
-    client = TestClient(web_server.app)
+def test_fs_endpoints_require_auth(tmp_path, gated_app):
+    client = gated_app
     target = tmp_path / "secret.txt"
     target.write_text("secret")
 
