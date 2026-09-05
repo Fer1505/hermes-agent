@@ -8,6 +8,7 @@ See: https://github.com/NousResearch/hermes-agent/issues/1002
 See: https://github.com/NousResearch/hermes-agent/issues/1264
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -963,6 +964,7 @@ class TestPythonpathSelectiveStrip:
         """
         import tools.code_execution_tool as cet
         from tools.code_execution_tool import execute_code
+        from tools.code_kernel import shutdown_all_kernels
 
         def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None):
             return '{"output": "mock", "exit_code": 0}'
@@ -973,29 +975,32 @@ class TestPythonpathSelectiveStrip:
         user_b = "/opt/project/lib"
         captured = {}
 
-        def _fake_popen(cmd, **kwargs):
+        real_popen = subprocess.Popen
+
+        def _capture_popen(cmd, **kwargs):
             captured["env"] = kwargs.get("env", {})
             captured["staging"] = os.path.dirname(cmd[1])
-            proc = MagicMock()
-            proc.stdout.read.return_value = b""
-            proc.stderr.read.return_value = b""
-            proc.wait.return_value = 0
-            proc.returncode = 0
-            proc.poll.return_value = 0
-            return proc
+            # Exercise the real persistent-kernel protocol. A per-call mock
+            # cannot acknowledge cells or provide byte streams to read1().
+            return real_popen(cmd, **kwargs)
 
-        with patch("tools.code_execution_tool._load_config",
-                   return_value={"mode": "strict"}), \
-             patch("model_tools.handle_function_call",
-                   side_effect=_mock_handle_function_call), \
-             patch("tools.code_execution_tool._uses_hermes_python_environment",
-                   return_value=same_env), \
-             patch("subprocess.Popen", side_effect=_fake_popen), \
-             patch.dict(os.environ, {
-                 "PYTHONPATH": os.pathsep.join(
-                     [hermes_root, venv_sp, user_a, user_b]),
-             }):
-            execute_code(code="pass", task_id="test-int", enabled_tools=[])
+        shutdown_all_kernels()
+        try:
+            with patch("tools.code_execution_tool._load_config",
+                       return_value={"mode": "strict", "timeout": 10}), \
+                 patch("model_tools.handle_function_call",
+                       side_effect=_mock_handle_function_call), \
+                 patch("tools.code_execution_tool._uses_hermes_python_environment",
+                       return_value=same_env), \
+                 patch("subprocess.Popen", side_effect=_capture_popen), \
+                 patch.dict(os.environ, {
+                     "PYTHONPATH": os.pathsep.join(
+                         [hermes_root, venv_sp, user_a, user_b]),
+                 }):
+                result = json.loads(execute_code(code="pass", task_id="test-int", enabled_tools=[]))
+                assert result["status"] == "success", result
+        finally:
+            shutdown_all_kernels()
 
         assert "PYTHONPATH" in captured["env"], \
             "execute_code never reached Popen"

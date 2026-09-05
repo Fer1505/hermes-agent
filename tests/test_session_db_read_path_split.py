@@ -139,10 +139,12 @@ def test_read_conn_open_failure_marks_thread(db, monkeypatch, tmp_path):
             raise _sqlite3.OperationalError("simulated open failure")
         return real_connect(*a, **k)
 
+    # Constructor maintenance may already borrow a reader; inject before
+    # construction so the first open, not a pre-populated pool hit, fails.
+    monkeypatch.setattr("hermes_state.sqlite3.connect", failing_connect)
     fresh = SessionDB(db_path=tmp_path / "state2.db")
     try:
         fresh.create_session(session_id="x", source="cli", model="m")
-        monkeypatch.setattr("hermes_state.sqlite3.connect", failing_connect)
         assert fresh.get_session("x")["id"] == "x"
         assert fresh.get_session("x")["id"] == "x"
         assert calls["n"] == 1, "open failure should be remembered per thread"
