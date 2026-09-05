@@ -25,8 +25,10 @@ class HangingSessionDB:
     def __init__(self, release: threading.Event):
         self.release = release
         self.entered = threading.Event()
+        self.entered_at = None
 
     def get_compression_tip(self, _session_id):
+        self.entered_at = time.monotonic()
         self.entered.set()
         self.release.wait()
         return None
@@ -66,12 +68,13 @@ def test_run_job_bounds_sessiondb_finalization(tmp_path):
             mock_agent.run_conversation.return_value = {"final_response": "ok"}
             mock_agent_cls.return_value = mock_agent
 
-            started = time.monotonic()
             success, _output, final_response, error = run_job(job)
-            elapsed = time.monotonic() - started
+            finished = time.monotonic()
 
         assert fake_db.entered.wait(timeout=0.5)
-        assert elapsed < 0.5
+        # This budget covers cleanup, not unrelated profile/model startup.
+        assert fake_db.entered_at is not None
+        assert finished - fake_db.entered_at < 0.5
         assert success is True
         assert final_response == "ok"
         assert error is None
