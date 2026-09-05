@@ -21,8 +21,8 @@ from tools.environments.base import (
     _popen_bash,
     _save_json_store,
     ensure_private_directory,
-    sanitize_task_id_for_path,
 )
+from tools.environments.path_utils import sanitize_task_id_for_path
 
 logger = logging.getLogger(__name__)
 

@@ -672,9 +672,10 @@ class TestRegisterHandlers:
         app = MagicMock()
         a._register_handlers(app)
 
-        # Five core handlers (default group, no group kwarg) plus the
-        # gateway_platform_event observer alone in group 99, so it observes
-        # alongside rather than displacing the core handlers.
+        # Six core handlers (default group, no group kwarg — incl. the
+        # inline command picker) plus the gateway_platform_event observer
+        # alone in group 99, so it observes alongside rather than
+        # displacing the core handlers.
         calls = app.add_handler.call_args_list
         assert len(calls) == 7
         assert len([c for c in calls if c.kwargs.get("group") == 99]) == 1
