@@ -69,17 +69,22 @@ def test_expired_cloud_session_is_replaced_without_reusing_dead_cdp(monkeypatch)
     }
     browser_tool._session_last_activity["task-1"] = 1.0
 
-    provider = Mock()
-    provider.create_session.return_value = {
+    # Keep the real provider's egress contract while mocking only its I/O.
+    provider = browser_use_provider.BrowserUseBrowserProvider()
+    provider.close_session = Mock()
+    provider.create_session = Mock(return_value={
         "session_name": "replacement",
         "bb_session_id": "browser-session-new",
         "cdp_url": "ws://browser-use.example/devtools/browser/new",
         "expires_at": "2999-01-01T00:05:00Z",
         # Real providers always report features; the fork's _validate_cloud_session requires it.
         "features": {"browser_use": True},
-    }
+    })
     monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: provider)
     monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "")
+    # Synthetic .example endpoint: mock the network preflight, not session
+    # metadata validation or the provider's explicit transport contract.
+    monkeypatch.setattr(browser_tool, "_is_public_network_url", lambda *_a, **_kw: True)
     monkeypatch.setattr(browser_tool, "_stop_cdp_supervisor", Mock())
     monkeypatch.setattr(browser_tool, "_maybe_stop_recording", Mock())
     monkeypatch.setattr(browser_tool, "_run_browser_command", Mock())

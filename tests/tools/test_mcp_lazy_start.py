@@ -7,6 +7,7 @@ existing connect path.
 """
 
 import json
+import shutil
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -16,7 +17,8 @@ import tools.mcp_tool as mcp
 
 
 @pytest.fixture(autouse=True)
-def _reset_mcp_state():
+def _reset_mcp_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     old_servers = dict(mcp._servers)
     old_lazy = dict(mcp._lazy_server_configs)
     old_fps = dict(mcp._lazy_server_fingerprints)
@@ -50,12 +52,15 @@ def _fake_cache_entry():
 
 
 def _lazy_config():
+    from hermes_cli.mcp_security import authorize_operator_stdio_entry
+    executable = shutil.which("true") or shutil.which("whoami")
+    assert executable is not None
     return {
-        "playwright": {
-            "command": "npx",
-            "args": ["-y", "@playwright/mcp"],
+        "playwright": authorize_operator_stdio_entry("playwright", {
+            "command": str(executable),
+            "args": [],
             "lazy": True,
-        }
+        })
     }
 
 
@@ -93,7 +98,8 @@ class TestLazyMcpRegistration:
         mock_run.assert_called_once()
 
     def test_non_lazy_server_never_touches_cache(self):
-        config = {"playwright": {"command": "npx", "args": []}}
+        config = _lazy_config()
+        config["playwright"]["lazy"] = False
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
              patch("tools.mcp_schema_cache.get_cached_entry") as mock_get, \
              patch("tools.mcp_tool._ensure_mcp_loop"), \

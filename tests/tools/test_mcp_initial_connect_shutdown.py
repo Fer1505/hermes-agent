@@ -3,9 +3,19 @@
 import asyncio
 import json
 import threading
+import shutil
 from types import SimpleNamespace
 
 import pytest
+
+
+def _authorized_stdio(name):
+    # Authorize an inert native executable in the fixture-owned HERMES_HOME.
+    # Server transport is mocked; no executable is actually spawned.
+    from hermes_cli.mcp_security import authorize_operator_stdio_entry
+    executable = shutil.which("true") or shutil.which("whoami")
+    assert executable is not None
+    return authorize_operator_stdio_entry(name, {"command": str(executable), "connect_timeout": 5})
 
 
 def _reset_mcp_state(mcp_tool) -> None:
@@ -74,7 +84,7 @@ def test_initial_connect_failure_is_registry_owned_and_reaped(monkeypatch, tmp_p
 
     try:
         assert mcp_tool.register_mcp_servers({
-            "initial-failure": {"command": "unused", "connect_timeout": 5}
+            "initial-failure": _authorized_stdio("initial-failure")
         }) == []
 
         assert len(created) == 1
@@ -160,7 +170,7 @@ def test_initial_connect_failure_revives_same_registered_server(monkeypatch, tmp
     monkeypatch.setattr(registry_module, "registry", mock_registry)
 
     config = {
-        "recovering": {"command": "unused", "connect_timeout": 5}
+        "recovering": _authorized_stdio("recovering")
     }
 
     try:
@@ -227,7 +237,7 @@ def test_initial_auth_failure_is_retained_and_reaped(monkeypatch, tmp_path):
 
     try:
         assert mcp_tool.register_mcp_servers({
-            "auth-failure": {"command": "unused", "connect_timeout": 5}
+            "auth-failure": _authorized_stdio("auth-failure")
         }) == []
         assert len(created) == 1
         server = created[0]

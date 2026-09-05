@@ -3064,11 +3064,14 @@ class TestInboundMediaAuthorizationGate:
         parent = tmp_path
         private_parts = []
         for index in range(6):
-            part = f"private-{index}-" + ("x" * 150)
+            # Keep the full path below macOS PATH_MAX while still exceeding
+            # the error's 900-character bound.
+            part = f"private-{index}-" + ("x" * 140)
             private_parts.append(part)
             parent = parent / part
             parent.mkdir()
         media = parent / "handoff.txt"
+        assert len(str(media)) > 900
         media.write_text("safe handoff", encoding="utf-8")
         adapter = _make_adapter()
         adapter._run_cli = AsyncMock(

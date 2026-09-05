@@ -198,7 +198,10 @@ def test_manager_does_not_pass_checkpoint_keyword_to_legacy_provider():
         [{"role": "user", "content": "evidence"}],
     )
 
-    assert combined == "legacy context"
+    assert combined == (
+        "[External memory pre-compression evidence; provider=legacy; "
+        "trust=untrusted-external]\n> legacy context"
+    )
     assert legacy.pre_compress_calls
 
 
@@ -233,7 +236,10 @@ def test_v2_provider_with_bare_signature_still_works():
         require_checkpoint=True,
     )
 
-    assert combined == "bare-v2 context"
+    assert combined == (
+        "[External memory pre-compression evidence; provider=bare-v2; "
+        "trust=untrusted-external]\n> bare-v2 context"
+    )
     assert bare.pre_compress_calls
 
 

@@ -181,6 +181,9 @@ cd "$REPO_ROOT"
 # resolve HERMES_HOME while importing. Keep both HOME and HERMES_HOME inside one
 # owner-private temporary root and remove it when the runner exits.
 TEST_PROFILE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/hermes-tests.XXXXXX")"
+# Canonicalize macOS TMPDIR's trailing slash and /var symlink so HOME,
+# expanduser() and Path.home().resolve() identify the same isolated directory.
+TEST_PROFILE_ROOT="$(cd "$TEST_PROFILE_ROOT" && pwd -P)"
 chmod 700 "$TEST_PROFILE_ROOT"
 trap 'rm -rf -- "$TEST_PROFILE_ROOT"' EXIT
 

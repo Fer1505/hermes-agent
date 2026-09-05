@@ -107,6 +107,9 @@ class TestCommandTimeoutRecovery:
         supervisor_events = []
 
         monkeypatch.setattr(bt, "_find_agent_browser", lambda: "agent-browser")
+        # The process is mocked below; exercise timeout recovery independently
+        # of whether the hermetic test HOME has a real Chromium installation.
+        monkeypatch.setattr(bt, "_chromium_installed", lambda: True)
         monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda _cmd: False)
         monkeypatch.setattr(bt, "_start_browser_cleanup_thread", lambda: None)
         monkeypatch.setattr(bt, "_ensure_cdp_supervisor", lambda _: supervisor_events.append("ensure"))

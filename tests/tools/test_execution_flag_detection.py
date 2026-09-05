@@ -4,6 +4,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 
 import pytest
@@ -47,6 +48,8 @@ def test_real_binaries_execute_leading_dash_program_payload(
     tmp_path, tool, args, stdin, needs_tty
 ):
     """A PATH marker proves these binaries do not reparse '-program' as an option."""
+    if sys.platform != "linux" and (tool == "sort" or needs_tty):
+        pytest.skip("This executable fixture requires GNU sort / Linux script CLI semantics")
     if shutil.which(tool) is None or (needs_tty and shutil.which("script") is None):
         pytest.skip(f"{tool} or script is not installed")
 

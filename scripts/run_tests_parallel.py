@@ -399,7 +399,9 @@ def _run_one_file_once(
     # One root for each subprocess removes the shared directory that the race
     # needs. The parent deletes the root after the attempt.
     env = os.environ.copy()
-    temproot = tempfile.mkdtemp(prefix="hermes-pytest-tmproot-")
+    # Leave room for pytest's per-test name and a Unix socket filename under
+    # macOS's 104-byte sockaddr_un limit; isolation does not need a long prefix.
+    temproot = tempfile.mkdtemp(prefix="hp-")
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
 
     subproc_start = time.monotonic()

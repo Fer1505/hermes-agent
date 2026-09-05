@@ -8,7 +8,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-08-22T01:34:08.583438Z"
+exclude-newer = "2026-08-22T01:46:27.75145Z"
 exclude-newer-span = "P14D"
 
 [options.exclude-newer-package]
@@ -1743,6 +1743,7 @@ daytona = [
 ]
 dev = [
     { name = "aiosqlite" },
+    { name = "anthropic" },
     { name = "debugpy" },
     { name = "defusedxml" },
     { name = "httpx2" },
@@ -1924,6 +1925,7 @@ requires-dist = [
     { name = "aiosqlite", marker = "extra == 'matrix'", specifier = "==0.22.1" },
     { name = "alibabacloud-dingtalk", marker = "extra == 'dingtalk'", specifier = "==2.2.42" },
     { name = "anthropic", marker = "extra == 'anthropic'", specifier = "==0.87.0" },
+    { name = "anthropic", marker = "extra == 'dev'", specifier = "==0.87.0" },
     { name = "asyncpg", marker = "extra == 'matrix'", specifier = "==0.31.0" },
     { name = "azure-identity", marker = "extra == 'azure-identity'", specifier = "==1.25.3" },
     { name = "boto3", marker = "extra == 'bedrock'", specifier = "==1.42.89" },
