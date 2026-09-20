@@ -9,12 +9,15 @@ from agent.compaction_display import project_compaction_message_for_display
 from hermes_cli import backup
 from hermes_state import SessionDB
 from tests.agent.test_public_contact_history import save_reply
-from tests.tools.test_public_contact_delivery import extraction, SID, PHONE
+from tests.tools.test_public_contact_delivery import extraction, source_authorization, SID, PHONE
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("snapshot_kind", ["quick", "pre-update-sibling"])
-async def test_quick_snapshot_restores_saved_contact_without_reviving_grant(extraction, monkeypatch, tmp_path, snapshot_kind):
+@pytest.mark.parametrize("grant_kind", ["exact", "source"])
+async def test_quick_snapshot_restores_saved_contact_without_reviving_grant(extraction, monkeypatch, tmp_path, snapshot_kind, grant_kind, request):
+    if grant_kind == "source":
+        request.getfixturevalue("source_authorization")
     ref, content, replay, db_path, original = await save_reply(extraction)
     (extraction.home / 'config.yaml').write_text('security: {}\n')
     if snapshot_kind == "quick":

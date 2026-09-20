@@ -1,4 +1,4 @@
-"""Reviewed public telephone receipts; never a general redaction exception.
+"""Reviewed public telephone/source receipts; never a general redaction exception.
 
 Only web_extract's successful, policy-checked results can issue references.
 Operator grants live in protected profile config. Receipts live in a protected
@@ -49,6 +49,19 @@ def _source_url(value) -> bool:
         return False
 
 
+def _valid_phone(phone) -> bool:
+    if not isinstance(phone, str):
+        return False
+    base = re.split(r" (?:ext\.?|x) ", phone, flags=re.I)[0]
+    # Digits alone remain ambiguous identifiers. This validates supported
+    # published display forms, not number allocation or dialability.
+    return bool(
+        _PHONE_RE.fullmatch(phone)
+        and 7 <= len(re.sub(r"\D", "", base)) <= 15
+        and any(c in phone for c in "+().- ")
+    )
+
+
 def _grants():
     """Read current authority each time, including revocations. Fail closed."""
     import yaml
@@ -58,34 +71,76 @@ def _grants():
         config = load_config_readonly(strict=True)
         policy = config.get("security", {}).get("public_contacts", {})
         grants = policy.get("grants", [])
+        sources = policy.get("source_grants", [])
         max_age = float(policy.get("max_age_seconds", 3600))
-        if not isinstance(grants, list) or len(grants) > 100 or not 0 < max_age <= 86400:
+        if (not isinstance(grants, list) or not isinstance(sources, list)
+                or len(grants) + len(sources) > 100 or not 0 < max_age <= 86400):
             return [], 0
         valid = []
-        for grant in grants:
+        for grant, source_only in [(g, False) for g in grants] + [(g, True) for g in sources]:
             if not isinstance(grant, dict):
                 continue
+            fields = ("id", "business", "session_id", "task", "label" if source_only else "phone")
             if not all(isinstance(grant.get(k), str) and 0 < len(grant[k]) <= 200
                        and not any(ord(c) < 32 for c in grant[k])
-                       for k in ("id", "business", "phone", "session_id", "task")):
+                       for k in fields):
                 continue
-            phone = grant["phone"]
-            base = re.split(r" (?:ext\.?|x) ", phone, flags=re.I)[0]
-            # Digits alone are ambiguous record identifiers, not a phone parser.
-            if (not _PHONE_RE.fullmatch(phone) or not 7 <= len(re.sub(r"\D", "", base)) <= 15
-                    or not any(c in phone for c in "+().- ") or not _source_url(grant.get("source_url"))):
+            if (not _source_url(grant.get("source_url"))
+                    or (not source_only and not _valid_phone(grant["phone"]))
+                    or (source_only and ("phone" in grant or not grant["label"].strip()))):
                 continue
             expires = datetime.fromisoformat(grant["expires_at"].replace("Z", "+00:00"))
             if expires.tzinfo is None:
                 continue
-            valid.append((grant, expires.timestamp()))
+            valid.append((grant, expires.timestamp(), source_only))
         # Duplicate IDs make reviewed identity ambiguous; none may authorize.
         counts = {}
-        for grant, _ in valid:
+        for grant, _, _ in valid:
             counts[grant["id"]] = counts.get(grant["id"], 0) + 1
-        return [(g, expiry) for g, expiry in valid if counts[g["id"]] == 1], max_age
+        return [(g, expiry, source_only) for g, expiry, source_only in valid
+                if counts[g["id"]] == 1], max_age
     except (OSError, ValueError, TypeError, AttributeError, KeyError, yaml.YAMLError):
         return [], 0
+
+
+def _published_phones(content: str, grant: dict, *, source_only: bool):
+    if not source_only:
+        span = re.search(r"(?<![\w+])" + re.escape(grant["phone"]) + r"(?!\w)", content)
+        return [(grant["phone"], [span.start(), span.end()])] if span else []
+    # The reviewed label must occupy its own contact line. Nearby page prose,
+    # identifiers and provider metadata cannot classify another number. Support
+    # ordinary extracted Markdown (including bold labels and list items).
+    label = re.escape(grant["label"])
+    prefixes = [label + r"[ \t]*:"]
+    for marker in (r"\*\*", "__"):
+        prefixes.extend((marker + label + r"[ \t]*:" + marker,
+                         marker + label + marker + r"[ \t]*:"))
+    pattern = (r"(?mi)^[ \t]*(?:[-*][ \t]+)?(?:" + "|".join(prefixes)
+               + r")[ \t]*(?P<phone>[^\r\n]+?)[ \t]*$")
+    found = []
+    seen = set()
+    for match in re.finditer(pattern, content):
+        phone, start, end = match["phone"], *match.span("phone")
+        # Preserve exact source offsets through simple Markdown presentation.
+        # A tel link is considered only within the reviewed contact label;
+        # the URI itself never establishes business ownership or authority.
+        if phone.startswith(("**", "__")) and phone.endswith(phone[:2]):
+            phone, start, end = phone[2:-2], start + 2, end - 2
+        link = re.fullmatch(r"\[([^\[\]\r\n]+)\]\(tel:(\+[0-9().-]+)\)", phone, re.I)
+        if link:
+            visible, target = link.groups()
+            # Global telephone identifiers may contain visual separators
+            # (RFC 3966). Do not infer a country code for a conflicting label.
+            if re.search(r"[0-9]", visible) and re.sub(r"\D", "", visible) != re.sub(r"\D", "", target):
+                continue
+            phone = target
+            start, end = start + link.start(2), start + link.end(2)
+        if phone not in seen and _valid_phone(phone):
+            found.append((phone, [start, end]))
+            seen.add(phone)
+        if len(found) == 8:
+            break
+    return found
 
 
 def _receipt_directory(*, create=False):
@@ -124,42 +179,46 @@ def issue_contact_references(result: dict) -> list[dict]:
     if not math.isfinite(fetched_at) or not 0 <= now - fetched_at <= max_age:
         return []
     references = []
-    for grant, expiry in grants:
+    for grant, expiry, source_only in grants:
         if (expiry <= now or grant["session_id"] != context["session_id"]
                 or result.get("requested_url") != grant["source_url"]
                 or result.get("url") != grant["source_url"]):
             continue
-        span = re.search(r"(?<![\w+])" + re.escape(grant["phone"]) + r"(?!\w)", content)
-        if span is None:
-            continue
-        receipt = {
-            "version": 1, "profile": str(get_hermes_home().resolve()),
-            "grant_digest": _digest(grant), "grant_id": grant["id"],
-            "session_id": context["session_id"], "task": grant["task"],
-            "turn_id": context["turn_id"], "tool_call_id": context["tool_call_id"],
-            "tool": "web_extract", "requested_url": result["requested_url"],
-            "source_url": result["url"], "fetched_at": fetched_at,
-            "issued_at": now, "expires_at": min(expiry, fetched_at + max_age),
-            "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
-            "span": [span.start(), span.end()], "phone_sha256": _digest(grant["phone"]),
-        }
-        # Letters only: general phone/token redaction must preserve the reference.
-        token = secrets.token_hex(32).translate(str.maketrans("0123456789abcdef", "abcdefghijklmnop"))
-        try:
-            path = _receipt_directory(create=True) / (token + ".json")
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as file:
-                json.dump(receipt, file, ensure_ascii=False)
-                file.flush()
-                os.fsync(file.fileno())
-            references.append({
-                "reference": f"[public-contact:{token}]", "business": grant["business"],
-                "source_url": grant["source_url"],
-                "usage": "Copy this reference verbatim to show the verified public telephone in the final reply.",
-            })
-        except (OSError, ValueError):
-            # Ordinary extraction remains usable when optional receipt storage fails.
-            continue
+        for phone, span in _published_phones(content, grant, source_only=source_only):
+            receipt = {
+                "version": 2 if source_only else 1, "profile": str(get_hermes_home().resolve()),
+                "grant_digest": _digest(grant), "grant_id": grant["id"],
+                "session_id": context["session_id"], "task": grant["task"],
+                "turn_id": context["turn_id"], "tool_call_id": context["tool_call_id"],
+                "tool": "web_extract", "requested_url": result["requested_url"],
+                "source_url": result["url"], "fetched_at": fetched_at,
+                "issued_at": now, "expires_at": min(expiry, fetched_at + max_age),
+                "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+                "span": span, "phone_sha256": _digest(phone),
+            }
+            if source_only:
+                # Protected receipt stores the newly discovered value; it is
+                # never copied to model output or ordinary logs. Current source
+                # authorization is still required for every new display.
+                receipt["phone"] = phone
+                receipt["publication_label"] = grant["label"]
+            # Letters only: general phone/token redaction must preserve the reference.
+            token = secrets.token_hex(32).translate(str.maketrans("0123456789abcdef", "abcdefghijklmnop"))
+            try:
+                path = _receipt_directory(create=True) / (token + ".json")
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as file:
+                    json.dump(receipt, file, ensure_ascii=False)
+                    file.flush()
+                    os.fsync(file.fileno())
+                references.append({
+                    "reference": f"[public-contact:{token}]", "business": grant["business"],
+                    "source_url": grant["source_url"],
+                    "usage": "Copy this reference verbatim to show the verified public telephone in the final reply.",
+                })
+            except (OSError, ValueError):
+                # Ordinary extraction remains usable when optional receipt storage fails.
+                continue
     return references
 
 
@@ -182,16 +241,20 @@ def render_contact_references(text: str, *, session_id: str) -> str:
             if path.is_symlink() or path.stat().st_size > 16384:
                 return UNAVAILABLE
             receipt = json.loads(path.read_text(encoding="utf-8"))
-            if (receipt["version"] != 1 or receipt["session_id"] != session_id
+            if (receipt["version"] not in (1, 2) or receipt["session_id"] != session_id
                     or receipt["profile"] != str(get_hermes_home().resolve())
                     or not receipt["fetched_at"] <= receipt["issued_at"] <= now
                     or not 0 <= now - receipt["fetched_at"] <= max_age
                     or now >= receipt["expires_at"]):
                 return UNAVAILABLE
-            for grant, expiry in grants:
-                if (expiry <= now or grant["session_id"] != session_id
+            for grant, expiry, source_only in grants:
+                phone = receipt.get("phone") if source_only else grant["phone"]
+                if (receipt["version"] != (2 if source_only else 1)
+                        or not _valid_phone(phone)
+                        or (source_only and receipt.get("publication_label") != grant["label"])
+                        or expiry <= now or grant["session_id"] != session_id
                         or receipt["grant_digest"] != _digest(grant)
-                        or receipt["phone_sha256"] != _digest(grant["phone"])
+                        or receipt["phone_sha256"] != _digest(phone)
                         or receipt["source_url"] != grant["source_url"]
                         or receipt["requested_url"] != grant["source_url"]):
                     continue
@@ -204,7 +267,7 @@ def render_contact_references(text: str, *, session_id: str) -> str:
                 if source != grant["source_url"]:
                     return UNAVAILABLE
                 date = datetime.fromtimestamp(receipt["fetched_at"], timezone.utc).isoformat()
-                return f"{business} — {grant['phone']}\nSource: <{source}>\nVerified: {date}"
+                return f"{business} — {phone}\nSource: <{source}>\nVerified: {date}"
         except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
             pass
         return UNAVAILABLE
