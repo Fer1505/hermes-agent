@@ -9,6 +9,7 @@ import time
 import uuid
 from contextlib import suppress
 from typing import Any, Dict, List, Optional
+from gateway.platforms.api_server_outcome import TERMINAL_RUN_STATUSES, api_run_outcome
 
 try:
     from aiohttp import web
@@ -137,7 +138,7 @@ def _set_run_status(
     self._run_statuses[run_id] = current
     should_persist = (
         status != previous_status
-        or status in {"completed", "failed", "cancelled", "interrupted"}
+        or status in TERMINAL_RUN_STATUSES
         or bool(
             field_names
             & {"output", "error", "usage", "pending_steer", "session_id"}
@@ -365,12 +366,7 @@ def _durable_run_status(
     status = dict(record["status"])
     owner_pid = int(record.get("owner_pid") or 0)
     owner_started = int(record.get("owner_started") or 0)
-    nonterminal = status.get("status") not in {
-        "completed",
-        "failed",
-        "cancelled",
-        "interrupted",
-    }
+    nonterminal = status.get("status") not in TERMINAL_RUN_STATUSES
     owner_alive = False
     if owner_pid > 0:
         try:
@@ -859,71 +855,40 @@ async def _handle_runs(
                     return r, u
 
             result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
-            if (
-                run_id in self._stopping_run_ids
-                and isinstance(result, dict)
-                and result.get("interrupted") is True
-            ):
-                _put_event_if_active({
-                    "event": "run.cancelled",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                })
-                self._set_run_status(
-                    run_id,
-                    "cancelled",
-                    last_event="run.cancelled",
-                )
-            # Check for structured failure (non-retryable client errors like
-            # 401/400 return failed=True instead of raising, so the except
-            # block below never fires — issue #15561).
-            elif isinstance(result, dict) and result.get("failed"):
-                error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
-                _put_event_if_active({
-                    "event": "run.failed",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "error": error_msg,
-                })
-                self._set_run_status(
-                    run_id,
-                    "failed",
-                    error=error_msg,
-                    last_event="run.failed",
-                )
-            else:
-                final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                # Undelivered steer text (accepted after the final response;
-                # see turn_finalizer) rides on the terminal event/status so
-                # the client can replay it as the next user turn.
-                pending_steer = result.get("pending_steer") if isinstance(result, dict) else None
-                completed_event = {
-                    "event": "run.completed",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "output": final_response,
-                    "usage": usage,
-                }
-                if pending_steer:
-                    completed_event["pending_steer"] = pending_steer
-                _put_event_if_active(completed_event)
-                self._set_run_status(
-                    run_id,
-                    "completed",
-                    output=final_response,
-                    usage=usage,
-                    last_event="run.completed",
-                    **({"pending_steer": pending_steer} if pending_steer else {}),
-                )
+            result_session_id = result.get("session_id") if isinstance(result, dict) else None
+            agent_session_id = getattr(agent, "session_id", None)
+            effective_session_id = next(
+                (value for value in (result_session_id, agent_session_id) if isinstance(value, str) and value),
+                session_id,
+            )
+            outcome = api_run_outcome(result)
+            final_response = (result.get("final_response") or "") if isinstance(result, dict) else ""
+            pending_steer = result.get("pending_steer") if isinstance(result, dict) else None
+            terminal_event = "run." + outcome.status
+            payload = {
+                "event": terminal_event, "run_id": run_id, "timestamp": time.time(),
+                "output": final_response, "session_id": effective_session_id,
+                "usage": usage, **outcome.metadata(),
+            }
+            if pending_steer:
+                payload["pending_steer"] = pending_steer
+            _put_event_if_active(payload)
+            self._set_run_status(
+                run_id, **outcome.metadata(), output=final_response,
+                session_id=effective_session_id, usage=usage, last_event=terminal_event,
+                **({"pending_steer": pending_steer} if pending_steer else {}),
+            )
         except asyncio.CancelledError:
+            outcome = api_run_outcome({"interrupted": True})
             self._set_run_status(
                 run_id,
-                "cancelled",
+                **outcome.metadata(),
                 last_event="run.cancelled",
             )
             try:
                 _put_event_if_active({
                     "event": "run.cancelled",
+                    **outcome.metadata(),
                     "run_id": run_id,
                     "timestamp": time.time(),
                 })
@@ -939,11 +904,10 @@ async def _handle_runs(
             # failure, instead of falling through to the generic
             # except-Exception branch below.
             logger.warning("Provider authentication failed for run=%s: %s", run_id, exc)
-            error_msg = f"⚠️ Provider authentication failed: {exc}"
+            outcome = api_run_outcome(None, error=f"⚠️ Provider authentication failed: {exc}")
             self._set_run_status(
                 run_id,
-                "failed",
-                error=error_msg,
+                **outcome.metadata(),
                 last_event="run.failed",
             )
             try:
@@ -951,16 +915,16 @@ async def _handle_runs(
                     "event": "run.failed",
                     "run_id": run_id,
                     "timestamp": time.time(),
-                    "error": error_msg,
+                    **outcome.metadata(),
                 })
             except Exception:
                 pass
         except Exception as exc:
             logger.exception("[api_server] run %s failed", run_id)
+            outcome = api_run_outcome(None, error=exc)
             self._set_run_status(
                 run_id,
-                "failed",
-                error=_redact_api_error_text(exc),
+                **outcome.metadata(),
                 last_event="run.failed",
             )
             try:
@@ -968,7 +932,7 @@ async def _handle_runs(
                     "event": "run.failed",
                     "run_id": run_id,
                     "timestamp": time.time(),
-                    "error": _redact_api_error_text(exc),
+                    **outcome.metadata(),
                 })
             except Exception:
                 pass
@@ -1385,12 +1349,7 @@ async def _handle_stop_run(
             _openai_error(f"Run not found: {run_id}", code="run_not_found"),
             status=404,
         )
-    if status.get("status") in {
-        "completed",
-        "failed",
-        "cancelled",
-        "interrupted",
-    }:
+    if status.get("status") in TERMINAL_RUN_STATUSES:
         return web.json_response(status)
 
     if agent is None and task is None:
@@ -1465,7 +1424,7 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
     stale_statuses = [
         run_id
         for run_id, status in list(self._run_statuses.items())
-        if status.get("status") in {"completed", "failed", "cancelled"}
+        if status.get("status") in TERMINAL_RUN_STATUSES
         and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL
     ]
     for run_id in stale_statuses:
