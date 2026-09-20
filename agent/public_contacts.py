@@ -336,6 +336,22 @@ class ContactReferenceStream:
 DISPLAY_METADATA_KEY = "public_contact_display"
 
 
+def project_contact_reply(message: dict, *, session_id: str) -> dict:
+    """Project a current assistant turn without treating it as a saved DB row.
+
+    This uses current authority, not model-supplied row IDs or display metadata.
+    Keep the existing contact-bearing transcript redaction before insertion.
+    """
+    projected = message.copy()
+    content = message.get("content")
+    if message.get("role") == "assistant" and isinstance(content, str) and REFERENCE_RE.search(content):
+        from agent.redact import redact_sensitive_text
+        projected["content"] = render_contact_references(
+            redact_sensitive_text(content, force=True), session_id=session_id,
+        )
+    return projected
+
+
 def _display_identity(content: str) -> str:
     # Match SessionDB's presentation normalization, without touching replay.
     from agent.memory_manager import sanitize_context

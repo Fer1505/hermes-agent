@@ -111,3 +111,22 @@ raw replay separate from displayed text. GET returns the saved displayed fact;
 it does not authorize that reference in a new reply. This integration does not
 certify custom session/run streams, CLI/interim/artifact output, full business
 discovery, lifecycle coverage or live provider delivery.
+
+## September 20, 2026 — Custom API display integration
+
+The custom session chat API and asynchronous `/v1/runs` API now resolve
+assistant contact references as well. Session deltas, final reply and the
+terminal reconciliation transcript use the current run's trusted session;
+transient model messages cannot manufacture historical row authority. Run
+status records the effective session after compression, and background
+finalization re-enters the captured profile scope.
+
+These custom APIs prepare display events under the executor's profile/session
+scope before queueing them for consumers. Current authority is checked when a
+complete reference becomes a display event. Pending suffixes are closed on
+normal completion or handled provider failure. Queued events and saved run
+status are snapshots of generated output, not proof of delivery or new
+authorization to reuse a reference. Raw model messages and SQLite continuation
+content remain unchanged. CLI/interim/artifact surfaces, automatic business
+source discovery and the remaining lifecycle/live acceptance work are still
+separate requirements.

@@ -151,7 +151,7 @@ from gateway.platforms.base import (
 # Re-exported here for existing imports and constructor monkeypatches.
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from agent.redact import redact_sensitive_text
-from agent.public_contacts import ContactReferenceStream, render_contact_references
+from agent.public_contacts import ContactReferenceStream, project_contact_reply, render_contact_references
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
 from gateway.browser_control_artifacts import (
@@ -4683,7 +4683,10 @@ class APIServerAdapter(BasePlatformAdapter):
             **agent_overrides,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
-        final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+        final_response = _resolve_media_to_data_urls(render_contact_references(
+            result.get("final_response", "") if isinstance(result, dict) else "",
+            session_id=effective_session_id or session_id,
+        ))
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -4819,9 +4822,25 @@ class APIServerAdapter(BasePlatformAdapter):
             except RuntimeError:
                 pass
 
+        contact_stream = ContactReferenceStream()
+        contact_session_id = session_id
+
         def _delta(delta: str) -> None:
+            nonlocal contact_session_id
             if delta:
-                _enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
+                contact_session_id = _contact_stream_session_id(
+                    [self._active_run_agents.get(run_id)], session_id,
+                )
+                displayed = contact_stream.feed(delta, session_id=contact_session_id)
+                if displayed:
+                    _enqueue("assistant.delta", {"message_id": message_id, "delta": displayed,
+                                                 "session_id": contact_session_id})
+
+        def _finish_contact_stream() -> None:
+            pending = contact_stream.finish()
+            if pending:
+                _enqueue("assistant.delta", {"message_id": message_id, "delta": pending,
+                                             "session_id": contact_session_id})
 
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
             if event_type == "reasoning.available":
@@ -4855,9 +4874,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     confirmed_runtime_lock=lock_active,
                     **agent_overrides,
                 )
-                final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
-                effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
-                turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
+                _finish_contact_stream()
+                effective_session_id = (result.get("session_id") or session_id) if isinstance(result, dict) else session_id
+                final_response = _resolve_media_to_data_urls(render_contact_references(
+                    result.get("final_response", "") if isinstance(result, dict) else "",
+                    session_id=effective_session_id,
+                ))
+                turn_messages = self._turn_transcript_messages(
+                    history, user_message, result, contact_session_id=effective_session_id,
+                ) if isinstance(result, dict) else []
                 effective_runtime = {}
                 if isinstance(result, dict):
                     effective_runtime = result.get("runtime") or {}
@@ -4913,6 +4938,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 raise
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
+                _finish_contact_stream()
                 self._set_run_status(
                     run_id,
                     "failed",
@@ -7113,6 +7139,8 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation_history: List[Dict[str, Any]],
         user_message: Any,
         result: Dict[str, Any],
+        *,
+        contact_session_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Return this turn's assistant/tool messages in client-safe shape.
 
@@ -7146,6 +7174,11 @@ class APIServerAdapter(BasePlatformAdapter):
             # marks pure handoffs display_kind == "hidden"; classifying here
             # first would re-run the content classifier (a full content
             # flatten + prefix scan) a second time per message.
+            # Result messages are current model output, not durable row
+            # identities. Resolve with the trusted run session before the
+            # existing compaction projection; leave raw messages untouched.
+            if contact_session_id is not None:
+                msg = project_contact_reply(msg, session_id=contact_session_id)
             projected = cls._message_response(msg)
             if projected.get("display_kind") == "hidden":
                 continue

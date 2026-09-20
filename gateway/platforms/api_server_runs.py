@@ -9,6 +9,7 @@ import time
 import uuid
 from contextlib import suppress
 from typing import Any, Dict, List, Optional
+from agent.public_contacts import ContactReferenceStream, render_contact_references
 
 try:
     from aiohttp import web
@@ -627,10 +628,22 @@ async def _handle_runs(
             q.put_nowait(event)
 
     # Also wire stream_delta_callback so message.delta events flow through.
+    contact_stream = ContactReferenceStream()
+    contact_session_id = session_id
+
     def _text_cb(delta: Optional[str]) -> None:
+        nonlocal contact_session_id
         if delta is None:
             return
         if run_id not in self._run_streams:
+            return
+        # Callback runs inside the executor's captured profile scope. Carry
+        # the actual agent session before cleanup can remove its live handle.
+        contact_session_id = _api_server._contact_stream_session_id(
+            [self._active_run_agents.get(run_id)], session_id,
+        )
+        delta = contact_stream.feed(delta, session_id=contact_session_id)
+        if not delta:
             return
         try:
             loop.call_soon_threadsafe(_put_event_if_active, {
@@ -638,9 +651,19 @@ async def _handle_runs(
                 "run_id": run_id,
                 "timestamp": time.time(),
                 "delta": delta,
+                "session_id": contact_session_id,
             })
         except Exception:
             pass
+
+    def _finish_contact_stream() -> None:
+        pending = contact_stream.finish()
+        if pending:
+            _put_event_if_active({
+                "event": "message.delta", "run_id": run_id,
+                "timestamp": time.time(), "delta": pending,
+                "session_id": contact_session_id,
+            })
 
     initial_status = self._set_run_status(
         run_id,
@@ -859,6 +882,8 @@ async def _handle_runs(
                     return r, u
 
             result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+            _finish_contact_stream()
+            effective_session_id = _api_server._contact_stream_session_id([agent], session_id)
             if (
                 run_id in self._stopping_run_ids
                 and isinstance(result, dict)
@@ -892,7 +917,13 @@ async def _handle_runs(
                     last_event="run.failed",
                 )
             else:
-                final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                # Background finalization outlives the request middleware.
+                # Resolve against the same profile used to execute the run.
+                with self._profile_scope(request_profile):
+                    final_response = render_contact_references(
+                        result.get("final_response", "") if isinstance(result, dict) else "",
+                        session_id=effective_session_id,
+                    )
                 # Undelivered steer text (accepted after the final response;
                 # see turn_finalizer) rides on the terminal event/status so
                 # the client can replay it as the next user turn.
@@ -902,6 +933,7 @@ async def _handle_runs(
                     "run_id": run_id,
                     "timestamp": time.time(),
                     "output": final_response,
+                    "session_id": effective_session_id,
                     "usage": usage,
                 }
                 if pending_steer:
@@ -911,6 +943,7 @@ async def _handle_runs(
                     run_id,
                     "completed",
                     output=final_response,
+                    session_id=effective_session_id,
                     usage=usage,
                     last_event="run.completed",
                     **({"pending_steer": pending_steer} if pending_steer else {}),
@@ -931,6 +964,7 @@ async def _handle_runs(
                 pass
             raise
         except _ProviderAuthResolutionError as exc:
+            _finish_contact_stream()
             # /v1/runs builds its own agent via _create_agent() and does
             # not route through _run_agent() (see that method's own
             # _ProviderAuthResolutionError branch), so it needs its own
@@ -957,6 +991,7 @@ async def _handle_runs(
                 pass
         except Exception as exc:
             logger.exception("[api_server] run %s failed", run_id)
+            _finish_contact_stream()
             self._set_run_status(
                 run_id,
                 "failed",
