@@ -30,7 +30,7 @@ class TestReadFileHandler:
         result = json.loads(read_file_tool("/tmp/test.txt"))
         assert result["content"] == "line1\nline2"
         assert result["total_lines"] == 2
-        mock_ops.read_file.assert_called_once_with("/tmp/test.txt", 1, 2000)
+        mock_ops.read_file.assert_called_once_with(str(Path("/tmp/test.txt").resolve()), 1, 2000)
 
 
     @patch("tools.file_tools._get_file_ops")
@@ -728,7 +728,9 @@ class TestDedupInvalidationTaskResolution:
         assert correct != buggy, "test precondition: cwds must diverge"
 
         # Populate the dedup cache via a real read.
-        ft.read_file_tool("data.txt", task_id=task_id)
+        observed = json.loads(ft.read_file_tool("data.txt", task_id=task_id))
+        assert not observed.get("error"), observed
+        assert "v1" in observed.get("content", ""), observed
         keys = [k[0] for k in ft._read_tracker.get(task_id, {}).get("dedup", {})]
         assert correct in keys, keys
 

@@ -42,6 +42,7 @@ manage_router = APIRouter()
 
 # Late-bound web_server helpers (resolved at call time; cycle-safe,
 # monkeypatch-transparent).
+_config_profile_scope = late("_config_profile_scope")
 _cron_default_profile = late("_cron_default_profile")
 _cron_profile_home = late("_cron_profile_home")
 _import_sessions_for_profile = late("_import_sessions_for_profile")
@@ -692,23 +693,27 @@ async def get_session_messages(
     from agent.compaction_display import project_compaction_message_for_display
     from agent.context_compressor import is_compaction_summary_message
 
-    projected_messages = []
-    for message in messages:
-        if not is_compaction_summary_message(message):
-            projected_messages.append(message)
-            continue
-        display_view = project_compaction_message_for_display(message)
-        projected = message.copy()
-        if display_view is None:
-            if not projected.get("display_kind"):
-                projected["display_kind"] = "hidden"
-        else:
-            # Keep the physical content for inspection/export compatibility;
-            # Desktop consumes this display-only projection. A legacy hidden
-            # wrapper must not hide a successfully recovered live ask.
-            projected["display_content"] = display_view.get("content")
-            projected.pop("display_kind", None)
-        projected_messages.append(projected)
+    with _config_profile_scope(profile):
+        projected_messages = []
+        for message in messages:
+            display_view = project_compaction_message_for_display(message)
+            if not is_compaction_summary_message(message):
+                projected = message.copy()
+                if display_view is not None and display_view.get("content") != message.get("content"):
+                    projected["display_content"] = display_view.get("content")
+                projected_messages.append(projected)
+                continue
+            projected = message.copy()
+            if display_view is None:
+                if not projected.get("display_kind"):
+                    projected["display_kind"] = "hidden"
+            else:
+                # Keep the physical content for inspection/export compatibility;
+                # Desktop consumes this display-only projection. A legacy hidden
+                # wrapper must not hide a successfully recovered live ask.
+                projected["display_content"] = display_view.get("content")
+                projected.pop("display_kind", None)
+            projected_messages.append(projected)
     return {
         "session_id": sid,
         "messages": projected_messages,

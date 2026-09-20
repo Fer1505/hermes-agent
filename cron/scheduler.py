@@ -6100,6 +6100,7 @@ def run_job(
     _cron_session_token = None
     _non_dispatcher_token = None
     _session_db = None
+    _run_completed = False
     try:
 
         # Scope cron approval policy to this job. Keep the token so the finally
@@ -7004,6 +7005,7 @@ def run_job(
             "duration_ms": _audit_duration_ms,
             "error": None,
         })
+        _run_completed = True
         return True, output, final_response, None
 
     except Exception as e:
@@ -7133,17 +7135,18 @@ def run_job(
             # pathological status (see the status vocabulary in
             # hermes_state's session_lifecycle_statuses docstring — keep the
             # tuple below in sync when it grows) downgrades the booking: an
-            # unknown value (newer classifier shape, test doubles) keeps the
-            # historical reason, and so does a failed probe — the booking
-            # itself is FAIL-OPEN on probe errors, because classification is
-            # best-effort metadata and must not mislabel a healthy run.
-            _end_reason = "cron_complete"
+            # unknown value or failed probe preserves the known run outcome;
+            # this optional metadata must not mislabel a healthy run.
+            # A final assistant row may itself be a provider/quota error.
+            # Message shape is secondary to the known run outcome; even a
+            # failed metadata probe must never turn a failed run green.
+            _end_reason = "cron_complete" if _run_completed else "cron_failed"
             try:
                 _statuses = _session_db.session_lifecycle_statuses(
                     [_final_cron_session_id]
                 )
                 _lifecycle = _statuses.get(_final_cron_session_id)
-                if _lifecycle in ("interrupted", "error", "empty"):
+                if _run_completed and _lifecycle in ("interrupted", "error", "empty"):
                     _end_reason = "cron_incomplete_no_output"
                     logger.warning(
                         "Job '%s': session ended without a final assistant "

@@ -33,8 +33,9 @@ def project_compaction_message_for_display(
     """
     if not isinstance(message, dict):
         return None
+    from agent.public_contacts import project_contact_history
     if not is_compaction_summary_message(message):
-        return message.copy()
+        return project_contact_history(message)
 
     projected = ContextCompressor._strip_context_summary_handoff_message(message)
     if projected is None:
@@ -44,4 +45,4 @@ def project_compaction_message_for_display(
     for key in _COMPACTION_INTERNAL_FIELDS:
         projected.pop(key, None)
     projected.pop("display_kind", None)
-    return projected
+    return project_contact_history(projected)

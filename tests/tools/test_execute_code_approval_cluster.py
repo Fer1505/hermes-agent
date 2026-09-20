@@ -27,6 +27,16 @@ from tools.thread_context import propagate_context_to_thread
 from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
 
 
+@pytest.fixture(autouse=True)
+def _isolated_session_host(monkeypatch):
+    import gateway.session_context as sc
+
+    monkeypatch.setattr(sc, "_session_context_engaged", False)
+    reset_session_vars()
+    yield
+    reset_session_vars()
+
+
 # ---------------------------------------------------------------------------
 # 1. Context + callback propagation helper
 # ---------------------------------------------------------------------------
@@ -119,6 +129,7 @@ def gw_session(monkeypatch):
     monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
 
     session_key = "cluster-test-session"
+    session_tokens = set_session_vars(platform="telegram", session_key=session_key, cron_session="")
     token = A.set_current_session_key(session_key)
     with A._lock:
         A._gateway_queues.pop(session_key, None)
@@ -129,6 +140,7 @@ def gw_session(monkeypatch):
         yield session_key
     finally:
         A.reset_current_session_key(token)
+        clear_session_vars(session_tokens)
         with A._lock:
             A._gateway_queues.pop(session_key, None)
             A._gateway_notify_cbs.pop(session_key, None)

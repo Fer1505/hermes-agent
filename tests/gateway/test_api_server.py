@@ -31,7 +31,6 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
     _IdempotencyCache,
-    _derive_chat_session_id,
     _hermes_version,
     _redact_api_error_text,
     _request_agent_overrides,
@@ -1307,25 +1306,6 @@ class TestChatCompletionsEndpoint:
             assert "call_orphan_1" not in body
             assert '"status": "running"' not in body
             assert '"status": "completed"' not in body
-
-
-# ---------------------------------------------------------------------------
-# _derive_chat_session_id unit tests
-# ---------------------------------------------------------------------------
-
-
-class TestDeriveChatSessionId:
-    def test_deterministic(self):
-        """Same inputs always produce the same session ID."""
-        a = _derive_chat_session_id("sys", "hello")
-        b = _derive_chat_session_id("sys", "hello")
-        assert a == b
-
-
-    def test_different_system_prompt(self):
-        a = _derive_chat_session_id("You are a pirate.", "Hello")
-        b = _derive_chat_session_id("You are a robot.", "Hello")
-        assert a != b
 
 
 # ---------------------------------------------------------------------------

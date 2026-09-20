@@ -15,6 +15,7 @@ that decision deterministic and explicit.
 import pytest
 
 import tools.approval as approval_module
+import gateway.session_context as sc
 from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
 from tools.approval import (
     _get_single_query_approval_mode,
@@ -25,7 +26,10 @@ from tools.approval import (
 
 
 @pytest.fixture(autouse=True)
-def _clear_approval_state():
+def _clear_approval_state(monkeypatch):
+    # Each env-only CLI case represents a new process. A prior gateway case
+    # must not leave the process-wide host latch engaged for the next test.
+    monkeypatch.setattr(sc, "_session_context_engaged", False)
     approval_module._permanent_approved.clear()
     approval_module.clear_session("default")
     approval_module.clear_session("test-session")

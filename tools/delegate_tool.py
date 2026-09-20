@@ -460,6 +460,39 @@ def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) ->
 _CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
 
 
+def _handle_result_action(delegation_id: Optional[str], parent_agent: Any) -> str:
+    """Inspect an owned durable receipt without acknowledging or redispatching."""
+    if not isinstance(delegation_id, str) or not delegation_id.strip():
+        return tool_error("action='result' requires delegation_id from the spawn response.")
+    from tools.async_delegation import get_durable_delegation
+
+    try:
+        receipt = get_durable_delegation(delegation_id.strip(), read_only=True)
+    except Exception:
+        return tool_error(
+            "Saved delegation result could not be read. Outcome is unverified; "
+            "do not restart work solely because this lookup failed."
+        )
+    if receipt is None or not _owns_subagent_record(
+        {"owner_agent_session_id": receipt.get("parent_session_id")}, parent_agent
+    ):
+        return tool_error(
+            "No saved delegation result is available to this conversation for that id. "
+            "This does not prove failure or completion; do not restart work solely "
+            "because the result is unavailable."
+        )
+    return json.dumps({
+        "action": "result",
+        **{key: receipt[key] for key in (
+            "delegation_id", "state", "dispatched_at", "completed_at",
+            "result", "delivery_state", "delivery_attempts",
+        )},
+        "note": "Read-only saved receipt. Retrieval does not acknowledge or resend "
+                "the completion message. Delivery state is recorded separately "
+                "from execution state; neither guarantees the delegated goal was achieved.",
+    }, ensure_ascii=False)
+
+
 def _resolve_session_lineage(session_id: Optional[str], parent_agent: Any) -> str:
     """Resolve a session id to the tip of its compression lineage.
 
@@ -544,6 +577,7 @@ def _handle_control_action(
             entries.append(
                 {
                     "subagent_id": r.get("subagent_id"),
+                    "delegation_id": r.get("delegation_id"),
                     "parent_id": r.get("parent_id"),
                     "goal": r.get("goal"),
                     "model": r.get("model"),
@@ -564,9 +598,10 @@ def _handle_control_action(
         }
         if not entries:
             payload["note"] = (
-                "No live subagents right now. Children that already finished "
-                "have delivered (or will deliver) their results as normal "
-                "completion messages — there is nothing to steer or stop."
+                "No live subagents right now. This does not prove completion or "
+                "delivery. Check the completion message or use action='result' "
+                "with the delegation_id from dispatch to read a saved result. "
+                "Do not restart work solely because a child is absent here."
             )
         return json.dumps(payload, ensure_ascii=False)
 
@@ -581,9 +616,11 @@ def _handle_control_action(
         record = _active_subagents.get(sid)
     if record is None or not _owns_subagent_record(record, parent_agent):
         return tool_error(
-            f"No live subagent '{sid}' in this conversation's spawn tree. It "
-            "may have already finished (its result arrives as a normal "
-            "completion message). Use action='list' to see live children."
+            f"No live subagent '{sid}' in this conversation's spawn tree. "
+            "Check its completion message or use action='result' with the "
+            "delegation_id from dispatch. Absence does not prove completion "
+            "or delivery. Use action='list' to see live children; do not "
+            "restart work solely because a child is absent here."
         )
 
     if action == "stop":
@@ -603,8 +640,9 @@ def _handle_control_action(
                 ensure_ascii=False,
             )
         return tool_error(
-            f"Could not interrupt '{sid}' — it likely finished in the last "
-            "moment. Its result arrives as a normal completion message."
+            f"Could not interrupt '{sid}'. Check its completion message or "
+            "action='result' with the delegation_id from dispatch before "
+            "deciding whether further work is needed."
         )
 
     if action == "steer":
@@ -632,8 +670,9 @@ def _handle_control_action(
             )
         return tool_error(
             f"Subagent '{sid}' is no longer accepting steering (finishing or "
-            "already finished). Its result arrives as a normal completion "
-            "message; re-delegate a follow-up task if more work is needed."
+            "already finished). Check its completion message or action='result' "
+            "with the delegation_id from dispatch before deciding whether "
+            "further work is needed."
         )
 
     return tool_error(f"Unknown action '{action}'. Use spawn, list, steer, or stop.")
@@ -3822,6 +3861,7 @@ def delegate_task(
     message: Optional[str] = None,
     parent_agent=None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
+    delegation_id: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks, or control
@@ -3836,6 +3876,7 @@ def delegate_task(
       - action='steer' -> queue course-correction text into a running child
                           (subagent_id + message)
       - action='stop'  -> interrupt a running child early (subagent_id)
+      - action='result' -> read a saved async receipt (delegation_id), no resend
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
@@ -3851,13 +3892,15 @@ def delegate_task(
     # They never spawn, so they bypass the pause gate, depth limit, and the
     # async dispatch machinery entirely.
     normalized_action = (action or "").strip().lower()
+    if normalized_action == "result":
+        return _handle_result_action(delegation_id, parent_agent)
     if normalized_action in _CONTROL_ACTIONS:
         return _handle_control_action(
             normalized_action, subagent_id, message, parent_agent
         )
     if normalized_action and normalized_action != "spawn":
         return tool_error(
-            f"Unknown action '{action}'. Use spawn (default), list, steer, or stop."
+            f"Unknown action '{action}'. Use spawn (default), list, steer, stop, or result."
         )
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
@@ -4518,6 +4561,9 @@ def delegate_task(
                 "mode": "background",
                 "count": n,
                 "delegation_id": dispatch["delegation_id"],
+                "result_hint": "If a completion is missing, use action='result' with "
+                               "this delegation_id to inspect its saved receipt. "
+                               "This does not resend or restart work; avoid routine polling.",
                 "goals": _goals,
                 "note": note,
             }
@@ -5160,13 +5206,15 @@ DELEGATE_TASK_SCHEMA = {
             # re-add to the schema.
             "action": {
                 "type": "string",
-                "enum": ["spawn", "list", "steer", "stop"],
+                "enum": ["spawn", "list", "steer", "stop", "result"],
                 "description": (
                     "Default 'spawn'. Live control of running children: "
                     "'list' = ids/goals/status/transcripts; 'steer' = queue "
                     "course-correction text into one child (subagent_id + "
                     "message) without stopping it; 'stop' = end one child "
                     "early (subagent_id; partial result still returns). "
+                    "'result' = read an owned saved async receipt by delegation_id, "
+                    "without resending, acknowledging or restarting work. "
                     "Control actions return immediately; goal/tasks are "
                     "ignored unless spawning."
                 ),
@@ -5177,6 +5225,10 @@ DELEGATE_TASK_SCHEMA = {
                     "Target for action='steer'/'stop' (ids from the spawn "
                     "response or action='list')."
                 ),
+            },
+            "delegation_id": {
+                "type": "string",
+                "description": "For action='result': delegation_id from the spawn response (not subagent_id).",
             },
             "message": {
                 "type": "string",
@@ -5248,6 +5300,7 @@ registry.register(
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
         action=args.get("action"),
+        delegation_id=args.get("delegation_id"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),
         parent_agent=kw.get("parent_agent"),

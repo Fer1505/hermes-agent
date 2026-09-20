@@ -41,7 +41,8 @@ from contextvars import ContextVar
 from typing import Any, Iterator
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
-# When a contextvar holds _UNSET, we fall back to os.environ (CLI/cron compat).
+# When a contextvar holds _UNSET, only an env-only host may fall back to
+# os.environ (CLI/cron compat). An engaged multi-session host returns default.
 # When it holds "" (after clear_session_vars resets it), we return "" — no fallback.
 _UNSET: Any = object()
 
@@ -58,6 +59,7 @@ _UNSET: Any = object()
 # os.environ fallback is preserved (no concurrency to leak across). Monotonic
 # latch — once any host binds a session, the process stays engaged for life.
 _session_context_engaged: bool = False
+_session_context_bound: ContextVar[bool] = ContextVar("hermes_session_context_bound", default=False)
 
 
 def session_context_engaged() -> bool:
@@ -66,6 +68,15 @@ def session_context_engaged() -> bool:
     See the ``_session_context_engaged`` comment for the leak-policy rationale.
     """
     return _session_context_engaged
+
+
+def session_context_missing() -> bool:
+    """True if a session host is active but this task has no bound turn.
+
+    Distinguishes a standalone env-only CLI from a host worker that lost its
+    context. The latter must not gain headless auto-approval privileges.
+    """
+    return _session_context_engaged and not _session_context_bound.get()
 
 # ---------------------------------------------------------------------------
 # Per-task session variables
@@ -258,8 +269,7 @@ def set_session_vars(
     ``_SESSION_ASYNC_DELIVERY`` / ``async_delivery_supported``). Stateless
     request/response adapters (the API server) pass ``False``.
 
-    ``cron_session`` is tri-state: ``_UNSET`` preserves legacy
-    ``os.environ["HERMES_CRON_SESSION"]`` fallback, ``"1"`` marks a cron job,
+    ``cron_session`` is tri-state: ``_UNSET`` means unbound, ``"1"`` marks a cron job,
     and ``""`` explicitly marks a non-cron session while masking leaked env.
     """
     # Mark the session-context machinery engaged for this process. The
@@ -267,6 +277,7 @@ def set_session_vars(
     # "ContextVar-authoritative, strip on _UNSET" — see session_context_engaged.
     global _session_context_engaged
     _session_context_engaged = True
+    _session_context_bound.set(True)
     tokens = [
         _SESSION_PLATFORM.set(platform),
         _SESSION_SOURCE.set(source),
@@ -308,6 +319,7 @@ def clear_session_vars(tokens: list) -> None:
     to ensure the "explicitly cleared" state is distinguishable from
     "never set" (which holds the ``_UNSET`` sentinel).
     """
+    _session_context_bound.set(False)
     for var in (
         _SESSION_PLATFORM,
         _SESSION_SOURCE,
@@ -376,6 +388,7 @@ def reset_session_vars() -> None:
     ``async_delivery_supported`` wrongly reports the new turn's channel as
     unable to route a background completion until ``set_session_vars`` runs.
     """
+    _session_context_bound.set(False)
     for var in _VAR_MAP.values():
         var.set(_UNSET)
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
@@ -400,9 +413,11 @@ def get_session_env(name: str, default: str = "") -> str:
        If the variable was explicitly set (even to ``""``) via
        ``set_session_vars`` or ``clear_session_vars``, that value is
        returned — **no fallback to os.environ**.
-    2. ``os.environ`` (only when the context variable was never set in
-       this context — i.e. CLI, cron scheduler, and test processes that
-       don't use ``set_session_vars`` at all).
+    2. ``os.environ`` (only when the context variable was never set and
+       no session host has engaged this process — env-only CLI/cron callers).
+       Once engaged, an unbound task returns *default*, just as the local
+       subprocess bridge strips unbound identity. A reset or a new thread
+       must not borrow another conversation's process-global mirror.
     3. *default*
     """
     import os
@@ -412,7 +427,10 @@ def get_session_env(name: str, default: str = "") -> str:
         value = var.get()
         if value is not _UNSET:
             return value
-    # Fall back to os.environ for CLI, cron, and test compatibility
+        if session_context_engaged():
+            return default
+    # Unknown/non-session names retain ordinary environment lookup semantics.
+    # Mapped names reach this fallback only in never-engaged env-only hosts.
     return os.getenv(name, default)
 
 

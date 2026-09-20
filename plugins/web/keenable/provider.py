@@ -177,16 +177,18 @@ class KeenableWebSearchProvider(WebSearchProvider):
                     title = data.get("title") or ""
                     results.append(
                         {
+                            "requested_url": url,
                             "url": data.get("url") or url,
                             "title": title,
                             "content": content,
                             "raw_content": content,
-                            "metadata": {"sourceURL": url, "title": title},
+                            "metadata": {"sourceURL": data.get("url") or url, "title": title},
                         }
                     )
                 except Exception as exc:  # noqa: BLE001 — per-URL error entry
                     results.append(
                         {
+                            "requested_url": url,
                             "url": url,
                             "title": "",
                             "content": "",

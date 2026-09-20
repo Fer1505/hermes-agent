@@ -13,7 +13,7 @@ bounded retention). The gateway writes three checkpoints around the send:
 
     record_obligation()   state='pending'     before any send attempt
     mark_attempting()     state='attempting'  immediately before the await
-    mark_delivered() /    state='delivered'   only on SendResult.success
+    mark_delivered() /    state='delivered'   on success with required proof
     mark_failed()         state='failed'      on a definitive rejection
 
 On startup and at a bounded periodic cadence, ``sweep_recoverable()`` claims
@@ -143,7 +143,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             lease_due_at REAL,
             next_attempt_at REAL,
             last_error TEXT,
-            adapter_profile TEXT
+            adapter_profile TEXT,
+            delivery_proof TEXT
         )"""
     )
     columns = {
@@ -155,6 +156,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         ("lease_due_at", "REAL"),
         ("next_attempt_at", "REAL"),
         ("adapter_profile", "TEXT"),
+        ("delivery_proof", "TEXT"),
     ):
         if name not in columns:
             try:
@@ -335,8 +337,41 @@ def mark_attempting(obligation_id: str, claim_token: str) -> bool:
     return bool(cursor.rowcount)
 
 
-def mark_delivered(obligation_id: str, claim_token: str) -> bool:
-    return _update_state(obligation_id, "delivered", claim_token=claim_token)
+def mark_delivered(
+    obligation_id: str,
+    claim_token: str,
+    *,
+    delivery_proof: Optional[dict] = None,
+) -> bool:
+    """Persist adapter-extracted proof atomically with the claimed outcome.
+
+    The obligation already binds platform, chat, thread and transport profile.
+    Keep only the small provider identifier, never raw provider responses.
+    NULL proof means adapter acknowledgment only (or a legacy caller); neither
+    historical rows nor receipt-free platforms acquire fabricated proof.
+    """
+    serialized = None
+    if delivery_proof is not None:
+        kind = delivery_proof.get("kind")
+        if kind in {"message_id", "wamid"}:
+            value = delivery_proof.get("value")
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("delivery proof requires a provider identifier")
+            safe_proof = {"kind": kind, "value": value}
+        elif kind in {"message_ids", "provider_timestamp"}:
+            values = delivery_proof.get("values")
+            if not isinstance(values, list) or not values or not all(
+                isinstance(value, str) and value.strip() for value in values
+            ):
+                raise ValueError("delivery proof requires provider identifiers")
+            safe_proof = {"kind": kind, "values": values}
+        else:
+            raise ValueError("unknown delivery proof kind")
+        serialized = json.dumps(safe_proof)
+    return _update_state(
+        obligation_id, "delivered", claim_token=claim_token,
+        delivery_proof=serialized,
+    )
 
 
 def mark_failed(
@@ -431,18 +466,20 @@ def _update_state(
     error: str = "",
     claim_token: str,
     next_attempt_at: Optional[float] = None,
+    delivery_proof: Optional[str] = None,
 ) -> bool:
     with _DB_LOCK, _transaction() as conn:
         cursor = conn.execute(
             """UPDATE delivery_obligations
                SET state=?, updated_at=?, last_error=?, next_attempt_at=?,
-                   lease_due_at=NULL
+                   lease_due_at=NULL, delivery_proof=?
                WHERE obligation_id=? AND claim_token=? AND state='attempting'""",
             (
                 state,
                 time.time(),
                 error[:500] if error else None,
                 next_attempt_at,
+                delivery_proof,
                 obligation_id,
                 claim_token,
             ),

@@ -15,6 +15,7 @@ id stability, and the startup redelivery sweep's contract:
 """
 
 import asyncio
+import json
 import os
 import sqlite3
 import time
@@ -110,6 +111,55 @@ def _orphan(oid):
 
 
 class TestStateMachine:
+    def test_legacy_schema_upgrade_preserves_history_without_inventing_proof(self):
+        token = _record()
+        assert dl.mark_attempting("ob-1", token)
+        assert dl.mark_delivered("ob-1", token)
+        with dl._transaction() as conn:
+            conn.execute("ALTER TABLE delivery_obligations DROP COLUMN delivery_proof")
+        # Reconnect runs the real additive initializer against the old schema.
+        with dl._transaction() as conn:
+            row = conn.execute("SELECT state, content, delivery_proof FROM delivery_obligations").fetchone()
+        assert row == ("delivered", "the final answer", None)
+
+    @pytest.mark.parametrize("proof", [
+        {"kind": "wamid", "value": "wamid.synthetic"},
+        {"kind": "message_ids", "values": ["first", "second"]},
+        {"kind": "provider_timestamp", "values": ["1789519000000"]},
+    ])
+    def test_provider_proof_variants_exclude_unrelated_response_payload(self, proof):
+        token = _record()
+        assert dl.mark_attempting("ob-1", token)
+        assert dl.mark_delivered("ob-1", token, delivery_proof={**proof, "raw_response": "private-data"})
+        with dl._transaction() as conn:
+            stored = conn.execute("SELECT delivery_proof FROM delivery_obligations").fetchone()[0]
+        assert json.loads(stored) == proof
+
+    @pytest.mark.parametrize("proof", [
+        {"kind": "message_id", "value": ""},
+        {"kind": "message_ids", "values": []},
+        {"kind": "provider_timestamp", "values": [None]},
+        {"kind": "unknown", "raw_response": "private-data"},
+    ])
+    def test_invalid_receipt_does_not_mark_delivered(self, proof):
+        token = _record()
+        assert dl.mark_attempting("ob-1", token)
+        with pytest.raises(ValueError):
+            dl.mark_delivered("ob-1", token, delivery_proof=proof)
+        assert _row("ob-1")["state"] == "attempting"
+
+    def test_receipt_update_is_atomic_and_fenced_to_the_current_claim(self):
+        token = _record()
+        assert dl.mark_attempting("ob-1", token)
+        proof = {"kind": "message_id", "value": "provider-42"}
+        assert not dl.mark_delivered("ob-1", "stale-token", delivery_proof=proof)
+        assert _row("ob-1")["state"] == "attempting"
+        assert dl.mark_delivered("ob-1", token, delivery_proof=proof)
+        assert not dl.mark_delivered("ob-1", token, delivery_proof={"kind": "message_id", "value": "replacement"})
+        with dl._transaction() as conn:
+            stored = conn.execute("SELECT delivery_proof FROM delivery_obligations").fetchone()[0]
+        assert json.loads(stored) == proof
+
     def test_record_starts_pending(self):
         _record()
         assert _row("ob-1")["state"] == "pending"
@@ -572,6 +622,38 @@ class TestGatewayRedeliverySweep:
         runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
             "agent:main:slack:channel:C1"
         )
+
+    @pytest.mark.parametrize("error,retryable", [(None, False), ("ReadTimeout", False), ("WriteTimeout", True)])
+    def test_unproven_redelivery_is_quarantined(self, error, retryable):
+        from gateway.platforms.base import SendResult
+        _record()
+        _orphan("ob-1")
+        adapter = self._adapter()
+        adapter.DELIVERY_PROOF_KIND = "message_id"
+        adapter.send = AsyncMock(return_value=SendResult(success=error is None, error=error, retryable=retryable))
+        runner = self._runner(adapter)
+        assert asyncio.run(runner._redeliver_pending_obligations()) == 0
+        assert _row("ob-1")["state"] == "ambiguous"
+        assert dl.sweep_recoverable(now=time.time() + 61) == []
+        adapter.send.assert_awaited_once()
+
+    def test_redelivery_persists_receipt_and_respects_failed_claim_commit(self):
+        from gateway.platforms.base import SendResult
+        _record()
+        _orphan("ob-1")
+        adapter = self._adapter()
+        adapter.DELIVERY_PROOF_KIND = "message_id"
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="recovered-42"))
+        runner = self._runner(adapter)
+        assert asyncio.run(runner._redeliver_pending_obligations()) == 1
+        with dl._transaction() as conn:
+            stored = conn.execute("SELECT delivery_proof FROM delivery_obligations").fetchone()[0]
+        assert json.loads(stored) == {"kind": "message_id", "value": "recovered-42"}
+
+        _record("another")
+        _orphan("another")
+        with patch.object(dl, "mark_delivered", return_value=False):
+            assert asyncio.run(runner._redeliver_pending_obligations()) == 0
 
     def test_attempting_is_quarantined_without_provider_resend(self):
         token = _record()

@@ -646,3 +646,53 @@ def test_duplicate_handles_on_one_path_are_reported(db, caplog):
     finally:
         for d in extra:
             d.close()
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+def test_closed_handles_retained_by_callers_do_not_warn_as_live(db, caplog, read_only):
+    """Object lifetime can exceed connection lifetime (e.g. completed agents)."""
+    import logging
+    from hermes_state import _HANDLES_PER_PATH_WARN
+
+    retained = []
+    baseline = _live_count(db.db_path)
+    try:
+        with caplog.at_level(logging.WARNING, logger="hermes_state"):
+            for _ in range(_HANDLES_PER_PATH_WARN + 2):
+                handle = SessionDB(db_path=db.db_path, read_only=read_only)
+                retained.append(handle)
+                handle.close()
+                assert _live_count(db.db_path) == baseline
+        assert not any("live SessionDB handles on" in r.getMessage() for r in caplog.records)
+        # Retaining the objects is deliberate. Garbage collection must not be
+        # necessary to keep a connection diagnostic accurate.
+        assert all(handle._conn is None for handle in retained)
+    finally:
+        for handle in retained:
+            handle.close()
+
+
+def test_failed_initialization_retained_by_tracebacks_does_not_count_as_open(db, caplog, monkeypatch):
+    import logging
+    from hermes_state import _HANDLES_PER_PATH_WARN
+
+    retained = []
+    baseline = _live_count(db.db_path)
+    def fail_schema(_self):
+        raise ValueError("synthetic schema initialization failure")
+    with monkeypatch.context() as patcher:
+        patcher.setattr(SessionDB, "_init_schema", fail_schema)
+        with caplog.at_level(logging.WARNING, logger="hermes_state"):
+            for _ in range(_HANDLES_PER_PATH_WARN + 2):
+                try:
+                    SessionDB(db_path=db.db_path)
+                except ValueError as exc:
+                    retained.append(exc)  # traceback retains the failed object
+                else:
+                    pytest.fail("fixture did not exercise initialization failure")
+                assert _live_count(db.db_path) == baseline
+    assert len(retained) == _HANDLES_PER_PATH_WARN + 2
+    assert not any("live SessionDB handles on" in r.getMessage() for r in caplog.records)
+    # Failed initialization must not poison the next healthy open or history.
+    with SessionDB(db_path=db.db_path) as reopened:
+        assert reopened.get_session("s1") is not None

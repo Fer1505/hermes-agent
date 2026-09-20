@@ -1620,6 +1620,34 @@ def _special_file_kind(path) -> str | None:
     return "a special (non-regular) file"
 
 
+def _missing_read_context(result: dict, resolved, task_id: str) -> dict:
+    """Add factual recovery context without recommending unreadable neighbors."""
+    result = dict(result)
+    result["path_status"] = "not_found"
+    result["resolved_path"] = str(resolved)
+    suggestions = []
+    for candidate in (result.get("similar_files") or [])[:5]:
+        if not isinstance(candidate, str):
+            continue
+        try:
+            target = str(_resolve_path_for_task(candidate, task_id))
+            if get_path_boundary_error(target, purpose="read") or get_read_block_error(target):
+                continue
+            if target not in suggestions:
+                suggestions.append(target)
+        except (OSError, ValueError):
+            continue
+    result["similar_files"] = suggestions
+    result["hint"] = (
+        "The requested file was not found at resolved_path. Verify the path "
+        "within the authorized workspace before retrying. Similar filenames "
+        "are candidates, not verified substitutes or evidence of the missing "
+        "file's contents. If no match is found, report the missing input "
+        "and continue independent work on the current task."
+    )
+    return result
+
+
 def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
     try:
@@ -1787,7 +1815,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         resolved_str_for_neg = str(_resolved)
         cached_not_found = _check_not_found_cache("read", resolved_str_for_neg, task_id)
         if cached_not_found is not None:
-            return cached_not_found
+            # A cached name suggestion is not a continuing permission grant.
+            return json.dumps(_missing_read_context(
+                json.loads(cached_not_found), _resolved, task_id,
+            ), ensure_ascii=False)
 
         # ── Dedup check ───────────────────────────────────────────────
         # If we already read this exact (path, offset, limit) and the
@@ -1849,20 +1880,19 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
 
         # ── Perform the read ──────────────────────────────────────────
         file_ops = _get_file_ops(task_id)
-        result = file_ops.read_file(path, offset, limit)
+        # Read the same task-resolved path that passed the guards above.
+        # The backend may be shared and have a different live cwd.
+        result = file_ops.read_file(str(_resolved), offset, limit)
         result_dict = result.to_dict()
 
         # ── Populate negative-result cache on not-found ───────────────
         # _suggest_similar_files returns ReadResult(error="File not found: ..").
         # Cache the JSON we'd return so a retry skips the parent-dir walk.
-        # Deliberately NO early return: on upstream, error results flow
-        # through the tracking block below (consecutive-loop detection,
-        # dedup bookkeeping via the resolved path) and the normal exit —
-        # short-circuiting here changes that behavior (and broke a real
-        # test interaction). Serving from the cache (above) is the
-        # optimization; recording must stay side-effect-identical.
+        # Failed attempts still flow through attempt bookkeeping below, but
+        # must never become evidence that current file contents were read.
         _err = result_dict.get("error") or ""
         if isinstance(_err, str) and _err.startswith("File not found:"):
+            result_dict = _missing_read_context(result_dict, _resolved, task_id)
             _not_found_json = json.dumps(result_dict, ensure_ascii=False)
             _record_not_found("read", resolved_str_for_neg, task_id, _not_found_json)
 
@@ -1925,7 +1955,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
             ))
 
         # ── Track for consecutive-loop detection ──────────────────────
-        read_key = ("read", path, offset, limit)
+        read_succeeded = not bool(result_dict.get("error"))
+        read_key = ("read" if read_succeeded else "read_failed", path, offset, limit)
         with _read_tracker_lock:
             # Ensure "dedup" / "dedup_hits" keys exist (backward compat with
             # old tracker state from pre-dedup-guard sessions).
@@ -1933,11 +1964,13 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                 task_data["dedup"] = {}
             if "dedup_hits" not in task_data:
                 task_data["dedup_hits"] = {}
-            # Real read succeeded — this key is no longer in a stub-loop, so
-            # reset its hit counter.  (File either changed or stat failed
-            # earlier and we fell through.)
+            # A backend attempt ends the stub loop. Only successful reads
+            # establish history; an error can coexist with an existing file.
             task_data["dedup_hits"].pop(dedup_key, None)
-            task_data["read_history"].add((path, offset, limit))
+            if read_succeeded:
+                task_data["read_history"].add((path, offset, limit))
+            else:
+                task_data["dedup"].pop(dedup_key, None)
             if task_data["last_key"] == read_key:
                 task_data["consecutive"] += 1
             else:
@@ -1949,16 +1982,20 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
             # 1. Dedup: skip identical re-reads of unchanged files.
             # 2. Staleness: warn on write/patch if the file changed since
             #    the agent last read it (external edit, concurrent agent, etc.).
-            try:
-                _mtime_now = os.path.getmtime(resolved_str)
-                task_data["dedup"][dedup_key] = _mtime_now
-                task_data.setdefault("read_timestamps", {})[resolved_str] = _mtime_now
-            except OSError:
-                pass  # Can't stat — skip tracking for this entry
+            if read_succeeded:
+                try:
+                    _mtime_now = os.path.getmtime(resolved_str)
+                    task_data["dedup"][dedup_key] = _mtime_now
+                    task_data.setdefault("read_timestamps", {})[resolved_str] = _mtime_now
+                except OSError:
+                    pass  # Can't stat — skip tracking for this entry
 
             # Bound the per-task containers so a long CLI session doesn't
             # accumulate megabytes of dict/set state.  See _cap_read_tracker_data.
             _cap_read_tracker_data(task_data)
+
+        if not read_succeeded:
+            return json.dumps(result_dict, ensure_ascii=False)
 
         # Cross-agent file-state registry (separate from per-task read
         # tracker above): records that THIS agent has read this path so

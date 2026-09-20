@@ -96,6 +96,19 @@ class TestSendWithRetrySuccess:
 
 class TestSendWithRetryNetworkRetry:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("retryable", [False, True])
+    @pytest.mark.parametrize("after_connect_failure", [False, True])
+    async def test_timeout_overrides_retry_flag_and_never_sends_a_fallback(self, retryable, after_connect_failure):
+        adapter = _StubAdapter()
+        uncertain = SendResult(success=False, error="WriteTimeout: request timed out", retryable=retryable)
+        initial = [SendResult(success=False, error="ConnectError", retryable=True)] if after_connect_failure else []
+        adapter._send_results = [*initial, uncertain, SendResult(success=True, message_id="must-not-send")]
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await adapter._send_with_retry("chat1", "hello", max_retries=3, base_delay=0)
+        assert result is uncertain
+        assert len(adapter._send_calls) == len(initial) + 1
+
+    @pytest.mark.asyncio
     async def test_retries_on_connect_error_and_succeeds(self):
         adapter = _StubAdapter()
         adapter._send_results = [

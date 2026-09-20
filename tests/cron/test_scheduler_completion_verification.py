@@ -13,6 +13,7 @@ mislabeling a healthy run.
 """
 
 import os
+import sqlite3
 
 import pytest
 
@@ -24,7 +25,7 @@ class _FakeCronAgent:
     def __init__(self, *args, **kwargs):
         pass
 
-    def run_conversation(self, prompt):
+    def run_conversation(self, prompt, **kwargs):
         return {
             "completed": True,
             "failed": False,
@@ -63,19 +64,19 @@ class _RecordingSessionDB:
         pass
 
 
-def _run_booked_job(monkeypatch, tmp_path):
+def _run_booked_job(monkeypatch, tmp_path, *, db_type=_RecordingSessionDB, expected_error=None):
     import hermes_state
     import run_agent
 
     instances: list[_RecordingSessionDB] = []
-    real_init = _RecordingSessionDB.__init__
+    real_init = db_type.__init__
 
     def _capture_init(self, *args, **kwargs):
         real_init(self, *args, **kwargs)
         instances.append(self)
 
-    monkeypatch.setattr(_RecordingSessionDB, "__init__", _capture_init)
-    monkeypatch.setattr(hermes_state, "SessionDB", _RecordingSessionDB)
+    monkeypatch.setattr(db_type, "__init__", _capture_init)
+    monkeypatch.setattr(hermes_state, "SessionDB", db_type)
     monkeypatch.setattr(run_agent, "AIAgent", _FakeCronAgent)
     monkeypatch.setattr(
         "hermes_constants.resolve_reasoning_config", lambda *_a, **_k: None
@@ -103,7 +104,7 @@ def _run_booked_job(monkeypatch, tmp_path):
     monkeypatch.setattr(
         cron_scheduler, "_guard_job_credential_exfil", lambda _job: None
     )
-    cron_scheduler.run_job(
+    outcome = cron_scheduler.run_job(
         {
             "id": "verify-complete",
             "name": "Verification",
@@ -111,6 +112,9 @@ def _run_booked_job(monkeypatch, tmp_path):
             "schedule_display": "manual",
         }
     )
+    assert outcome[0] is (expected_error is None), outcome[3]
+    if expected_error:
+        assert expected_error in outcome[3]
     return instances
 
 
@@ -151,3 +155,41 @@ def test_classification_probe_failure_keeps_historical_reason(monkeypatch, tmp_p
 
     reasons = [reason for _sid, reason in instances[0].ended]
     assert reasons == ["cron_complete"]
+
+
+@pytest.mark.parametrize("lifecycle", ["complete", "interrupted", RuntimeError("metadata probe unavailable")])
+@pytest.mark.parametrize("failed,completed", [(True, False), (False, False)])
+def test_reported_failure_never_books_healthy_session(monkeypatch, tmp_path, lifecycle, failed, completed):
+    _RecordingSessionDB.next_lifecycle = lifecycle
+    monkeypatch.setattr(_FakeCronAgent, "run_conversation", lambda self, prompt, **kwargs: {
+        "failed": failed, "completed": completed,
+        "final_response": "Synthetic provider usage limit; review was interrupted.",
+        "turn_exit_reason": "provider_error",
+    })
+    instances = _run_booked_job(monkeypatch, tmp_path, expected_error="Synthetic provider usage limit")
+    assert [reason for _, reason in instances[0].ended] == ["cron_failed"]
+
+
+def test_quota_error_reply_persists_failed_session_in_real_sqlite(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+    path = tmp_path / "sessions.db"
+
+    class DiskDB(SessionDB):
+        def __init__(self, *args, **kwargs):
+            super().__init__(path)
+
+    def initialize(self, *args, session_db, session_id, **kwargs):
+        self.db, self.session_id = session_db, session_id
+        self.db.create_session(session_id, "cron")
+
+    def interrupted(self, prompt, **kwargs):
+        self.db.append_message(self.session_id, "user", "Synthetic scheduled review")
+        self.db.append_message(self.session_id, "assistant", "Synthetic provider usage limit")
+        return {"failed": True, "completed": False, "final_response": "Synthetic provider usage limit"}
+
+    monkeypatch.setattr(_FakeCronAgent, "__init__", initialize)
+    monkeypatch.setattr(_FakeCronAgent, "run_conversation", interrupted)
+    _run_booked_job(monkeypatch, tmp_path, db_type=DiskDB, expected_error="Synthetic provider usage limit")
+    with sqlite3.connect(path) as observer:
+        assert observer.execute("SELECT source,end_reason FROM sessions").fetchall() == [("cron", "cron_failed")]
+        assert observer.execute("SELECT role FROM messages ORDER BY id").fetchall() == [("user",), ("assistant",)]

@@ -212,6 +212,13 @@ def set_current_observability_context(
     )
 
 
+def get_current_tool_context() -> dict[str, str]:
+    """Read correlation bound by the dispatcher, never model arguments."""
+    return {"turn_id": _approval_turn_id.get(),
+            "tool_call_id": _approval_tool_call_id.get(),
+            "session_id": _approval_session_id.get()}
+
+
 def reset_current_observability_context(
     tokens: tuple[
         contextvars.Token[str], contextvars.Token[str], contextvars.Token[str]
@@ -3762,6 +3769,26 @@ def _smart_approve(command: str, description: str) -> str:
         return "escalate"
 
 
+def _missing_session_context_result() -> dict | None:
+    """A lost host context is not a trusted headless CLI invocation."""
+    from gateway.session_context import session_context_missing
+
+    if not session_context_missing():
+        return None
+    return {
+        "approved": False,
+        "outcome": "blocked",
+        "reason": "session_context_missing",
+        "user_consent": False,
+        "message": (
+            "BLOCKED: The session host has no bound conversation context for "
+            "this call. Restore the originating turn's context in the runner "
+            "before retrying; another session's approval or process environment "
+            "cannot authorize it."
+        ),
+    }
+
+
 def _run_approval_gate(
     *,
     pattern_key: str,
@@ -3817,6 +3844,10 @@ def _run_approval_gate(
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
         ``check_dangerous_command`` so all callers handle it uniformly.
     """
+    missing_context = _missing_session_context_result()
+    if missing_context is not None:
+        return missing_context
+
     # --yolo bypasses all approval prompts (session- or process-scoped).
     # Hardline blocks are handled by the caller BEFORE this gate, so yolo
     # here only skips the recoverable approval layer.
@@ -4109,6 +4140,9 @@ def check_dangerous_command(command: str, env_type: str,
     Returns:
         {"approved": True/False, "message": str or None, ...}
     """
+    missing_context = _missing_session_context_result()
+    if missing_context is not None:
+        return missing_context
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
 
@@ -4850,6 +4884,9 @@ def check_all_command_guards(command: str, env_type: str,
     such a session is no longer isolated, so it goes through the normal flow
     instead of the container fast-path.
     """
+    missing_context = _missing_session_context_result()
+    if missing_context is not None:
+        return missing_context
     # Skip isolated container backends for both checks. Docker stops skipping
     # once host paths are bind-mounted into the sandbox.
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
@@ -5573,6 +5610,9 @@ def check_execute_code_guard(code: str, env_type: str,
     trusted-by-config (set a gateway/ask surface or ``approvals.cron_mode`` to
     require approval).
     """
+    missing_context = _missing_session_context_result()
+    if missing_context is not None:
+        return missing_context
     pattern_key = "execute_code"
     description = (
         "execute_code script execution. The script can spawn subprocesses or "

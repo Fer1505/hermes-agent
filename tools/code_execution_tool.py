@@ -427,6 +427,13 @@ _TOOL_STUBS = {
 }
 
 
+def _resolve_sandbox_tools(enabled_tools=None) -> frozenset:
+    """Omitted legacy scope defaults to the allowlist; explicit scope can be empty."""
+    if enabled_tools is None:
+        return SANDBOX_ALLOWED_TOOLS
+    return frozenset(SANDBOX_ALLOWED_TOOLS & set(enabled_tools))
+
+
 def _sandbox_failure_hint(stderr_text: str, enabled_tools=None) -> Optional[str]:
     """Map well-known sandbox script failures to one actionable recovery hint.
 
@@ -441,12 +448,12 @@ def _sandbox_failure_hint(stderr_text: str, enabled_tools=None) -> Optional[str]
         return None
     window = stderr_text[:4000]
     try:
+        available = sorted(_resolve_sandbox_tools(enabled_tools))
         m = re.search(
             r"cannot import name '(\w+)' from 'hermes_tools'", window
         )
         if m:
             missing = m.group(1)
-            available = sorted(SANDBOX_ALLOWED_TOOLS & set(enabled_tools or SANDBOX_ALLOWED_TOOLS))
             builtin = {"json_parse", "shell_quote", "retry"}
             if missing in builtin:
                 return (
@@ -455,8 +462,9 @@ def _sandbox_failure_hint(stderr_text: str, enabled_tools=None) -> Optional[str]
                 )
             return (
                 f"'{missing}' is not available inside the execute_code sandbox. "
-                f"Importable tools here: {', '.join(available)}. For anything "
-                "else, use the normal tool call instead of execute_code."
+                f"Importable tools here: {', '.join(available) or 'none'}. "
+                "Use another normal tool only if it is enabled for this session; "
+                "otherwise report the missing capability."
             )
         m = re.search(r"NameError: name '(json_parse|shell_quote|retry)' is not defined", window)
         if m:
@@ -466,11 +474,22 @@ def _sandbox_failure_hint(stderr_text: str, enabled_tools=None) -> Optional[str]
             )
         m = re.search(r"ModuleNotFoundError: No module named '([\w.]+)'", window)
         if m:
-            return (
-                f"'{m.group(1)}' is not installed in the sandbox interpreter. "
-                "Use Python stdlib inside execute_code, or run the code via "
-                "terminal() with the project venv's python instead."
-            )
+            module = m.group(1)
+            hint = f"The current execute_code interpreter cannot import '{module}'. "
+            if module.split('.')[0] == "bs4":
+                if "web_extract" in available:
+                    hint += "Use the available web_extract tool for page extraction, or "
+                else:
+                    hint += "For HTML already retrieved, "
+                hint += "use Python's stdlib html.parser instead of importing bs4 again. "
+            else:
+                hint += "Use a suitable Python stdlib alternative when possible. "
+            if "terminal" in available:
+                hint += (
+                    "If a project interpreter is required, verify its path and import "
+                    "availability via terminal() before using it. "
+                )
+            return hint + "Keep the current task; report any remaining capability gap. Dependency installation requires the task's authorization."
         if re.search(r"TypeError: string indices must be integers|AttributeError: 'str' object has no attribute 'get'", window):
             return (
                 "Tool functions in the sandbox return DICTS (already parsed) — "
@@ -1157,7 +1176,8 @@ def _format_interrupted_output(stdout_text: str) -> str:
 
 
 def _finish_remote_kernel_result(kernel_result: Dict[str, Any], *,
-                                 timeout: int, exec_start: float) -> str:
+                                 timeout: int, exec_start: float,
+                                 enabled_tools=None) -> str:
     """Post-process a remote-kernel cell result into the tool's JSON reply.
 
     Same output pipeline as the per-call paths: truncation, ANSI strip,
@@ -1205,6 +1225,14 @@ def _finish_remote_kernel_result(kernel_result: Dict[str, Any], *,
     elif result["status"] == "error" and kernel_result.get("error"):
         result["error"] = kernel_result["error"]
 
+    if result["status"] == "error":
+        hint = _sandbox_failure_hint(
+            redact_sensitive_text(strip_ansi(stderr_text + traceback_text), code_file=True),
+            enabled_tools=enabled_tools,
+        )
+        if hint:
+            result["hint"] = hint
+
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -1227,10 +1255,7 @@ def _execute_remote(
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = _resolve_sandbox_tools(enabled_tools)
 
     effective_task_id = task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
@@ -1294,6 +1319,7 @@ def _execute_remote(
         if kernel_result is not None:
             return _finish_remote_kernel_result(
                 kernel_result, timeout=timeout, exec_start=exec_start,
+                enabled_tools=sandbox_tools,
             )
         logger.info(
             "remote session kernel unavailable on %s; using per-call path",
@@ -1428,6 +1454,9 @@ def _execute_remote(
     elif exit_code != 0:
         result["status"] = "error"
         result["error"] = f"Script exited with code {exit_code}"
+        hint = _sandbox_failure_hint(stdout_text, enabled_tools=sandbox_tools)
+        if hint:
+            result["hint"] = hint
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -1625,11 +1654,7 @@ def execute_code(
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
     # Determine which tools the sandbox can call
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = _resolve_sandbox_tools(enabled_tools)
 
     if _get_kernel_mode() == "session":
         # Session kernels keep one interpreter alive across calls; the guards

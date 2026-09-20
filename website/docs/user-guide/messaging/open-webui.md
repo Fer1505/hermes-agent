@@ -294,3 +294,12 @@ docker run --network=host -e OPENAI_API_BASE_URL=http://localhost:8642/v1 ...
 # Option 3: Use Docker bridge IP
 docker run -e OPENAI_API_BASE_URL=http://172.17.0.1:8642/v1 ...
 ```
+
+
+## September 16, 2026 — explicit Chat Completions continuity
+
+Hermes no longer infers a persistent conversation from matching opening prompts. Independent chats that both start with “Hello” must have different session IDs.
+
+Before upgrading an integration that relies on persistent Hermes sessions, verify that its connector preserves the returned `X-Hermes-Session-Id` separately for each chat and resends it on follow-up turns, or uses the Responses API's `previous_response_id` chain. Configure API-key authentication for explicit session continuity. Do not set one static session ID for every chat. See [API Server continuity](/user-guide/features/api-server#september-16-2026--explicit-chat-completions-continuity).
+
+A client that only resends the full `messages` history continues to provide model context, but each request gets a fresh Hermes tool-task/session namespace. Per-chat integration behavior, including edits, branches and utility/title requests, must be verified in the installed frontend before rollout; custom-header support alone does not establish correct conversation routing.

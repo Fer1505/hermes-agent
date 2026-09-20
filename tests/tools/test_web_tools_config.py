@@ -372,8 +372,15 @@ class TestParallelClientConfig:
         fake_parallel.Parallel = Parallel
         fake_parallel.AsyncParallel = AsyncParallel
         sys.modules["parallel"] = fake_parallel
+        # This fixture supplies a synthetic SDK; its distribution is not
+        # installed. Keep client-construction tests out of the lazy installer.
+        self._sdk_install = patch(
+            "plugins.web.parallel.provider._ensure_parallel_sdk_installed"
+        )
+        self._sdk_install.start()
 
     def teardown_method(self):
+        self._sdk_install.stop()
         import tools.web_tools
         tools.web_tools._parallel_client = None
         os.environ.pop("PARALLEL_API_KEY", None)
@@ -387,6 +394,7 @@ class TestParallelClientConfig:
             client = _get_parallel_client()
             assert client is not None
             assert isinstance(client, Parallel)
+            assert client.api_key == "test-key"
 
     def test_no_key_raises_with_helpful_message(self):
         """No PARALLEL_API_KEY → ValueError with guidance."""

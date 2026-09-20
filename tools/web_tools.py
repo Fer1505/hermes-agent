@@ -110,6 +110,79 @@ def _web_extract_url(value: Any) -> Optional[str]:
     return value or None
 
 
+def _bind_extract_results(urls: List[str], results: Any) -> List[dict]:
+    """Match provider results by request identity, never batch position.
+
+    Batch APIs may return successes and errors separately or omit failures.
+    Per-URL providers can report requested_url separately from a redirect's
+    final url. Legacy providers can match by URL or a single-request response;
+    ambiguous batches require individual requests, not a guessed cache key.
+    """
+    unique_urls = set(urls)
+    candidates: Dict[str, List[dict]] = {url: [] for url in unique_urls}
+    rows = results if isinstance(results, list) else []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if "requested_url" in row:
+            requested = row["requested_url"]
+        elif isinstance(row.get("url"), str) and row["url"] in unique_urls:
+            requested = row["url"]
+        elif len(unique_urls) == 1 and len(rows) == 1:
+            requested = urls[0]
+        else:
+            continue
+        if isinstance(requested, str) and requested in candidates:
+            candidates[requested].append(row)
+    bound = []
+    for url in urls:
+        matches = candidates[url]
+        # Repeated identical request URLs commonly produce identical rows.
+        # Conflicting observations must not be selected arbitrarily.
+        if matches and all(row == matches[0] for row in matches[1:]):
+            bound.append({**matches[0], "requested_url": url})
+        else:
+            bound.append({
+                "requested_url": url, "url": url, "title": "", "content": "",
+                "attribution_error": True,
+                "error": "Extract response could not be uniquely matched to this request. "
+                         "Retry this URL individually; no content was attributed or cached.",
+            })
+    return bound
+
+
+async def _check_extract_source(result: dict) -> dict:
+    """Apply the same final-source policy to every provider and cache hit."""
+    if result.get("error"):
+        return result
+    from tools.website_policy import check_website_access
+    from agent.redact import _PREFIX_RE
+    from urllib.parse import unquote
+
+    url = result.get("url")
+    blocked = None
+    if not isinstance(url, str) or not url.strip():
+        error = "Extract backend did not report a source URL; content is unverified."
+    elif _PREFIX_RE.search(unquote(url)) or sensitive_query_param_name(url):
+        # Do not echo an embedded credential from a provider's redirect URL.
+        result = {**result, "url": ""}
+        error = "Blocked: reported source URL contains credential-like data."
+    elif not await async_is_safe_url(url):
+        error = "Blocked: reported source URL targets a private or internal network address"
+    else:
+        blocked = check_website_access(url)
+        error = blocked["message"] if blocked else None
+    if not error:
+        return result
+    # Drop provider content/metadata, including alternate raw representations.
+    return {
+        "requested_url": result.get("requested_url"), "url": result.get("url", ""),
+        "title": "", "content": "", "error": error,
+        **({"blocked_by_policy": {k: blocked[k] for k in ("host", "rule", "source")}}
+           if blocked else {}),
+    }
+
+
 # ─── Backend Selection ────────────────────────────────────────────────────────
 
 def _env_value(name: str) -> str:
@@ -525,15 +598,14 @@ def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
     """
     from plugins.web.keyless_mcp import extract_with_failover
 
+    results = _bind_extract_results(urls, results)
     # Partition out policy blocks. Rescue only genuine backend failures.
-    if len(results) == len(urls):
-        rescue_idx = [i for i, r in enumerate(results) if not _policy_blocked_result(r)]
-    else:  # defensive: provider broke order parity — treat all as rescueable
-        rescue_idx = list(range(len(results)))
+    rescue_idx = [i for i, r in enumerate(results)
+                  if not _policy_blocked_result(r) and not r.get("attribution_error")]
     if not rescue_idx:
         return results  # every failure is an intentional policy block
 
-    rescue_urls = [urls[i] for i in rescue_idx] if len(results) == len(urls) else list(urls)
+    rescue_urls = [urls[i] for i in rescue_idx]
     original_error = next(
         (results[i].get("error") for i in rescue_idx if results[i].get("error")),
         "extract failed",
@@ -542,7 +614,9 @@ def _rescue_extract(provider_name: str, urls: list, results: list) -> list:
         "web_extract backend '%s' failed all %d URL(s) (%s); one-shot keyless rescue",
         provider_name, len(rescue_urls), (original_error or "")[:200],
     )
-    rescued = extract_with_failover(provider_name, list(rescue_urls))
+    rescued = _bind_extract_results(
+        rescue_urls, extract_with_failover(provider_name, list(rescue_urls))
+    )
     rescued_errors = [r.get("error", "") for r in rescued]
     if rescued and all(e for e in rescued_errors):
         return results  # rescue also failed everywhere: keep original errors
@@ -1126,6 +1200,7 @@ async def web_extract_tool(
         safe_urls = []
         safe_indices = []
         ssrf_blocked: Dict[int, Dict[str, Any]] = {}
+        from tools.website_policy import check_website_access as _check_site
         for index, url in zip(normalized_indices, normalized_urls):
             if not await async_is_safe_url(url):
                 ssrf_blocked[index] = {
@@ -1133,6 +1208,14 @@ async def web_extract_tool(
                     "error": "Blocked: URL targets a private or internal network address",
                 }
             else:
+                blocked = _check_site(url)
+                if blocked:
+                    ssrf_blocked[index] = {
+                        "url": url, "title": "", "content": "",
+                        "error": blocked["message"],
+                        "blocked_by_policy": {k: blocked[k] for k in ("host", "rule", "source")},
+                    }
+                    continue
                 safe_urls.append(url)
                 safe_indices.append(index)
 
@@ -1256,22 +1339,23 @@ async def web_extract_tool(
                 extract_cache_get as _extract_cache_get,
                 extract_cache_put as _extract_cache_put,
             )
-            from tools.website_policy import check_website_access as _check_site
             cached_results: Dict[int, Dict[str, Any]] = {}
             fetch_urls: List[str] = []
             fetch_positions: List[int] = []
             for position, url in enumerate(safe_urls):
-                hit = None
-                try:
-                    _policy_block = _check_site(url)
-                except Exception:  # noqa: BLE001 — policy errors fail open like dispatch
-                    _policy_block = None
-                if _policy_block is None:
-                    hit = _extract_cache_get(
-                        url, format=format, provider=provider.name
-                    )
+                blocked = _check_site(url)
+                if blocked:
+                    cached_results[position] = {
+                        "requested_url": url, "url": url, "title": "", "content": "",
+                        "error": blocked["message"],
+                        "blocked_by_policy": {k: blocked[k] for k in ("host", "rule", "source")},
+                    }
+                    continue
+                hit = _extract_cache_get(url, format=format, provider=provider.name)
                 if hit is not None:
-                    cached_results[position] = hit
+                    cached_results[position] = await _check_extract_source(
+                        {**hit, "requested_url": url}
+                    )
                 else:
                     fetch_urls.append(url)
                     fetch_positions.append(position)
@@ -1309,6 +1393,7 @@ async def web_extract_tool(
                     else:
                         raise
                 else:
+                    results = _bind_extract_results(fetch_urls, results)
                     # One-shot keyless rescue when the WHOLE batch failed
                     # (backend-level outage, not per-page problems). Stateless:
                     # the next web_extract call uses the chosen backend again.
@@ -1321,6 +1406,15 @@ async def web_extract_tool(
                         results = await asyncio.to_thread(
                             _rescue_extract, provider.name, fetch_urls, results
                         )
+
+                results = _bind_extract_results(fetch_urls, results)
+                results = [await _check_extract_source(row) for row in results]
+
+                # Cache-hit metadata belongs to this local cache, never to a
+                # provider payload (including a rescue provider's response).
+                for fetched in results:
+                    fetched.pop("cached", None)
+                    fetched.pop("cache_stored_at", None)
 
                 # Cache each successful fetch's full clean text for TTL reuse
                 # (best-effort; oversized pages are skipped by the cache).
@@ -1344,6 +1438,7 @@ async def web_extract_tool(
                                 title=fetched.get("title", ""),
                                 format=format,
                                 provider=provider.name,
+                                result_url=fetched.get("url") or "",
                             )
 
                 # Merge fetched results back with cache hits, restoring the
@@ -1366,8 +1461,8 @@ async def web_extract_tool(
                     results = merged
 
         # Reconstruct the original input order across invalid, blocked, and
-        # provider-processed entries. Providers are expected to preserve the
-        # order of the safe URL list they receive.
+        # provider-processed entries. The binding step above has already
+        # restored request order independently of provider batch order.
         if invalid_urls or ssrf_blocked:
             safe_results = {
                 index: (
@@ -1384,6 +1479,15 @@ async def web_extract_tool(
             }
             by_index = {**safe_results, **ssrf_blocked, **invalid_urls}
             results = [by_index[index] for index in range(len(urls))]
+
+        # Only local, reviewed authority may create display references. Provider
+        # payload fields with this name are deliberately discarded.
+        from agent.public_contacts import issue_contact_references
+        for result in results:
+            result.pop("public_contacts", None)
+            references = issue_contact_references(result)
+            if references:
+                result["public_contacts"] = references
 
         response = {"results": results}
         
@@ -1429,9 +1533,13 @@ async def web_extract_tool(
         trimmed_results = [
             {
                 "url": r.get("url", ""),
+                **({"requested_url": r["requested_url"]} if "requested_url" in r else {}),
                 "title": r.get("title", ""),
                 "content": r.get("content", ""),
                 "error": r.get("error"),
+                **({"public_contacts": r["public_contacts"]} if r.get("public_contacts") else {}),
+                **({"cached": True, "cache_stored_at": r["cache_stored_at"]}
+                   if r.get("cached") is True and "cache_stored_at" in r else {}),
                 **({  "blocked_by_policy": r["blocked_by_policy"]} if "blocked_by_policy" in r else {}),
             }
             for r in response.get("results", [])

@@ -4,8 +4,39 @@ from agent.file_safety import (
     get_path_boundary_error,
     get_writable_surfaces,
     get_workspace_roots,
+    get_write_denied_error,
     is_write_denied,
 )
+
+
+def test_write_denial_identifies_config_boundary_without_inventing_env_setting(tmp_path, monkeypatch):
+    workspace = tmp_path / "assigned-repository"
+    monkeypatch.delenv("HERMES_WRITE_SAFE_ROOT", raising=False)
+    monkeypatch.delenv("HERMES_WRITE_SAFE_ROOTS", raising=False)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {
+        "runtime": {"writableSurfaces": [{"path": str(workspace)}]},
+    })
+    error = get_write_denied_error(str(tmp_path / "outside" / "receipt.md"))
+    assert str(workspace.resolve()) in error
+    assert "configured writable surfaces" in error
+    assert "HERMES_WRITE_SAFE_ROOT" not in error
+    assert "Unset" not in error
+    assert get_write_denied_error(str(workspace / "receipt.md")) is None
+
+
+def test_legacy_env_cap_still_limits_broader_config_without_suggesting_bypass(tmp_path, monkeypatch):
+    allowed = tmp_path / "allowed"
+    other = tmp_path / "other"
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(allowed))
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {
+        "runtime": {"writableSurfaces": [{"path": str(other)}]},
+    })
+    error = get_write_denied_error(str(other / "receipt.md"))
+    assert "outside HERMES_WRITE_SAFE_ROOT" in error
+    assert str(allowed.resolve()) in error
+    assert "Unset" not in error
+    assert is_write_denied(str(other / "receipt.md")) is True
+    assert is_write_denied(str(allowed / "receipt.md")) is False
 
 
 def test_workspace_root_config_gates_reads_and_falls_back_for_writes(tmp_path, monkeypatch):

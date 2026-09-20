@@ -56,7 +56,7 @@ _CONTROL_RELATIVE_FILES = frozenset({
     ("auth", "google_oauth.json"),
     ("cache", "bws_cache.json"),
 })
-_CONTROL_DIRECTORY_NAMES = frozenset({"mcp-installs", "mcp-tokens", "pairing"})
+_CONTROL_DIRECTORY_NAMES = frozenset({"mcp-installs", "mcp-tokens", "pairing", "public-contact-receipts"})
 _MUTATING_CONTROL_OPERATIONS = frozenset({
     ProtectedFileOperation.WRITE,
     ProtectedFileOperation.RENAME,
@@ -643,10 +643,19 @@ def get_write_denied_error(path: str, *, verb: str = "Write") -> Optional[str]:
     if denial is None:
         return None
     if denial == "safe_root":
-        roots_display = os.pathsep.join(sorted(get_safe_write_roots()))
+        legacy_roots = get_safe_write_roots()
+        if legacy_roots and not is_path_within_roots(path, legacy_roots):
+            boundary = "HERMES_WRITE_SAFE_ROOT"
+            roots = sorted(legacy_roots)
+        else:
+            boundary = "configured writable surfaces"
+            roots = get_writable_surfaces()
+        roots_display = os.pathsep.join(roots)
         return (
-            f"{verb} denied: '{path}' is outside HERMES_WRITE_SAFE_ROOT "
-            f"({roots_display}). Unset the variable or add this path's directory prefix."
+            f"{verb} denied: '{path}' is outside {boundary} ({roots_display}). "
+            "Route this operation to an authorized owner or a permitted tool for "
+            "the canonical target. Keep the task unresolved until that operation "
+            "is verified; boundary changes require operator configuration."
         )
     return f"{verb} denied: '{path}' is a protected system/credential file."
 

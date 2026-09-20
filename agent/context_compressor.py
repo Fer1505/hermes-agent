@@ -8663,6 +8663,7 @@ def split_user_originated_turn(
     candidate.pop(_DB_PERSISTED_MARKER, None)
     if is_summary:
         candidate.pop("_row_id", None)
+        candidate.pop("_session_id", None)
     candidate.pop("display_kind", None)
     candidate.pop("display_metadata", None)
     carrier_metadata = message.get("display_metadata")

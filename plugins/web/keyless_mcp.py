@@ -405,6 +405,7 @@ def exa_extract_keyless(urls: List[str]) -> List[Dict[str, Any]]:
         except KeylessMCPError as exc:
             results.append(
                 {
+                    "requested_url": url,
                     "url": url,
                     "title": "",
                     "content": "",
@@ -427,6 +428,7 @@ def exa_extract_keyless(urls: List[str]) -> List[Dict[str, Any]]:
                 break
         results.append(
             {
+                "requested_url": url,
                 "url": url,
                 "title": title,
                 "content": text,
@@ -484,16 +486,18 @@ def firecrawl_extract_keyless(urls: List[str]) -> List[Dict[str, Any]]:
             title = metadata.get("title") or ""
             results.append(
                 {
-                    "url": url,
+                    "requested_url": url,
+                    "url": metadata.get("sourceURL") or url,
                     "title": title,
                     "content": content,
                     "raw_content": content,
-                    "metadata": {"sourceURL": url, "title": title},
+                    "metadata": metadata,
                 }
             )
         except Exception as exc:  # noqa: BLE001 — per-URL error entry
             results.append(
                 {
+                    "requested_url": url,
                     "url": url,
                     "title": "",
                     "content": "",
@@ -595,16 +599,18 @@ def keenable_extract_keyless(urls: List[str]) -> List[Dict[str, Any]]:
             title = data.get("title") or ""
             results.append(
                 {
+                    "requested_url": url,
                     "url": data.get("url") or url,
                     "title": title,
                     "content": content,
                     "raw_content": content,
-                    "metadata": {"sourceURL": url, "title": title},
+                    "metadata": {"sourceURL": data.get("url") or url, "title": title},
                 }
             )
         except Exception as exc:  # noqa: BLE001 — per-URL error entry
             results.append(
                 {
+                    "requested_url": url,
                     "url": url,
                     "title": "",
                     "content": "",

@@ -280,14 +280,9 @@ def test_extract_cache_tampered_index_path_is_miss(_isolated_cache, tmp_path):
     """An index entry pointing outside cache/web must never be read."""
     outside = tmp_path / "outside.md"
     outside.write_text("secret", encoding="utf-8")
-    index = {
-        wrc._url_digest("https://evil.com", None): {
-            "url": "https://evil.com",
-            "file": str(outside),
-            "title": "",
-            "fetched_at": time.time(),
-        }
-    }
+    extract_cache_put("https://evil.com", "secret")
+    index = wrc._load_index()
+    index[wrc._url_digest("https://evil.com", None)]["file"] = str(outside)
     (_isolated_cache / wrc._INDEX_FILENAME).write_text(json.dumps(index))
     assert extract_cache_get("https://evil.com") is None
 
@@ -336,3 +331,54 @@ def test_ttl_clamping(monkeypatch):
     assert wrc.ttl_seconds() == 1440 * 60.0   # ceiling 24h
     monkeypatch.setattr(wrc, "_web_config", lambda: {"cache_ttl_minutes": "bogus"})
     assert wrc.ttl_seconds() == 20 * 60.0     # default on garbage
+
+
+def test_reported_url_and_cache_time_survive_disk_index_reload(_isolated_cache, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(wrc.time, "time", lambda: clock[0])
+    extract_cache_put("https://example.com/start", "public text", provider="synthetic", result_url="https://example.org/contact")
+    clock[0] += 10
+    hit = extract_cache_get("https://example.com/start", provider="synthetic")
+    assert hit["url"] == "https://example.org/contact"
+    assert hit["cache_stored_at"] == 1000.0
+    assert hit["cached"] is True
+
+
+def test_legacy_cache_entry_cannot_invent_reported_source(_isolated_cache):
+    url = "https://example.com/legacy"
+    extract_cache_put(url, "old content")
+    index = wrc._load_index()
+    entry = index[wrc._url_digest(url, None)]
+    for field in ("schema_version", "result_url", "content_sha256"):
+        entry.pop(field)
+    wrc._save_index(index)
+    assert extract_cache_get(url) is None
+
+
+def test_content_index_mismatch_is_cache_miss(_isolated_cache):
+    url = "https://example.com/content"
+    extract_cache_put(url, "original source text")
+    from pathlib import Path
+    entry = wrc._load_index()[wrc._url_digest(url, None)]
+    Path(entry["file"]).write_text("different source text", encoding="utf-8")
+    assert extract_cache_get(url) is None
+
+
+@pytest.mark.parametrize("timestamp", [None, "invalid", float("nan"), float("inf"), -float("inf"), 1001.0])
+def test_invalid_or_future_cache_time_is_miss(_isolated_cache, monkeypatch, timestamp):
+    monkeypatch.setattr(wrc.time, "time", lambda: 1000.0)
+    url = "https://example.com/time"
+    extract_cache_put(url, "source text")
+    index = wrc._load_index()
+    index[wrc._url_digest(url, None)]["fetched_at"] = timestamp
+    wrc._save_index(index)
+    assert extract_cache_get(url) is None
+
+
+@pytest.mark.parametrize("content", ["line one\r\nline two\r\n", "line one\rline two"])
+def test_cache_digest_preserves_provider_line_endings(_isolated_cache, content):
+    url = "https://example.com/line-endings"
+    extract_cache_put(url, content)
+    hit = extract_cache_get(url)
+    assert hit is not None
+    assert hit["content"] == content

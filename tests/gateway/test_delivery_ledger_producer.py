@@ -8,6 +8,7 @@ block the send.
 """
 
 import asyncio
+import json
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -100,6 +101,34 @@ async def _run(adapter, event, response="final answer"):
 
 
 class TestProducerHook:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("result", [
+        SendResult(success=True),
+        SendResult(success=False, error="ReadTimeout: request timed out"),
+        SendResult(success=False, error="WriteTimeout", retryable=True),
+    ])
+    async def test_unproven_outcome_is_never_auto_replayed(self, result):
+        adapter = _Adapter()
+        adapter.DELIVERY_PROOF_KIND = "message_id"
+        adapter.send = AsyncMock(return_value=result)
+        await _run(adapter, _event())
+        assert _rows()[0][1] == "ambiguous"
+        assert dl.sweep_recoverable(now=dl.time.time() + 61) == []
+        adapter.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_provider_receipt_is_durable_with_target_and_transport_owner(self):
+        adapter = _Adapter()
+        adapter.DELIVERY_PROOF_KIND = "message_id"
+        adapter._owner_profile = "synthetic-owner"
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="provider-42",
+            raw_response={"private_provider_payload": "must not be copied"}))
+        await _run(adapter, _event())
+        with dl._transaction() as conn:
+            row = conn.execute("SELECT state, platform, chat_id, adapter_profile, delivery_proof FROM delivery_obligations").fetchone()
+        assert row[:4] == ("delivered", "slack", "C1", "synthetic-owner")
+        assert json.loads(row[4]) == {"kind": "message_id", "value": "provider-42"}
+
     @pytest.mark.asyncio
     async def test_normal_turn_records_and_delivers(self):
         adapter = _Adapter()

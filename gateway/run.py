@@ -986,7 +986,7 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
-def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
+def _sanitize_gateway_final_response(platform: Any, text: str, *, session_id: str = "") -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
     Every human-facing chat surface (Telegram, WhatsApp, Discord, Slack,
@@ -1022,7 +1022,8 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     redacted = _redact_gateway_user_facing_secrets(str(text))
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
-    return redacted
+    from agent.public_contacts import render_contact_references
+    return render_contact_references(redacted, session_id=session_id)
 
 
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
@@ -13127,9 +13128,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         or proof is not None
                     )
                 ):
-                    await asyncio.to_thread(
-                        mark_delivered, row["obligation_id"], claim_token
+                    committed = await asyncio.to_thread(
+                        mark_delivered, row["obligation_id"], claim_token,
+                        delivery_proof=proof,
                     )
+                    if not committed:
+                        logger.warning(
+                            "obligation %s: receipt not committed because claim changed",
+                            row["obligation_id"],
+                        )
+                        continue
                     redelivered += 1
                     logger.info(
                         "Redelivered recovered final response to %s:%s "
@@ -13138,10 +13146,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         row["obligation_id"], row["attempts"],
                     )
                 else:
-                    raw = getattr(result, "raw_response", None)
-                    delivery_state = (
-                        raw.get("delivery_state") if isinstance(raw, dict) else None
-                    )
                     _redelivery_error = str(getattr(result, "error", "") or "send failed")
                     await asyncio.to_thread(
                         mark_failed,
@@ -13151,7 +13155,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         retry_after=getattr(result, "retry_after", None),
                         ambiguous=bool(
                             result is None
-                            or delivery_state == "attempted_unverified"
+                            or getattr(result, "success", False)
+                            or BasePlatformAdapter._delivery_attempted_unverified(result)
                             or (
                                 getattr(result, "retryable", False) is True
                                 and not is_runtime_retryable_error(_redelivery_error)
@@ -22486,7 +22491,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = _normalize_empty_agent_response(
                     agent_result, response, history_len=len(history),
                 )
-                response = _sanitize_gateway_final_response(source.platform, response)
+                response = _sanitize_gateway_final_response(
+                    source.platform, response,
+                    session_id=agent_result.get("session_id") or session_entry.session_id,
+                )
 
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().

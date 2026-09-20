@@ -132,11 +132,10 @@ def test_run_job_cron_execute_code_deny_does_not_pollute_later_gateway_execute_c
     assert os.environ.get("HERMES_CRON_SESSION") is None
     assert get_session_env("HERMES_CRON_SESSION") == ""
 
-    # A completed in-process job must restore the truly-unset ContextVar state,
-    # not leave an explicit empty value that shadows the standalone cron env
-    # fallback in this reused context.
+    # Once this process has hosted a bound job, a new unbound context must
+    # not borrow a process-global cron flag. The next job binds its own flag.
     monkeypatch.setenv("HERMES_CRON_SESSION", "1")
-    assert get_session_env("HERMES_CRON_SESSION") == "1"
+    assert get_session_env("HERMES_CRON_SESSION") == ""
     monkeypatch.delenv("HERMES_CRON_SESSION")
 
     session_key = "cron-isolation-session"

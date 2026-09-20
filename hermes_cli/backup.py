@@ -2531,56 +2531,14 @@ def run_import(args) -> None:
 # are recoverable if anything goes wrong (issue #15733).
 _QUICK_STATE_FILES = (
     "state.db",
+    "public-contact-receipts",          # immutable display evidence referenced by state.db
     "config.yaml",
     ".env",
     "auth.json",
     "cron/jobs.json",
     "cron/executions.db",
-    "gateway_state.json",
-    "channel_directory.json",
-    "channel_aliases.json",
-    "processes.json",
-    "gateway/discord_message_recovery.db",  # Discord reconnect replay ledger
-    # Per-profile user-created stores that live outside the git checkout and
-    # are therefore destroyed if the update flow removes/replaces the file and
-    # the post-update schema-init re-creates an empty one (issue #52889). All
-    # are at $HERMES_HOME/<name> for the default/root profile; on non-root
-    # profiles the real path is outside HERMES_HOME and the entry is silently
-    # skipped (best-effort, same as the pairing stores). SQLite DBs are copied
-    # WAL-safely via _safe_copy_db.
-    "projects.db",                      # per-profile project store
-    "response_store.db",                # gateway conversation history / tool payloads
-    "memory_store.db",                  # holographic memory facts/entities
-    "verification_evidence.db",         # agent verification audit trail
-    "kanban.db",                        # default board (back-compat <root>/kanban.db)
-    "kanban/boards",                    # non-default boards: each <slug>/kanban.db + board metadata (workspaces/ + attachments/ are skipped as regenerable)
-    # Pairing stores (generic + per-platform JSONs outside state.db)
-    "pairing",                          # legacy location (gateway/pairing.py)
-    "platforms/pairing",                # new location (gateway/pairing.py)
-    "feishu_comment_pairing.json",      # Feishu comment subscription pairings
-)
-
-# ``_QUICK_SNAPSHOTS_DIR`` lives with the exclusion rules at the top of the module.
-_QUICK_DEFAULT_KEEP = 20
-
-
-
-# Critical state files to include in quick snapshots (relative to HERMES_HOME).
-# Everything else is either regeneratable (logs, cache) or managed separately
-# (skills, repo, sessions/).
-#
-# Entries may be individual files OR directories.  Directories are captured
-# recursively; missing entries are silently skipped.  Pairing data lives in
-# platform-specific JSON blobs outside state.db, so it's listed here explicitly
-# — `hermes update` snapshots this set before pulling so approved-user lists
-# are recoverable if anything goes wrong (issue #15733).
-_QUICK_STATE_FILES = (
-    "state.db",
-    "config.yaml",
-    ".env",
-    "auth.json",
-    "cron/jobs.json",
-    "cron/executions.db",
+    "cron/notepad.db",                  # job cursors/watermarks prevent repeated work
+    "runs_idempotency.db",              # durable API admission/replay reservations
     "gateway_state.json",
     "channel_directory.json",
     "channel_aliases.json",
@@ -2607,6 +2565,48 @@ _QUICK_STATE_FILES = (
 
 _QUICK_SNAPSHOTS_DIR = "state-snapshots"
 _QUICK_DEFAULT_KEEP = 20
+
+
+def _copy_contact_snapshot_state(home, staging_dir, manifest, max_file_size):
+    """Copy immutable receipt files after the SQLite snapshot, or fail visibly.
+
+    A saved row is committed only after its display receipt is written. Walking
+    this directory after state.db is copied therefore includes receipts created
+    during that copy. Optional unreferenced receipts do not authorize new rows.
+    """
+    directory = home / "public-contact-receipts"
+    _ensure_safe_filesystem_path(home, directory, final_may_be_file=False,
+                                final_may_be_directory=True, allow_missing=True)
+    if not directory.exists():
+        return
+
+    def fail_walk(error):
+        raise error
+
+    for parent, dirs, files in os.walk(directory, followlinks=False, onerror=fail_walk):
+        for name in dirs:
+            _ensure_safe_filesystem_path(home, Path(parent) / name, final_may_be_file=False,
+                                        final_may_be_directory=True, allow_missing=False)
+        for name in files:
+            source = Path(parent) / name
+            _ensure_safe_filesystem_path(home, source, final_may_be_file=True,
+                                        final_may_be_directory=False, allow_missing=False)
+            relative = source.relative_to(home).as_posix()
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            with os.fdopen(os.open(source, flags), "rb") as reader:
+                info = os.fstat(reader.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    raise BackupError("Contact snapshot source is not a regular file")
+                if max_file_size is not None and info.st_size > max_file_size:
+                    raise BackupError("Contact snapshot receipt exceeds the file-size limit")
+                destination = staging_dir / relative
+                destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+                with os.fdopen(os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as writer:
+                    shutil.copyfileobj(reader, writer)
+                    writer.flush()
+                    if writer.tell() != info.st_size:
+                        raise BackupError("Contact snapshot receipt changed during copy")
+                manifest[relative] = info.st_size
 
 
 def _quick_snapshot_root(hermes_home: Optional[Path] = None) -> Path:
@@ -2702,6 +2702,15 @@ def _create_quick_snapshot_locked(
     oversized_skipped: list[str] = []
 
     for rel in _QUICK_STATE_FILES:
+        if rel == "public-contact-receipts":
+            try:
+                _copy_contact_snapshot_state(home, staging_dir, manifest, max_file_size)
+            except (BackupError, OSError) as exc:
+                # Never publish a successful-looking snapshot or prune its
+                # predecessor when the dependent history evidence was lost.
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                raise BackupError("Public-contact snapshot incomplete; prior snapshots retained") from exc
+            continue
         src = home / rel
         if not src.exists():
             continue

@@ -523,6 +523,27 @@ class TestBatchedDescribe:
 
 
 class TestConfigAndSchema:
+    @pytest.mark.parametrize("cap", [2, 10])
+    @pytest.mark.parametrize("bridge,field,constant", [
+        ("tool_search", "queries", "_MAX_QUERIES_PER_CALL"),
+        ("tool_describe", "names", "_MAX_DESCRIBE_NAMES_PER_CALL"),
+    ])
+    def test_advertised_batch_bounds_match_real_dispatch(self, issue_defs, monkeypatch, cap, bridge, field, constant):
+        import tools.tool_search as tool_search
+
+        monkeypatch.setattr(tool_search, constant, cap)
+        schemas = {s["function"]["name"]: s["function"] for s in tool_search.bridge_tool_schemas(len(issue_defs))}
+        schema = schemas[bridge]["parameters"]["properties"][field]
+        dispatch = getattr(tool_search, "dispatch_" + bridge)
+        cfg = tool_search.ToolSearchConfig.from_raw({})
+        for size, accepted in ((0, False), (schema["minItems"], True), (schema["maxItems"], True), (schema["maxItems"] + 1, False)):
+            response = json.loads(dispatch(
+                {field: [f"synthetic_tool_{i}" for i in range(size)]},
+                current_tool_defs=issue_defs, config=cfg,
+            ))
+            assert ("error" not in response) is accepted
+        assert str(schema["maxItems"]) in schemas[bridge]["description"]
+
     def test_limit_default_within_cap(self):
         from hermes_cli.config_defaults import DEFAULT_CONFIG
         from tools.tool_search import ToolSearchConfig

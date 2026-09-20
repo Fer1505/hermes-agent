@@ -29,6 +29,7 @@ Disable with ``web.cache_enabled: false``; both TTLs come from
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -50,6 +51,11 @@ _INDEX_FILENAME = "extract-index.json"
 
 # Cap index growth; oldest entries evicted past this.
 _INDEX_MAX_ENTRIES = 500
+
+# v2 could store a batched provider's result under a positional, wrong URL.
+# A digest only binds content bytes, not that request/result relationship.
+# Discard old entries on read; do not silently bless them by upgrading metadata.
+_EXTRACT_SCHEMA_VERSION = 3
 
 
 def _web_config() -> dict:
@@ -356,7 +362,11 @@ def extract_cache_get(
     format: Optional[str] = None,
     provider: str = "",
 ) -> Optional[dict]:
-    """Return {'url','title','content'} for a fresh cached page, else None."""
+    """Return a fresh page with its original reported URL and cache age.
+
+    Cache metadata is not an attestation of business ownership or a verified
+    redirect chain. The content digest detects mismatched backing-file writes.
+    """
     if not cache_enabled():
         return None
     if _is_local_dev_url(url) or _is_cache_exempt_host(url):
@@ -364,27 +374,38 @@ def extract_cache_get(
     with _index_lock:
         index = _load_index()
         entry = index.get(_url_digest(url, format, provider))
-    if not entry:
+    if not isinstance(entry, dict) or entry.get("schema_version") != _EXTRACT_SCHEMA_VERSION:
         return None
-    if (time.time() - float(entry.get("fetched_at", 0))) >= ttl_seconds():
+    result_url = entry.get("result_url")
+    if not isinstance(result_url, str) or not result_url or _is_local_dev_url(result_url) or _is_cache_exempt_host(result_url):
         return None
     try:
+        stored_at = float(entry["fetched_at"])
+        age = time.time() - stored_at
+        if not math.isfinite(stored_at) or not 0 <= age < ttl_seconds():
+            return None
         file_path = Path(entry["file"])
         cache_root = _cache_dir()
         # The index is plain JSON on disk; never let a tampered entry read
         # outside cache/web.
         if cache_root is None or cache_root.resolve() not in file_path.resolve().parents:
             return None
-        content = file_path.read_text(encoding="utf-8")
+        # Preserve the exact stored text for digest verification; universal
+        # newline conversion would turn CRLF pages into spurious cache misses.
+        with file_path.open(encoding="utf-8", newline="") as handle:
+            content = handle.read()
+        if hashlib.sha256(content.encode("utf-8")).hexdigest() != entry.get("content_sha256"):
+            return None
     except Exception:  # noqa: BLE001 — evicted/pruned file == miss
         return None
     logger.info("web_extract cache hit: %s", url)
     return {
-        "url": url,
+        "url": result_url,
         "title": entry.get("title", ""),
         "content": content,
         "error": None,
         "cached": True,
+        "cache_stored_at": stored_at,
     }
 
 
@@ -394,6 +415,8 @@ def extract_cache_put(
     title: str = "",
     format: Optional[str] = None,
     provider: str = "",
+    *,
+    result_url: Optional[str] = None,
 ) -> None:
     """Store one successful extraction's full clean text for TTL reuse.
 
@@ -407,6 +430,9 @@ def extract_cache_put(
         return
     if _is_local_dev_url(url) or _is_cache_exempt_host(url):
         return
+    result_url = url if result_url is None else result_url
+    if not isinstance(result_url, str) or not result_url or _is_local_dev_url(result_url) or _is_cache_exempt_host(result_url):
+        return
     try:
         from tools.web_tools import MAX_STORED_TEXT_CHARS
         if len(content) > MAX_STORED_TEXT_CHARS:
@@ -419,8 +445,11 @@ def extract_cache_put(
         with _index_lock:
             index = _load_index()
             index[_url_digest(url, format, provider)] = {
+                "schema_version": _EXTRACT_SCHEMA_VERSION,
                 "url": url,
+                "result_url": result_url,
                 "file": str(file_path),
+                "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
                 "title": title or "",
                 "fetched_at": time.time(),
             }

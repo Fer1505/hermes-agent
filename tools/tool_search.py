@@ -774,7 +774,7 @@ def bridge_tool_schemas(
     """
     desc_search = (
         f"Search {deferred_count} additional tools that are loaded on demand. "
-        "Takes a list of queries searched in parallel against the same "
+        f"Takes up to {_MAX_QUERIES_PER_CALL} queries searched in parallel against the same "
         "catalog; send one query per distinct capability you need. Returns "
         "matching tool names grouped per query plus a shared map with each "
         "tool's description. Follow with "
@@ -807,7 +807,8 @@ def bridge_tool_schemas(
     desc_describe = (
         f"Load the full JSON schemas for tools returned by `{TOOL_SEARCH_NAME}`. "
         f"Required before `{TOOL_CALL_NAME}` if a tool's parameters are unknown. "
-        "Batch every schema you need into one call."
+        f"Batch up to {_MAX_DESCRIBE_NAMES_PER_CALL} tool names per call. "
+        "Split larger requests into separate batches."
     )
     desc_call = (
         "Invoke a deferred tool by name with the given arguments. Argument shape "
@@ -827,6 +828,8 @@ def bridge_tool_schemas(
                         "queries": {
                             "type": "array",
                             "items": {"type": "string"},
+                            "minItems": 1,
+                            "maxItems": _MAX_QUERIES_PER_CALL,
                             "description": "Search queries, each a few keywords describing one capability (e.g. ['create github issue', 'send slack message']). Searched in parallel; results come back grouped per query. A single string is accepted and treated as one query.",
                         },
                         "limit": {
@@ -849,6 +852,8 @@ def bridge_tool_schemas(
                         "names": {
                             "type": "array",
                             "items": {"type": "string"},
+                            "minItems": 1,
+                            "maxItems": _MAX_DESCRIBE_NAMES_PER_CALL,
                             "description": "Exact tool names (as returned by tool_search). A single string is accepted and treated as one name.",
                         },
                     },

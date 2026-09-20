@@ -9630,7 +9630,16 @@ def _legacy_display_kind(role: str, text: str) -> str | None:
     return None
 
 
-def _history_to_messages(history: list[dict]) -> list[dict]:
+def _history_to_messages(history: list[dict], *, profile_home=None) -> list[dict]:
+    token = set_hermes_home_override(profile_home) if profile_home else None
+    try:
+        return _project_history_messages(history)
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
+
+
+def _project_history_messages(history: list[dict]) -> list[dict]:
     messages = []
     tool_call_args = {}
 
@@ -11049,7 +11058,7 @@ def _live_session_payload(
     payload = {
         "info": _fallback_session_info(session),
         "message_count": len(history),
-        "messages": [] if omit_messages else _history_to_messages(history),
+        "messages": [] if omit_messages else _history_to_messages(history, profile_home=session.get("profile_home")),
         "messages_omitted": omit_messages,
         "running": running,
         "turn_started_at": turn_started_at,
@@ -16179,7 +16188,7 @@ def _format_live_history_output(session: dict) -> str:
                 )
             except Exception:
                 pass
-    messages = _history_to_messages(history)
+    messages = _history_to_messages(history, profile_home=session.get("profile_home"))
     if not messages:
         return "No conversation history yet."
     lines = ["Conversation History", "────────────────────────────────────────"]
@@ -16219,13 +16228,13 @@ def _format_live_context_output(session: dict) -> str:
                 messages = _history_to_messages(
                     db.get_messages_as_conversation(
                         session["session_key"], include_ancestors=True, include_row_ids=True
-                    )
+                    ), profile_home=session.get("profile_home"),
                 )
             except Exception:
                 messages = []
     if not messages:
         with session["history_lock"]:
-            messages = _history_to_messages(list(session.get("history", [])))
+            messages = _history_to_messages(list(session.get("history", [])), profile_home=session.get("profile_home"))
     usage = _session_usage_snapshot(session)
     mirror = _metadata_mirror(session)
     lines = [

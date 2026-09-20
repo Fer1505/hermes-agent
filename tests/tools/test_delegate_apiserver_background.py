@@ -138,6 +138,19 @@ def test_apiserver_session_with_id_dispatches_background(monkeypatch):
     # id, not the subagent-internal id the child build clobbered
     # HERMES_SESSION_ID with (see clobbering_build_child).
     assert evt["origin_session_id"] == "raw-sid-7"
+    # Saved result ownership uses the durable parent, never the transport's
+    # wake id or the child's clobbered context id. Exercise real batch dispatch.
+    from types import SimpleNamespace
+    receipt = json.loads(dt.delegate_task(
+        action="result", delegation_id=parsed["delegation_id"],
+        parent_agent=SimpleNamespace(session_id="sess")))
+    assert receipt["result"]["results"][0]["summary"] == "done: bg on api_server"
+    for other in ("raw-sid-7", "20260715_child1"):
+        denied = json.loads(dt.delegate_task(
+            action="result", delegation_id=parsed["delegation_id"],
+            parent_agent=SimpleNamespace(session_id=other)))
+        assert "error" in denied
+        assert "done: bg on api_server" not in json.dumps(denied)
 
 
 # ---------------------------------------------------------------------------

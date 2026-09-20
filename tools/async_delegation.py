@@ -578,14 +578,29 @@ def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
         release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
 
-def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
-    with _DB_LOCK, _transaction() as conn:
-        row = conn.execute(
-            """SELECT origin_session, state, dispatched_at, completed_at,
+def get_durable_delegation(
+    delegation_id: str, *, read_only: bool = False,
+) -> Optional[Dict[str, Any]]:
+    query = """SELECT origin_session, state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
-                      origin_session_id
-               FROM async_delegations WHERE delegation_id=?""", (delegation_id,),
-        ).fetchone()
+                      origin_session_id, parent_session_id
+               FROM async_delegations WHERE delegation_id=?"""
+    if read_only:
+        # Model-facing inspection must not create a profile or migrate state.
+        # Use mode=ro (not immutable) so committed live WAL records stay visible.
+        path = _db_path()
+        if not path.is_file():
+            return None
+        with _DB_LOCK:
+            conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+            try:
+                conn.execute("PRAGMA query_only=ON")
+                row = conn.execute(query, (delegation_id,)).fetchone()
+            finally:
+                conn.close()
+    else:
+        with _DB_LOCK, _transaction() as conn:
+            row = conn.execute(query, (delegation_id,)).fetchone()
     if row is None:
         return None
     return {
@@ -594,6 +609,7 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         "result": json.loads(row[4]) if row[4] else None,
         "delivery_state": row[5], "delivery_attempts": row[6],
         "origin_session_id": row[7] or "",
+        "parent_session_id": row[8] or "",
     }
 
 

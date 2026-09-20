@@ -565,13 +565,18 @@ class _PathReadBudget:
             # incident rather than inferred from an lsof after one.
             logger.warning(
                 "%d live SessionDB handles on %s in this process; each holds "
-                "its own writer connection (read connections are capped at %d "
+                "its own primary connection (pooled read connections are capped at %d "
                 "for the file). A long-lived process should share one handle "
                 "per path.",
                 handles,
                 db.db_path,
                 _READ_POOL_MAX,
             )
+
+    def unregister(self, db: "SessionDB") -> None:
+        """Stop counting a closed handle even if its owner retains the object."""
+        with self._lock:
+            self._members.discard(db)
 
     def acquire(self, requester: "SessionDB") -> bool:
         """Take a permit for a new read connection, or refuse.
@@ -5127,6 +5132,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if not initialization_complete:
                 conn, self._conn = self._conn, None
                 self._close_connection_quietly(conn)
+                self._read_budget.unregister(self)
 
         # A prior process may have committed DB deletion and then lost the
         # filesystem unlink race. The queue is profile-local (state.db and
@@ -6203,6 +6209,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         )
                 conn, self._conn = self._conn, None
                 self._close_connection_quietly(conn)
+        # A completed agent or cache may retain this object after close().
+        # Weak-reference membership alone measures objects, not open handles.
+        # In-flight readers still return their path permits on release; close
+        # has already disabled their pool before we remove this idle member.
+        self._read_budget.unregister(self)
 
     def __del__(self) -> None:
         """Safety net: close the connection if the caller forgot.
@@ -11663,6 +11674,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             msg_id = cursor.lastrowid
 
+            self._capture_contact_display_metadata(
+                conn, session_id, msg_id, role, stored_content, display_metadata,
+                compressed=_compressed_summary,
+            )
+
             # Update counters
             if num_tool_calls > 0:
                 conn.execute(
@@ -11753,6 +11769,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 messages,
                 encode_content_fn=self._encode_content,
                 decode_content_fn=self._decode_content,
+                on_row_resolved=lambda row_id, filled, msg: self._sync_resolved_contact_display(
+                    conn, session_id, row_id, filled, msg,
+                ),
             )
             inserted = 0
             tool_calls_total = 0
@@ -12022,6 +12041,50 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return row[0] if row else None
 
+    def _sync_resolved_contact_display(self, conn, session_id, row_id, filled, msg):
+        row = conn.execute(
+            "SELECT role, content, display_metadata, _compressed_summary FROM messages "
+            "WHERE id = ? AND session_id = ?", (row_id, session_id),
+        ).fetchone()
+        if row is None:
+            return
+        metadata = self._decode_display_metadata(row["display_metadata"]) or {}
+        if filled:
+            metadata = self._capture_contact_display_metadata(
+                conn, session_id, row_id, row["role"], row["content"], metadata,
+                compressed=bool(row["_compressed_summary"]),
+            )
+        msg["_session_id"] = session_id
+        msg["display_metadata"] = metadata or None
+
+    def _capture_contact_display_metadata(
+        self, conn, session_id, row_id, role, content, metadata, *, compressed=False,
+    ):
+        """Bind optional contact display evidence to an actual inserted row.
+
+        Receipt-file capture failures leave an ordinary transcript row. Database
+        write errors retain normal transaction failure behavior. Supplied handles
+        confer no authority on a new row, including imports.
+        """
+        decoded = self._decode_display_metadata(metadata) or {}
+        if "public_contact_display" not in decoded and (
+            role != "assistant" or not isinstance(content, str) or "[public-contact:" not in content
+        ):
+            return decoded
+        from agent.public_contacts import capture_contact_display, DISPLAY_METADATA_KEY
+        clean = dict(decoded)
+        clean.pop(DISPLAY_METADATA_KEY, None)
+        if role == "assistant" and not compressed:
+            try:
+                clean = capture_contact_display(
+                    content, session_id=session_id, row_id=row_id, metadata=clean,
+                )
+            except Exception:
+                logger.debug("Optional public-contact display capture unavailable")
+        conn.execute("UPDATE messages SET display_metadata = ? WHERE id = ?",
+                     (self._encode_display_metadata(clean), row_id))
+        return clean
+
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
@@ -12108,6 +12171,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             if isinstance(msg, dict) and cur.lastrowid is not None:
                 msg["_row_id"] = cur.lastrowid
+                msg["_session_id"] = session_id
+                captured = self._capture_contact_display_metadata(
+                    conn, session_id, cur.lastrowid, role, self._encode_content(msg.get("content")),
+                    msg.get("display_metadata"), compressed=bool(msg.get("_compressed_summary")),
+                )
+                if captured:
+                    msg["display_metadata"] = captured
+                else:
+                    msg["display_metadata"] = None
             inserted += 1
             if tool_calls is not None:
                 tool_calls_total += (
@@ -12884,7 +12956,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
             rows = conn.execute(
-                f"SELECT {self._CONVERSATION_ROW_COLUMNS} "
+                f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
                 f"FROM messages WHERE session_id IN ({placeholders})"
                 # Order by AUTOINCREMENT id (true insertion order), NOT timestamp:
                 # append_message stamps rows with time.time(), which is not
@@ -12965,6 +13037,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # strips it before the wire.
             if include_row_ids and row["id"] is not None:
                 msg["_row_id"] = row["id"]
+                msg["_session_id"] = row["session_id"]
             # api_content is the byte-fidelity sidecar: the exact string sent
             # to the API when it differed from the clean content. Returned
             # VERBATIM — no sanitize_context, no strip — because the replay
@@ -13307,6 +13380,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 continue
             projected = message.copy()
             projected.pop("_row_id", None)
+            projected.pop("_session_id", None)
             prefix.append(projected)
         return prefix
 

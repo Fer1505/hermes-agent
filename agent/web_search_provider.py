@@ -180,6 +180,7 @@ class WebSearchProvider(abc.ABC):
             [
                 {
                     "url": str,
+                    "requested_url": str,      # optional request identity
                     "title": str,
                     "content": str,
                     "raw_content": str,
@@ -188,6 +189,15 @@ class WebSearchProvider(abc.ABC):
                 },
                 ...
             ]
+
+        Results need not preserve input order. The dispatcher associates exact
+        URL matches and single-URL replies. When a per-URL fetch reports a
+        different source URL (for example a redirect), set ``requested_url``
+        to the input URL and keep ``url`` as the reported source. An ambiguous
+        multi-URL result is not assigned by position or cached. Unknown fields
+        remain optional for plugin compatibility. These fields identify the
+        provider's observation; they do not attest business ownership or a
+        verified redirect chain.
 
         Implementations MAY be ``async def`` — the dispatcher detects
         coroutines via :func:`inspect.iscoroutinefunction` and awaits.

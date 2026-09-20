@@ -2692,6 +2692,7 @@ DEFAULT_CONFIG = {
         "tirith_path": "tirith",
         "tirith_timeout": 5,
         "tirith_fail_open": True,
+        "public_contacts": {"grants": [], "max_age_seconds": 3600},
         "website_blocklist": {
             "enabled": False,
             "domains": [],

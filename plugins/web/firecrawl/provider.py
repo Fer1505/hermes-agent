@@ -644,7 +644,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
 
         for url in urls:
             if _is_interrupted():
-                results.append({"url": url, "error": "Interrupted", "title": ""})
+                results.append({"requested_url": url, "url": url, "error": "Interrupted", "title": ""})
                 continue
 
             # Pre-scrape website policy gate
@@ -657,6 +657,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                 )
                 results.append(
                     {
+                        "requested_url": url,
                         "url": url,
                         "title": "",
                         "content": "",
@@ -685,6 +686,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                     logger.warning("Firecrawl scrape timed out for %s", url)
                     results.append(
                         {
+                            "requested_url": url,
                             "url": url,
                             "title": "",
                             "content": "",
@@ -721,6 +723,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                     )
                     results.append(
                         {
+                            "requested_url": url,
                             "url": final_url,
                             "title": title,
                             "content": "",
@@ -743,6 +746,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                     )
                     results.append(
                         {
+                            "requested_url": url,
                             "url": final_url,
                             "title": title,
                             "content": "",
@@ -765,6 +769,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
 
                 results.append(
                     {
+                        "requested_url": url,
                         "url": final_url,
                         "title": title,
                         "content": chosen_content,
@@ -776,6 +781,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                 logger.debug("Firecrawl scrape failed for %s: %s", url, scrape_err)
                 results.append(
                     {
+                        "requested_url": url,
                         "url": url,
                         "title": "",
                         "content": "",

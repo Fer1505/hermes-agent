@@ -39,6 +39,7 @@ def resolve_and_repair_transcript_batch(
     messages: List[Dict[str, Any]],
     encode_content_fn: Callable[[Any], Any],
     decode_content_fn: Callable[[Any], Any],
+    on_row_resolved: Optional[Callable[[int, bool, Dict[str, Any]], None]] = None,
 ) -> List[Dict[str, Any]]:
     """Partition a message batch within an active write transaction.
 
@@ -79,7 +80,8 @@ def resolve_and_repair_transcript_batch(
                 target_id = int(target_row["id"])
                 raw_content = target_row["content"]
                 decoded = decode_content_fn(raw_content)
-                if is_content_blank(decoded):
+                filled = is_content_blank(decoded)
+                if filled:
                     encoded = encode_content_fn(msg.get("content"))
                     conn.execute(
                         "UPDATE messages SET content = ? "
@@ -93,6 +95,8 @@ def resolve_and_repair_transcript_batch(
                     if isinstance(msg, dict):
                         msg["_row_id"] = target_id
                         msg["_canonical_content"] = decoded
+                if on_row_resolved is not None:
+                    on_row_resolved(target_id, filled, msg)
                 repaired = True
         if not repaired:
             inserted_rows.append(msg)
@@ -108,5 +112,12 @@ def sync_flushed_message_markers(
         written[_DB_PERSISTED_MARKER] = True
         if isinstance(row.get("_row_id"), int):
             written["_row_id"] = row["_row_id"]
+            if row.get("_session_id"):
+                written["_session_id"] = row["_session_id"]
+            if "display_metadata" in row:
+                if row["display_metadata"]:
+                    written["display_metadata"] = row["display_metadata"]
+                else:
+                    written.pop("display_metadata", None)
         if "_canonical_content" in row:
             written["content"] = row["_canonical_content"]

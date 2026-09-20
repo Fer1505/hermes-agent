@@ -3,6 +3,8 @@ import os
 
 import pytest
 
+import gateway.session_context as sc
+
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionContext, SessionSource
@@ -17,7 +19,7 @@ from gateway.session_context import (
 
 
 @pytest.fixture(autouse=True)
-def _reset_contextvars():
+def _reset_contextvars(monkeypatch):
     """Reset all session contextvars to _UNSET between tests.
 
     In production each asyncio.Task gets a fresh context copy where the
@@ -25,10 +27,17 @@ def _reset_contextvars():
     context, so a clear_session_vars() from test A (which sets vars to "")
     would leak into test B.  This fixture ensures each test starts clean.
     """
+    tokens = [var.set(_UNSET) for var in _VAR_MAP.values()]
+    async_token = sc._SESSION_ASYNC_DELIVERY.set(_UNSET)
+    bound_token = sc._session_context_bound.set(False)
+    # Each test starts as an env-only process; set_session_vars engages it.
+    # Resetting ContextVars alone must not reset a real host's monotonic latch.
+    monkeypatch.setattr(sc, "_session_context_engaged", False)
     yield
-    for var in _VAR_MAP.values():
-        # Can't use var.reset() without a token; just set back to sentinel.
-        var.set(_UNSET)
+    for var, token in zip(_VAR_MAP.values(), tokens):
+        var.reset(token)
+    sc._SESSION_ASYNC_DELIVERY.reset(async_token)
+    sc._session_context_bound.reset(bound_token)
 
 
 def test_set_session_env_sets_contextvars(monkeypatch):
@@ -261,7 +270,7 @@ def test_cron_session_explicit_blank_masks_leaked_env(monkeypatch):
 
 
 def test_cron_session_set_clear_and_reset_tristate(monkeypatch):
-    """Cron marker supports _UNSET fallback, 1 cron, and  explicit clear."""
+    """Resetting an engaged host cannot revive an old process cron marker."""
     monkeypatch.setenv("HERMES_CRON_SESSION", "1")
 
     tokens = set_session_vars(cron_session="1")
@@ -271,5 +280,4 @@ def test_cron_session_set_clear_and_reset_tristate(monkeypatch):
     assert get_session_env("HERMES_CRON_SESSION") == ""
 
     reset_session_vars()
-    assert get_session_env("HERMES_CRON_SESSION") == "1"
-
+    assert get_session_env("HERMES_CRON_SESSION") == ""

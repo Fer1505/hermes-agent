@@ -764,3 +764,19 @@ In Open WebUI, add each as a separate connection. The model dropdown shows `alic
 The API server also serves as the backend for **gateway proxy mode**. When another Hermes gateway instance is configured with `GATEWAY_PROXY_URL` pointing at this API server, it forwards all messages here instead of running its own agent. This enables split deployments — for example, a Docker container handling Matrix E2EE that relays to a host-side agent.
 
 See [Matrix Proxy Mode](/user-guide/messaging/matrix#proxy-mode-e2ee-on-macos) for the full setup guide.
+
+
+## September 16, 2026 — explicit Chat Completions continuity
+
+Requests to `/v1/chat/completions` without `X-Hermes-Session-Id` now receive a fresh Hermes session ID. Identical opening messages and system prompts no longer combine independent chats into one transcript or tool-task namespace. The request's `messages` array still supplies the model's conversation context.
+
+To keep a Hermes transcript and session-scoped tool state across turns:
+
+1. Authenticate with the configured API key.
+2. Save the `X-Hermes-Session-Id` response header from the first request.
+3. Send that value as the `X-Hermes-Session-Id` request header on subsequent turns of that conversation. Send a new user message; Hermes loads prior history from its session database.
+4. Omit the header when starting a different conversation, then save the new response header. Keep IDs separate for different conversations.
+
+Alternatively, use `/v1/responses` and send the preceding response's `id` as `previous_response_id`; this existing path preserves the response chain and its session.
+
+**Compatibility change:** clients that previously depended on the system-prompt/first-message fingerprint must adopt explicit continuity before deployment if they need session-scoped tool state. Sending full history still preserves model context, but does not identify a persistent tool session. Existing saved sessions remain available through their explicit IDs; no session data is migrated or deleted. `X-Hermes-Session-Key` remains a separate long-term-memory scope and does not select the short-term transcript. A retained session ID is not a promise that an ephemeral tool process/container survives cleanup or a host restart.

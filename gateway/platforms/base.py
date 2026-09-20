@@ -5868,11 +5868,6 @@ class BasePlatformAdapter(ABC):
             return result
         is_network = result.retryable or self._is_retryable_error(error_str)
 
-        # Timeout errors are not safe to retry (message may have been
-        # delivered) and not formatting errors — return the failure as-is.
-        if not is_network and self._is_timeout_error(error_str):
-            return result
-
         if is_network:
             # Retry with exponential backoff for transient errors.
             # Honor server-requested retry_after (e.g. Telegram FloodWait)
@@ -5937,6 +5932,10 @@ class BasePlatformAdapter(ABC):
     def _delivery_attempted_unverified(result: "SendResult") -> bool:
         """Whether a send result may already include provider-side effects."""
         raw_response = getattr(result, "raw_response", None)
+        # Read/write timeouts can lose the ACK after acceptance. This overrides
+        # a generic retryable flag, both initially and after a safe retry.
+        if BasePlatformAdapter._is_timeout_error(getattr(result, "error", None)):
+            return True
         return bool(
             isinstance(raw_response, dict)
             and raw_response.get("delivery_state") == "attempted_unverified"
@@ -7100,14 +7099,9 @@ class BasePlatformAdapter(ABC):
                                     mark_delivered,
                                     _obligation_id,
                                     _obligation_token,
+                                    delivery_proof=_proof,
                                 )
                             else:
-                                _raw = getattr(result, "raw_response", None)
-                                _delivery_state = (
-                                    _raw.get("delivery_state")
-                                    if isinstance(_raw, dict)
-                                    else None
-                                )
                                 _delivery_error = str(
                                     getattr(result, "error", "") or ""
                                 )
@@ -7124,7 +7118,8 @@ class BasePlatformAdapter(ABC):
                                     # never crossed the provider boundary; a
                                     # partially accepted send stays ambiguous.
                                     ambiguous=bool(
-                                        _delivery_state == "attempted_unverified"
+                                        getattr(result, "success", False)
+                                        or self._delivery_attempted_unverified(result)
                                         or (
                                             getattr(result, "retryable", False) is True
                                             and not is_runtime_retryable_error(
