@@ -512,6 +512,23 @@ class TestDelegationCleanup:
         monkeypatch.setattr(relay_runtime, "get_runtime", lambda **_kwargs: relay_host)
         monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 0.1)
 
+        # This case tests timeout cleanup while a turn is active. Establish
+        # that precondition before starting the real Future.result timeout;
+        # a busy host may legitimately take >0.1s just to start the worker.
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+
+        original_submit = DaemonThreadPoolExecutor.submit
+
+        def submit_active_child(executor, *args, **kwargs):
+            future = original_submit(executor, *args, **kwargs)
+            # The child also submits relay initialization work. Only the
+            # parent's submission waits; nested worker submissions must run.
+            if threading.current_thread() is threading.main_thread():
+                assert child_started.wait(timeout=10), "child never entered its active turn"
+            return future
+
+        monkeypatch.setattr(DaemonThreadPoolExecutor, "submit", submit_active_child)
+
         def run_conversation(**kwargs):
             lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
@@ -525,7 +542,7 @@ class TestDelegationCleanup:
             )
             child_started.set()
             try:
-                release_child.wait(timeout=5)
+                assert release_child.wait(timeout=30), "test did not release the child"
                 return {
                     "final_response": "late result",
                     "completed": True,
@@ -566,5 +583,9 @@ class TestDelegationCleanup:
             )
         finally:
             release_child.set()
-            reset_hermes_home_override(profile_token)
-            relay_runtime._reset_for_tests()
+            try:
+                if child_started.is_set():
+                    assert child_finished.wait(timeout=10), "child did not finish cleanup"
+            finally:
+                reset_hermes_home_override(profile_token)
+                relay_runtime._reset_for_tests()
