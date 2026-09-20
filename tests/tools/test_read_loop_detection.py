@@ -107,12 +107,12 @@ class TestReadLoopDetection(unittest.TestCase):
     @patch("tools.file_tools._get_file_ops", return_value=_make_fake_file_ops())
     def test_warning_still_returns_content(self, _mock_ops):
         """Even with a warning (3rd read), the file content is still returned."""
-        for _ in range(2):
-            read_file_tool("/tmp/test.py", task_id="t1")
+        first = json.loads(read_file_tool("/tmp/test.py", task_id="t1"))
+        read_file_tool("/tmp/test.py", task_id="t1")
         result = json.loads(read_file_tool("/tmp/test.py", task_id="t1"))
         self.assertIn("_warning", result)
         self.assertIn("content", result)
-        self.assertIn("content of /tmp/test.py", result["content"])
+        self.assertEqual(first["content"], result["content"])
 
 
 class TestNotifyOtherToolCall(unittest.TestCase):

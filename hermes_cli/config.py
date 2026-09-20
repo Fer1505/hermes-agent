@@ -3737,7 +3737,7 @@ def load_config() -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=True)
 
 
-def load_config_readonly() -> Dict[str, Any]:
+def load_config_readonly(*, strict: bool = False) -> Dict[str, Any]:
     """Fast-path variant of ``load_config()`` for callers that ONLY READ.
 
     Returns the cached config dict directly without the defensive deepcopy
@@ -3756,8 +3756,15 @@ def load_config_readonly() -> Dict[str, Any]:
     Note: this returns a plain ``dict`` (not ``MappingProxyType``) so
     existing ``isinstance(x, dict)`` guards downstream keep working. The
     safety guarantee is purely documented, not enforced — be careful.
+
+    ``strict=True`` instead reads fresh user and managed policy without cache,
+    last-known-good fallback, or filesystem writes. Missing user configuration,
+    unreadable files, and malformed policy raise. Use this for fresh grants;
+    ordinary settings retain their existing recovery behavior by default.
     """
-    return _load_config_impl(want_deepcopy=False)
+    # Authorization grants must observe fresh, readable policy; cached or
+    # last-known-good grants cannot authorize after a failed policy refresh.
+    return _load_config_impl(want_deepcopy=False, strict=strict)
 
 
 def write_platform_config_field(
@@ -3933,9 +3940,10 @@ def apply_terminal_config_to_env(
     return target
 
 
-def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+def _load_config_impl(*, want_deepcopy: bool, strict: bool = False) -> Dict[str, Any]:
     with _CONFIG_LOCK:
-        ensure_hermes_home()
+        if not strict:
+            ensure_hermes_home()
         config_path = get_config_path()
         path_key = str(config_path)
 
@@ -3943,6 +3951,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             st = config_path.stat()
             user_sig: Optional[Tuple[int, int]] = (st.st_mtime_ns, st.st_size)
         except FileNotFoundError:
+            if strict:
+                raise
             user_sig = None
 
         # Managed scope: fold the managed config file's (mtime, size) into the
@@ -3955,7 +3965,11 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         try:
             mst = managed_cfg_path.stat() if managed_cfg_path else None
             managed_sig = (mst.st_mtime_ns, mst.st_size) if mst else (0, 0)
+        except FileNotFoundError:
+            managed_sig = (0, 0)
         except OSError:
+            if strict:
+                raise
             managed_sig = (0, 0)
 
         # Combined cache signature: user file + managed file. None only when the
@@ -3973,7 +3987,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             cache_sig = None
 
         cached = _LOAD_CONFIG_CACHE.get(path_key)
-        if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
+        if not strict and cached is not None and cache_sig is not None and cached[:4] == cache_sig:
             # File signatures match, but the cached expansion is only valid if
             # every ${VAR} it was expanded against still has the same value.
             # Without this, a load_config() that ran before load_hermes_dotenv()
@@ -3988,7 +4002,10 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         if user_sig is not None:
             try:
                 with open(config_path, encoding="utf-8") as f:
-                    user_config = fast_safe_load(f) or {}
+                    loaded = fast_safe_load(f)
+                    user_config = ({} if loaded is None else loaded) if strict else (loaded or {})
+                if strict and not isinstance(user_config, dict):
+                    raise ValueError("Config root must be a mapping")
 
                 if "max_turns" in user_config:
                     agent_user_config = dict(user_config.get("agent") or {})
@@ -3999,6 +4016,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
                 config = _deep_merge(config, user_config)
             except Exception as e:
+                if strict:
+                    raise
                 # Last-known-good fallback (port of openai/codex#31188's
                 # invariant: a parse failure in a policy/config file must not
                 # silently replace the effective policy with an empty/default
@@ -4046,7 +4065,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         # against the process environment, never against user-config-defined refs.
         # This deliberately inverts the usual env-over-config precedence for the
         # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
-        managed_config = managed_scope.load_managed_config()
+        managed_config = (managed_scope.load_managed_config(strict=True) if strict
+                          else managed_scope.load_managed_config())
         if managed_config:
             # Normalize the managed overlay through the same canonicalization as
             # the user config BEFORE merging (parity with
@@ -4061,6 +4081,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 managed_normalized["model"] = {"default": managed_normalized["model"]}
             managed_expanded = _expand_env_vars(managed_normalized)
             expanded = _deep_merge(expanded, managed_expanded)
+        if strict:
+            return expanded
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``

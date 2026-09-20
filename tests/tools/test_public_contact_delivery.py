@@ -93,6 +93,17 @@ async def extract():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["security: [", "security: {public_contacts: {grants: []}}"])
+async def test_current_invalid_or_revoked_policy_cannot_reuse_cached_grant(extraction, policy):
+    from hermes_cli.config import load_config_readonly
+    reference = (await extract())["public_contacts"][0]["reference"]
+    load_config_readonly()  # Populate the ordinary last-known-good settings.
+    (extraction.home / "config.yaml").write_text(policy, encoding="utf-8")
+    assert contacts.render_contact_references(reference, session_id=SID) == contacts.UNAVAILABLE
+    assert not (await extract()).get("public_contacts")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("phone", [PHONE, "+44 20 7946 0123", "(202) 555-0142 ext. 23"])
 async def test_contact_survives_storage_compression_filter_and_delivery(extraction, monkeypatch, phone):
     from agent import redact

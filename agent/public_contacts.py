@@ -52,9 +52,10 @@ def _source_url(value) -> bool:
 def _grants():
     """Read current authority each time, including revocations. Fail closed."""
     import yaml
+    from hermes_cli.config import load_config_readonly
 
     try:
-        config = yaml.safe_load((get_hermes_home() / "config.yaml").read_text()) or {}
+        config = load_config_readonly(strict=True)
         policy = config.get("security", {}).get("public_contacts", {})
         grants = policy.get("grants", [])
         max_age = float(policy.get("max_age_seconds", 3600))
@@ -147,7 +148,7 @@ def issue_contact_references(result: dict) -> list[dict]:
         try:
             path = _receipt_directory(create=True) / (token + ".json")
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w") as file:
+            with os.fdopen(fd, "w", encoding="utf-8") as file:
                 json.dump(receipt, file, ensure_ascii=False)
                 file.flush()
                 os.fsync(file.fileno())
@@ -180,7 +181,7 @@ def render_contact_references(text: str, *, session_id: str) -> str:
             path = _receipt_directory() / (match[1] + ".json")
             if path.is_symlink() or path.stat().st_size > 16384:
                 return UNAVAILABLE
-            receipt = json.loads(path.read_text())
+            receipt = json.loads(path.read_text(encoding="utf-8"))
             if (receipt["version"] != 1 or receipt["session_id"] != session_id
                     or receipt["profile"] != str(get_hermes_home().resolve())
                     or not receipt["fetched_at"] <= receipt["issued_at"] <= now
@@ -257,7 +258,7 @@ def capture_contact_display(
         directory.mkdir(mode=0o700, exist_ok=True)
         path = directory / (token + ".json")
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as file:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
             json.dump(record, file, ensure_ascii=False)
             file.flush()
             os.fsync(file.fileno())
@@ -296,7 +297,7 @@ def project_contact_history(message: dict) -> dict:
             path = directory / (token + ".json")
             if directory.is_symlink() or path.is_symlink() or path.stat().st_size > 131072:
                 raise ValueError("Invalid display record")
-            record = json.loads(path.read_text())
+            record = json.loads(path.read_text(encoding="utf-8"))
             if (record["version"] == 1 and record["kind"] == "historical-contact-display"
                     and record["profile"] == str(get_hermes_home().resolve())
                     and record["session_id"] == session_id and record["row_id"] == row_id

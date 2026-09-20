@@ -173,11 +173,13 @@ def test_row_id_is_opt_in_and_never_reaches_the_provider(session, db):
 
     for message in db.get_messages_as_conversation(key):
         assert "_row_id" not in message
+        assert "_session_id" not in message
         assert message.get("_db_persisted") is True
 
     for message in db.get_messages_as_conversation(key, include_row_ids=True):
         assert "_row_id" in message
+        assert message["_session_id"] == key
         assert all(
-            not k.startswith("_") or k in {"_row_id", "_db_persisted"}
+            not k.startswith("_") or k in {"_row_id", "_session_id", "_db_persisted"}
             for k in message
         )

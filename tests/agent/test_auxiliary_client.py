@@ -3292,13 +3292,16 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert response.choices[0].message.content == "primary ok"
 
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+        import threading
+        closed = threading.Event()
+
         class _SlowAliveCreateStream:
             def __iter__(self):
-                for _ in range(5):
-                    time.sleep(0.03)
+                while not closed.wait(0.01):
                     yield SimpleNamespace(type="response.in_progress")
 
-            def close(self): pass
+            def close(self):
+                closed.set()
 
         class FakeResponses:
             def create(self, **kwargs):
@@ -3308,13 +3311,16 @@ class TestCodexAuxiliaryAdapterTimeout:
         adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
 
         started = time.monotonic()
-        with pytest.raises(TimeoutError):
-            adapter.create(
-                messages=[{"role": "user", "content": "summarize this"}],
-                timeout=0.05,
-            )
-
-        assert time.monotonic() - started < 0.14
+        try:
+            with pytest.raises(TimeoutError):
+                adapter.create(
+                    messages=[{"role": "user", "content": "summarize this"}],
+                    timeout=0.05,
+                )
+            assert closed.wait(2), "timed-out stream was not closed"
+            assert time.monotonic() - started < 2
+        finally:
+            closed.set()
 
 
 class TestCodexAuxiliaryAdapterCacheScope:

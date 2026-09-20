@@ -2593,7 +2593,8 @@ def _copy_contact_snapshot_state(home, staging_dir, manifest, max_file_size):
                                         final_may_be_directory=False, allow_missing=False)
             relative = source.relative_to(home).as_posix()
             flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-            with os.fdopen(os.open(source, flags), "rb") as reader:
+            source_fd = os.open(source, flags)
+            with os.fdopen(source_fd, "rb") as reader:
                 info = os.fstat(reader.fileno())
                 if not stat.S_ISREG(info.st_mode):
                     raise BackupError("Contact snapshot source is not a regular file")
@@ -2601,7 +2602,8 @@ def _copy_contact_snapshot_state(home, staging_dir, manifest, max_file_size):
                     raise BackupError("Contact snapshot receipt exceeds the file-size limit")
                 destination = staging_dir / relative
                 destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-                with os.fdopen(os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as writer:
+                destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(destination_fd, "wb") as writer:
                     shutil.copyfileobj(reader, writer)
                     writer.flush()
                     if writer.tell() != info.st_size:

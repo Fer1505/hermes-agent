@@ -554,6 +554,7 @@ class TestCrossSessionApprovalIsolation:
     def test_approval_prompt_routes_to_originating_session(self):
         """A dangerous command in session A's worker thread notifies
         session A's callback, even though os.environ points at session B."""
+        from gateway.session_context import clear_session_vars, set_session_vars
         from tools.approval import (
             check_all_command_guards,
             register_gateway_notify,
@@ -579,11 +580,13 @@ class TestCrossSessionApprovalIsolation:
             # it deliberately does NOT touch os.environ (mirroring the fixed
             # gateway, which no longer writes HERMES_SESSION_KEY).
             token = set_current_session_key("session-A")
+            session_tokens = set_session_vars(session_key="session-A")
             try:
                 result_holder[0] = check_all_command_guards(
                     "rm -rf /important", "local"
                 )
             finally:
+                clear_session_vars(session_tokens)
                 reset_current_session_key(token)
 
         t = threading.Thread(target=worker_a)
@@ -601,6 +604,8 @@ class TestCrossSessionApprovalIsolation:
             assert result_holder[0] is not None
             assert result_holder[0]["approved"] is True
         finally:
+            resolve_gateway_approval("session-A", "deny")
+            t.join(timeout=2)
             os.environ.pop("HERMES_GATEWAY_SESSION", None)
             os.environ.pop("HERMES_EXEC_ASK", None)
             unregister_gateway_notify("session-A")
@@ -610,7 +615,7 @@ class TestCrossSessionApprovalIsolation:
         """Cross-session isolation driven by contextvars ALONE (#24100).
 
         Two concurrent worker threads with DISTINCT session keys each set
-        only ``set_current_session_key()`` — they deliberately never write
+        the originating session context — they deliberately never write
         ``os.environ["HERMES_SESSION_KEY"]``. This proves the contextvar is
         sufficient post-fix, and would FAIL if contextvar routing regressed
         (the prior 'parallel' tests share one key and dual-set env+contextvar,
@@ -618,6 +623,7 @@ class TestCrossSessionApprovalIsolation:
         must land in its OWN gateway queue, and resolving one must not resolve
         the other.
         """
+        from gateway.session_context import clear_session_vars, set_session_vars
         from tools.approval import (
             _gateway_queues,
             check_all_command_guards,
@@ -640,9 +646,11 @@ class TestCrossSessionApprovalIsolation:
 
         def worker(key, cmd):
             token = set_current_session_key(key)
+            session_tokens = set_session_vars(session_key=key)
             try:
                 results[key] = check_all_command_guards(cmd, "local")
             finally:
+                clear_session_vars(session_tokens)
                 reset_current_session_key(token)
 
         ta = threading.Thread(target=worker, args=("sess-A", "rm -rf /a-data"))

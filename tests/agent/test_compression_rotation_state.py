@@ -1616,10 +1616,12 @@ class TestTodoSnapshotScaffoldingTails:
             {
                 k: v
                 for k, v in m.items()
-                if k not in {"_row_id", _DB_PERSISTED_MARKER}
+                if k not in {"_row_id", "_session_id", "display_metadata", _DB_PERSISTED_MARKER}
             }
             for m in compressed
         ] == expected
+        assert all(message["_session_id"] == agent.session_id for message in compressed)
+        assert all(message.get("display_metadata") is None for message in compressed)
         assert not any(
             TODO_INJECTION_HEADER in str(message.get("content") or "")
             for message in compressed

@@ -14,7 +14,7 @@ class TestSandboxFailureHint:
         h = _sandbox_failure_hint(err, enabled_tools={"terminal", "read_file"})
         assert "browser_navigate" in h
         assert "read_file" in h and "terminal" in h
-        assert "normal tool call" in h
+        assert "only if it is enabled for this session" in h
 
     def test_builtin_helper_import_redirects(self):
         err = "ImportError: cannot import name 'json_parse' from 'hermes_tools'"
@@ -57,7 +57,11 @@ class TestLiveSandboxHint:
             "import nonexistent_pkg_zzz\n", task_id="t-sbhint",
         ))
         assert r["status"] == "error"
-        assert "not installed in the sandbox" in r.get("hint", "")
+        hint = r.get("hint", "")
+        assert "cannot import 'nonexistent_pkg_zzz'" in hint
+        assert "stdlib" in hint
+        assert "Keep the current task" in hint
+        assert "requires the task's authorization" in hint
 
     def test_successful_script_has_no_hint(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
