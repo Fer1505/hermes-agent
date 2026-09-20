@@ -223,10 +223,11 @@ def issue_contact_references(result: dict) -> list[dict]:
 
 
 def render_contact_references(text: str, *, session_id: str) -> str:
-    """Resolve references AFTER ordinary secret filtering at a display boundary.
+    """Resolve references after the surface's existing egress filtering.
 
     Never call this for logs or provider replay. Explicit session identity is
     mandatory; no process environment fallback is used at the delivery boundary.
+    Programmatic APIs retain their existing raw-text policy for ordinary prose.
     """
     if not REFERENCE_RE.search(text):
         return text
@@ -273,6 +274,63 @@ def render_contact_references(text: str, *, session_id: str) -> str:
         return UNAVAILABLE
 
     return REFERENCE_RE.sub(resolve, text)
+
+
+class ContactReferenceStream:
+    """Resolve references split across API deltas without buffering prose.
+
+    This is presentation only, not a streaming secret filter. Callers keep raw
+    deltas separately for provider replay and apply their existing egress policy.
+    Only a possible reference suffix is held (at most 80 characters). Authority
+    is read when the complete reference is emitted, never cached at stream start.
+    A reference assembled across different profile/session scopes is denied.
+    """
+
+    _prefix = "[public-contact:"
+
+    def __init__(self):
+        self._pending = ""
+        self._pending_scope = None
+
+    def feed(self, text: str, *, session_id: str) -> str:
+        scope = (str(get_hermes_home().resolve()), session_id)
+        combined_scope = scope
+        if self._pending and self._pending_scope != scope:
+            combined_scope = None
+        remaining = self._pending + text
+        out = []
+        self._pending = ""
+        while remaining:
+            start = remaining.find(self._prefix)
+            if start < 0:
+                # Retain a split prefix, but send unrelated text immediately.
+                hold = next((n for n in range(min(len(remaining), len(self._prefix) - 1), 0, -1)
+                             if remaining.endswith(self._prefix[:n])), 0)
+                out.append(remaining[:-hold] if hold else remaining)
+                self._pending = remaining[-hold:] if hold else ""
+                break
+            out.append(remaining[:start])
+            remaining = remaining[start:]
+            match = REFERENCE_RE.match(remaining)
+            if match:
+                out.append(render_contact_references(
+                    match[0], session_id=session_id if combined_scope == scope else "",
+                ))
+                remaining = remaining[match.end():]
+            elif re.fullmatch(r"\[public-contact:[a-p]{0,64}", remaining):
+                self._pending = remaining
+                break
+            else:
+                # Malformed references are ordinary text; do not swallow it.
+                out.append(remaining[0])
+                remaining = remaining[1:]
+        self._pending_scope = combined_scope if self._pending else None
+        return "".join(out)
+
+    def finish(self) -> str:
+        pending, self._pending = self._pending, ""
+        self._pending_scope = None
+        return UNAVAILABLE if pending.startswith(self._prefix) else pending
 
 
 DISPLAY_METADATA_KEY = "public_contact_display"

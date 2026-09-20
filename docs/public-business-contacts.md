@@ -89,3 +89,25 @@ and their visual separators; parsing one does not prove that a business owns
 the number. [Schema.org telephone](https://schema.org/telephone) can describe
 people as well as organizations, so the presence of that property alone is not
 used to authorize business-contact display.
+
+## September 20, 2026 — OpenAI API display integration
+
+Chat Completions and Responses now resolve references in assistant reply text,
+including references split across streaming chunks and providers that only
+return final text. Ordinary prose continues streaming immediately. The parser
+holds only a possible reference suffix, at most 80 characters; a truncated
+reference at normal or failed stream completion becomes an unavailable notice.
+Malformed markers are ordinary text and confer no authority.
+
+Each completed reference checks current profile/session authority. Revocation
+while a reference is buffered prevents display. A reference split across
+different profile/session scopes is denied, and compression does not inherit
+the old session's grant. Existing API raw-text and tool-event behavior remains
+unchanged; this parser is not a general streaming secret-redaction mechanism.
+
+Responses stores the displayed response separately from the raw conversation
+used by `previous_response_id`. Completed, failed and interrupted streams keep
+raw replay separate from displayed text. GET returns the saved displayed fact;
+it does not authorize that reference in a new reply. This integration does not
+certify custom session/run streams, CLI/interim/artifact output, full business
+discovery, lifecycle coverage or live provider delivery.

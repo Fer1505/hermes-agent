@@ -151,6 +151,7 @@ from gateway.platforms.base import (
 # Re-exported here for existing imports and constructor monkeypatches.
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from agent.redact import redact_sensitive_text
+from agent.public_contacts import ContactReferenceStream, render_contact_references
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
 from gateway.browser_control_artifacts import (
@@ -1219,6 +1220,13 @@ def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
     if limit is not None:
         return redacted[:limit]
     return redacted
+
+
+def _contact_stream_session_id(agent_ref, session_id: str) -> str:
+    """Use the current agent identity after compression, never ambient env."""
+    agent = agent_ref[0] if agent_ref else None
+    current = getattr(agent, "session_id", None)
+    return current if isinstance(current, str) and current else session_id
 
 
 def _openai_error(message: str, err_type: str = "invalid_request_error", param: str = None, code: str = None) -> Dict[str, Any]:
@@ -5325,7 +5333,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+        final_response = _resolve_media_to_data_urls(render_contact_references(
+            result.get("final_response") or "",
+            session_id=result.get("session_id") or session_id,
+        ))
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
@@ -5434,6 +5445,8 @@ class APIServerAdapter(BasePlatformAdapter):
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
 
+        contact_stream = ContactReferenceStream()
+        saw_text = False
         try:
             last_activity = time.monotonic()
 
@@ -5457,16 +5470,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
                 """
+                nonlocal saw_text
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     await response.write(_sse_frame(item[1], event="hermes.tool.progress"))
                 else:
-                    content_chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
-                    }
-                    await response.write(_sse_frame(content_chunk))
+                    saw_text = saw_text or bool(item)
+                    item = contact_stream.feed(
+                        item, session_id=_contact_stream_session_id(agent_ref, session_id),
+                    )
+                    if not item:
+                        return time.monotonic()
+                    await _emit_content(item)
                 return time.monotonic()
+
+            async def _emit_content(item):
+                content_chunk = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
+                }
+                await response.write(_sse_frame(content_chunk))
 
             # Stream content chunks as they arrive from the agent. Woken
             # directly by put_threadsafe's call_soon_threadsafe — no
@@ -5516,6 +5539,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.error(
                     "Agent task %s failed during SSE streaming: %s", completion_id, exc
                 )
+
+            # Some providers only return final text. Never duplicate text that
+            # has already streamed, and never put the display copy into replay.
+            if not saw_text and isinstance(result, dict) and result.get("final_response"):
+                fallback = contact_stream.feed(
+                    result["final_response"], session_id=result.get("session_id") or session_id,
+                )
+                if fallback:
+                    await _emit_content(fallback)
+            pending = contact_stream.finish()
+            if pending:
+                await _emit_content(pending)
 
             # Inspect the result dict for a flagged (non-exception) failure.
             is_partial = bool(result.get("partial")) if isinstance(result, dict) else False
@@ -5662,6 +5697,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # State accumulated during the stream
         final_text_parts: List[str] = []
+        raw_text_parts: List[str] = []
+        contact_stream = ContactReferenceStream()
         # Track open function_call items by name so we can emit a matching
         # ``done`` event when the tool completes.  Order preserved.
         pending_tool_calls: List[Dict[str, Any]] = []
@@ -5752,8 +5789,8 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             incomplete_history = list(conversation_history)
             incomplete_history.append({"role": "user", "content": user_message})
-            if incomplete_text:
-                incomplete_history.append({"role": "assistant", "content": incomplete_text})
+            if raw_text_parts:
+                incomplete_history.append({"role": "assistant", "content": "".join(raw_text_parts)})
             _persist_response_snapshot(
                 incomplete_env,
                 conversation_history_snapshot=incomplete_history,
@@ -5793,6 +5830,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
 
             async def _emit_text_delta(delta_text: str) -> None:
+                raw_text_parts.append(delta_text)
+                displayed = contact_stream.feed(
+                    delta_text, session_id=_contact_stream_session_id(agent_ref, session_id),
+                )
+                if displayed:
+                    await _emit_display_delta(displayed)
+
+            async def _emit_display_delta(delta_text: str) -> None:
                 await _open_message_item()
                 final_text_parts.append(delta_text)
                 await _write_event("response.output_text.delta", {
@@ -6009,10 +6054,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 # the full response at the end), emit a single fallback
                 # delta so Responses clients still receive a live text part.
                 agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
-                if agent_final and not final_text_parts:
-                    await _emit_text_delta(agent_final)
+                if agent_final and not raw_text_parts:
+                    raw_text_parts.append(agent_final)
+                    displayed = contact_stream.feed(
+                        agent_final, session_id=result.get("session_id") or session_id,
+                    )
+                    if displayed:
+                        await _emit_display_delta(displayed)
                 if agent_final and not final_response_text:
-                    final_response_text = agent_final
+                    final_response_text = "".join(final_text_parts)
                 if isinstance(result, dict) and result.get("error") and not final_response_text:
                     agent_error = _redact_api_error_text(result["error"])
             except Exception as e:  # noqa: BLE001
@@ -6020,6 +6070,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_error = _redact_api_error_text(e)
 
             # Close the message item if it was opened
+            pending = contact_stream.finish()
+            if pending:
+                await _emit_display_delta(pending)
             final_response_text = "".join(final_text_parts) or final_response_text
             if message_opened:
                 await _write_event("response.output_text.done", {
@@ -6097,7 +6150,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 if final_response_text or agent_error:
                     _failed_history.append({
                         "role": "assistant",
-                        "content": final_response_text or _redact_api_error_text(agent_error),
+                        "content": "".join(raw_text_parts) or _redact_api_error_text(agent_error),
                     })
                 _persist_response_snapshot(
                     failed_env,
@@ -6120,7 +6173,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history,
                     user_message,
                     result,
-                    final_response_text,
+                    "".join(raw_text_parts),
                 )
                 # Compression-aware transcript substitution happens inside
                 # _build_response_conversation_history (result["_compressed"]);
@@ -6497,7 +6550,9 @@ class APIServerAdapter(BasePlatformAdapter):
             user_message,
             result,
         )
-        output_items = self._extract_output_items(result, start_index=output_start_index)
+        output_items = self._extract_output_items(
+            result, start_index=output_start_index, session_id=_effective_session_id,
+        )
 
         response_data = {
             "id": response_id,
@@ -7098,7 +7153,9 @@ class APIServerAdapter(BasePlatformAdapter):
         return out
 
     @staticmethod
-    def _extract_output_items(result: Dict[str, Any], start_index: int = 0) -> List[Dict[str, Any]]:
+    def _extract_output_items(
+        result: Dict[str, Any], start_index: int = 0, *, session_id: str = "",
+    ) -> List[Dict[str, Any]]:
         """
         Build the output item array from the agent's messages.
 
@@ -7150,7 +7207,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "content": [
                 {
                     "type": "output_text",
-                    "text": final,
+                    "text": render_contact_references(final, session_id=session_id),
                 }
             ],
         })
