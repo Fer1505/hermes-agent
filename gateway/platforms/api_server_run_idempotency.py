@@ -2,6 +2,7 @@
 
 import hmac
 import json
+from gateway.platforms.api_server_outcome import TERMINAL_RUN_STATUSES
 import logging
 import sqlite3
 import threading
@@ -263,12 +264,7 @@ class RunIdempotencyStore:
             updated_at,
         ) in stale:
             try:
-                terminal = json.loads(stale_status).get("status") in {
-                    "completed",
-                    "failed",
-                    "cancelled",
-                    "interrupted",
-                }
+                terminal = json.loads(stale_status).get("status") in TERMINAL_RUN_STATUSES
             except Exception:
                 terminal = False
             expired = bool(
