@@ -3737,7 +3737,7 @@ def load_config() -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=True)
 
 
-def load_config_readonly(*, strict: bool = False) -> Dict[str, Any]:
+def load_config_readonly(*, strict: bool = False, allow_missing_user: bool = False, validate_native_containers: bool = False) -> Dict[str, Any]:
     """Fast-path variant of ``load_config()`` for callers that ONLY READ.
 
     Returns the cached config dict directly without the defensive deepcopy
@@ -3761,10 +3761,18 @@ def load_config_readonly(*, strict: bool = False) -> Dict[str, Any]:
     last-known-good fallback, or filesystem writes. Missing user configuration,
     unreadable files, and malformed policy raise. Use this for fresh grants;
     ordinary settings retain their existing recovery behavior by default.
+    ``allow_missing_user=True`` is restricted to strict opt-in policy reads:
+    an absent user file supplies defaults while managed policy is still read
+    fresh and validated. Existing strict authorization callers reject absence.
+    ``validate_native_containers=True`` preserves fail-closed native admission
+    shapes before nullable legacy sections are normalized/merged. Other strict
+    callers retain their existing schema semantics.
     """
     # Authorization grants must observe fresh, readable policy; cached or
     # last-known-good grants cannot authorize after a failed policy refresh.
-    return _load_config_impl(want_deepcopy=False, strict=strict)
+    if (allow_missing_user or validate_native_containers) and not strict:
+        raise ValueError("Missing-user policy reads require strict mode")
+    return _load_config_impl(want_deepcopy=False, strict=strict, allow_missing_user=allow_missing_user, validate_native_containers=validate_native_containers)
 
 
 def write_platform_config_field(
@@ -3940,8 +3948,30 @@ def apply_terminal_config_to_env(
     return target
 
 
-def _load_config_impl(*, want_deepcopy: bool, strict: bool = False) -> Dict[str, Any]:
+def _validate_native_container_shape(config: Dict[str, Any]) -> None:
+    """Reject explicit malformed native containers before legacy null merging.
+
+    This opt-in owner check does not change ordinary UI or other authorization
+    readers' legacy normalization. Numeric/enable policy checks remain owned by
+    native admission after canonical user/managed precedence is applied.
+    """
+    if "agent" not in config:
+        return
+    agent = config["agent"]
+    if not isinstance(agent, dict):
+        raise ValueError("Native admission agent policy must be a mapping")
+    if "native_oauth_task_limits" in agent and not isinstance(agent["native_oauth_task_limits"], dict):
+        raise ValueError("Native admission limits must be a mapping")
+
+
+def _load_config_impl(*, want_deepcopy: bool, strict: bool = False, allow_missing_user: bool = False, validate_native_containers: bool = False) -> Dict[str, Any]:
     with _CONFIG_LOCK:
+        if globals().get("_CONFIG_IMPORT_READONLY", False) and not strict:
+            # Provider metadata discovery recursively asks for plugin settings.
+            # Import-time reads must never initialize/repair a profile or cache
+            # grants; explicit later config/UI reads keep normal behavior.
+            strict = True
+            allow_missing_user = True
         if not strict:
             ensure_hermes_home()
         config_path = get_config_path()
@@ -3951,7 +3981,7 @@ def _load_config_impl(*, want_deepcopy: bool, strict: bool = False) -> Dict[str,
             st = config_path.stat()
             user_sig: Optional[Tuple[int, int]] = (st.st_mtime_ns, st.st_size)
         except FileNotFoundError:
-            if strict:
+            if strict and not allow_missing_user:
                 raise
             user_sig = None
 
@@ -4006,6 +4036,8 @@ def _load_config_impl(*, want_deepcopy: bool, strict: bool = False) -> Dict[str,
                     user_config = ({} if loaded is None else loaded) if strict else (loaded or {})
                 if strict and not isinstance(user_config, dict):
                     raise ValueError("Config root must be a mapping")
+                if validate_native_containers:
+                    _validate_native_container_shape(user_config)
 
                 if "max_turns" in user_config:
                     agent_user_config = dict(user_config.get("agent") or {})
@@ -4067,6 +4099,8 @@ def _load_config_impl(*, want_deepcopy: bool, strict: bool = False) -> Dict[str,
         # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
         managed_config = (managed_scope.load_managed_config(strict=True) if strict
                           else managed_scope.load_managed_config())
+        if validate_native_containers:
+            _validate_native_container_shape(managed_config)
         if managed_config:
             # Normalize the managed overlay through the same canonicalization as
             # the user config BEFORE merging (parity with
@@ -6307,8 +6341,14 @@ def _inject_profile_env_vars() -> None:
         pass
 
 
-# Eagerly inject so that OPTIONAL_ENV_VARS is fully populated at import time.
-_inject_profile_env_vars()
+# Eager provider metadata remains available to existing UI consumers, but
+# recursive config reads during discovery are fresh/read-only rather than
+# initializing profiles or recording cached fallback authorization.
+_CONFIG_IMPORT_READONLY = True
+try:
+    _inject_profile_env_vars()
+finally:
+    _CONFIG_IMPORT_READONLY = False
 
 
 # ── Platform-plugin env var injection ────────────────────────────────────────

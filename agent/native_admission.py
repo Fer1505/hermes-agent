@@ -14,9 +14,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
-import yaml
-
-from hermes_constants import get_hermes_home
 
 
 class NativeAdmissionDenied(RuntimeError):
@@ -26,10 +23,12 @@ class NativeAdmissionDenied(RuntimeError):
 def _policy():
     # Read strictly, without the ordinary config loader's default-on-parse-
     # error fallback or repair writes: corrupt policy cannot disable a gate.
-    path = get_hermes_home() / "config.yaml"
     try:
-        config = yaml.safe_load(path.read_text()) if path.exists() else {}
-        config = {} if config is None else config
+        from hermes_cli.config import load_config_readonly
+
+        # Missing user configuration keeps this opt-in mode disabled, while
+        # a managed policy still applies and cannot be hidden by missing files.
+        config = load_config_readonly(strict=True, allow_missing_user=True, validate_native_containers=True)
         agent = config.get("agent", {})
         policy = agent.get("native_oauth_task_limits", {})
         if not isinstance(policy, dict):

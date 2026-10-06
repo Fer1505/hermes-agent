@@ -3,6 +3,7 @@ import asyncio
 import json
 import threading
 import time
+import os
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -542,3 +543,72 @@ def test_short_watchdog_with_noop_abort_latches_before_replay(configure, make_ag
         assert len(wire.calls) == 1
     finally:
         release.set()
+
+
+def test_native_policy_uses_fresh_canonical_managed_policy(configure, tmp_path, monkeypatch):
+    from hermes_cli import config, managed_scope
+    configure(attempts=2, seconds=60, enabled=False)
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: managed)
+    path = managed / "config.yaml"
+    path.write_text("agent: {native_oauth_task_limits: {enabled: true, max_attempts: 3, max_seconds: 60}}\n", encoding="utf-8")
+    # Warm ordinary cache, then replace policy while preserving signature.
+    config.load_config_readonly()
+    previous = path.stat()
+    path.write_text("agent: {native_oauth_task_limits: {enabled: true, max_attempts: 1, max_seconds: 60}}\n", encoding="utf-8")
+    os.utime(path, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+    assert admission._policy() == (1, 60.0)
+    path.write_text("agent: [", encoding="utf-8")
+    with pytest.raises(admission.NativeAdmissionDenied, match="unreadable"):
+        admission._policy()
+
+
+def test_native_policy_missing_user_keeps_disabled_but_cannot_hide_managed_gate(tmp_path, monkeypatch):
+    from hermes_cli import managed_scope
+    home = tmp_path / "absent-profile"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: None)
+    assert admission._policy() is None
+    assert not home.exists()
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: managed)
+    (managed / "config.yaml").write_text("agent: {native_oauth_task_limits: {enabled: true, max_attempts: 1, max_seconds: 2}}\n", encoding="utf-8")
+    assert admission._policy() == (1, 2.0)
+    assert not home.exists()
+
+
+@pytest.mark.parametrize("broken", ["agent: [", "[]", "agent: null", "agent: []", "agent: false", "agent: {native_oauth_task_limits: null}", "agent: {native_oauth_task_limits: []}", "agent: {native_oauth_task_limits: false}", "agent: {native_oauth_task_limits: {enabled: yes, max_attempts: false, max_seconds: 2}}"])
+def test_canonical_invalid_native_policy_refuses_without_repair(tmp_path, monkeypatch, broken):
+    from hermes_cli import managed_scope
+    home = tmp_path / "profile"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(managed_scope, "get_managed_dir", lambda: None)
+    path = home / "config.yaml"
+    path.write_text(broken, encoding="utf-8")
+    before = path.read_bytes(), path.stat().st_mode
+    with pytest.raises(admission.NativeAdmissionDenied, match="unreadable"):
+        admission._policy()
+    assert (path.read_bytes(), path.stat().st_mode) == before
+    assert list(home.iterdir()) == [path]
+
+
+def test_canonical_utf8_policy_and_inflight_ceiling_are_preserved(configure, make_agent):
+    configure(attempts=1, seconds=60)
+    path = get_hermes_home() / "config.yaml"
+    path.write_text(path.read_text(encoding="utf-8") + "description: café Ω\n", encoding="utf-8")
+    owner, wire = make_agent()
+    with admission.task_scope(owner, "frozen-ceiling"):
+        budget = admission.current_budget(owner)
+        deadline = budget.deadline
+        configure(attempts=9, seconds=600)
+        assert admission._policy() == (9, 600.0)
+        assert budget.max_attempts == 1 and budget.deadline == deadline
+        run_codex_stream(owner, _request(), client=wire)
+        with pytest.raises(admission.NativeAdmissionDenied, match="physical-attempt"):
+            run_codex_stream(owner, _request(), client=wire)
+    assert len(wire.calls) == 1
+    with admission.task_scope(owner, "fresh-new-root"):
+        assert admission.current_budget(owner).max_attempts == 9
