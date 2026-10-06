@@ -1773,6 +1773,11 @@ def _build_child_agent(
     """
     from run_agent import AIAgent
     import uuid as _uuid
+    from agent.native_admission import current_budget
+
+    # Refuse missing/closed required task ownership before allocating clients
+    # or a dedicated child SessionDB connection.
+    current_budget(parent_agent)
 
     # ── Role resolution ─────────────────────────────────────────────────
     # Depth-derived, not caller-declared: a child may delegate iff the
@@ -2173,6 +2178,13 @@ def _build_child_agent(
     # close it out from under a background child (#81267).
     if child_session_db is not None:
         child._owns_session_db = True
+    from agent.native_admission import inherit_parent_budget
+
+    try:
+        inherit_parent_budget(child, parent_agent)
+    except BaseException:
+        child.close()
+        raise
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""

@@ -54,6 +54,15 @@ DEFAULT_CONFIG = {
         # implicit provider stale timeouts are capped to the remaining
         # budget. CLI one-shot equivalent: `hermes chat --run-budget N`.
         "run_budget_seconds": None,
+        # Opt-in process-local native ChatGPT OAuth task-tree ceiling. Both
+        # positive limits are required when enabled. Includes child, summary
+        # and auxiliary physical opens; no API/other-provider fallback.
+        # This is not durable account-wide admission or an OS boundary.
+        "native_oauth_task_limits": {
+            "enabled": False,
+            "max_attempts": None,
+            "max_seconds": None,
+        },
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has

@@ -1152,7 +1152,11 @@ def _consume_codex_event_stream(
             break
         except (TimeoutError, InterruptedError, KeyboardInterrupt):
             raise
-        except Exception:
+        except Exception as exc:
+            from agent.native_admission import NativeAdmissionDenied
+
+            if isinstance(exc, NativeAdmissionDenied):
+                raise
             if collected_text_deltas or collected_output_items:
                 logger.warning(
                     "Codex event stream died mid-flight after %d delta(s); "
@@ -1622,6 +1626,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     from openai import APIConnectionError as _APIConnectionError
 
     from agent import relay_llm
+    from agent.native_admission import NativeAdmissionDenied
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries = 1
@@ -1657,7 +1662,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
             stream_kwargs["stream"] = True
             stream_kwargs = _bypass_sdk_request_transform(stream_kwargs)
-            return active_client.responses.create(**stream_kwargs)
+            from agent.native_admission import open_native_stream
+
+            return open_native_stream(active_client, stream_kwargs, agent=agent)
 
         def _codex_stream_created(_raw_stream: Any) -> None:
             # Claim the delta sink for THIS physical attempt. A newer attempt
@@ -1777,6 +1784,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     exc,
                     stream_opened=writer_token["value"] is not None,
                 )
+                raise
+            except NativeAdmissionDenied:
                 raise
             except RuntimeError:
                 if event_stream.final_response is not None:

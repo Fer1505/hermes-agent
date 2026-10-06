@@ -4637,6 +4637,23 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                from agent.native_admission import NativeAdmissionDenied
+
+                if isinstance(api_error, NativeAdmissionDenied):
+                    # Permanent policy failures must not enter retry, credential
+                    # rotation, free-summary grace or provider fallback paths.
+                    if thinking_spinner:
+                        thinking_spinner.stop("")
+                    return {
+                        "final_response": str(api_error),
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": str(api_error),
+                        "failure_reason": "native_oauth_task_admission",
+                        "failure_retryable": False,
+                    }
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:
@@ -8690,6 +8707,16 @@ def run_conversation(
                 break
             
         except Exception as e:
+            from agent.native_admission import NativeAdmissionDenied
+
+            if isinstance(e, NativeAdmissionDenied):
+                return {
+                    "final_response": str(e), "messages": messages,
+                    "api_calls": api_call_count, "completed": False,
+                    "failed": True, "error": str(e),
+                    "failure_reason": "native_oauth_task_admission",
+                    "failure_retryable": False,
+                }
             # Count every escaped exception against the per-turn bound before
             # classification — permanent failures must terminate even when the
             # turn budget is unlimited (#92450).

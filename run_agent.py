@@ -3331,6 +3331,9 @@ class AIAgent:
         # A hard stop and redirect share one lock so /stop cannot race with an
         # accepted correction and accidentally turn itself into a retry.
         def _admit_hard_cancel() -> None:
+            from agent.native_admission import cancel_task
+
+            cancel_task(self)
             event = getattr(self, "_hard_interrupt_requested", None)
             if event is None:
                 return
@@ -9075,7 +9078,9 @@ class AIAgent:
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another thread.
-            with bind_subagent_parent(self), scoped_runtime_main({}):
+            from agent.native_admission import task_scope
+
+            with bind_subagent_parent(self), scoped_runtime_main({}), task_scope(self, effective_task_id):
                 try:
                     if durable_turn_lease_thread is not None:
                         with durable_turn_lease_activity_lock:

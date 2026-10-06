@@ -933,6 +933,9 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     interrupt, abort, cancellation, and close semantics stay in the callers —
     this helper only issues the request.
     """
+    from agent.native_admission import require_native_route
+
+    require_native_route(agent)
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
@@ -1246,6 +1249,11 @@ def direct_api_call(agent, api_kwargs: dict):
     # stalls from the stall monitor.
     call_start = time.time()
     stale_timeout = _resolve_direct_stale_timeout(agent, api_kwargs)
+    from agent.native_admission import current_budget, NativeAdmissionDenied
+
+    native_budget = current_budget(agent)
+    if native_budget is not None:
+        stale_timeout = min(stale_timeout, native_budget.check())
     # Do not override an explicit per-call timeout (provider config /
     # transport already set one). Otherwise pin read=stale_timeout so a
     # no-op stranger-thread abort cannot leave the keepalive client's
@@ -1265,6 +1273,8 @@ def direct_api_call(agent, api_kwargs: dict):
         # interrupt owns the outcome.
         if not _abort_active_request("stale_call_kill"):
             return
+        if native_budget is not None:
+            native_budget.mark_uncertain()
         elapsed = time.time() - call_start
         _report_stale_nonstream_kill(
             agent, api_kwargs, elapsed, stale_timeout, inline=True
@@ -1286,7 +1296,9 @@ def direct_api_call(agent, api_kwargs: dict):
         response = _dispatch_nonstreaming_api_request(
             agent, api_kwargs, make_client=_make_client
         )
-    except Exception:
+    except Exception as exc:
+        if isinstance(exc, NativeAdmissionDenied):
+            raise
         if getattr(agent, "_interrupt_requested", False):
             raise InterruptedError("Agent interrupted during API call") from None
         with request_client_lock:
@@ -1534,6 +1546,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
     ):
         _stale_timeout = min(_stale_timeout, _codex_hard_timeout)
 
+    from agent.native_admission import current_budget
+
+    native_budget = current_budget(agent)
+    if native_budget is not None:
+        _stale_timeout = min(_stale_timeout, native_budget.check())
+
     if _est_tokens_for_codex_watchdog > 100_000:
         _codex_idle_timeout_default = 180.0
     elif _est_tokens_for_codex_watchdog > 50_000:
@@ -1651,6 +1669,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
             and _elapsed > _ttfb_timeout
             and getattr(agent, "_codex_stream_last_event_ts", None) is None
         ):
+            if native_budget is not None:
+                native_budget.mark_uncertain()
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
             if callable(_hint_fn):
@@ -1712,6 +1732,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
             and _last_codex_event_ts is not None
             and (time.time() - _last_codex_event_ts) > _codex_idle_timeout
         ):
+            if native_budget is not None:
+                native_budget.mark_uncertain()
             _event_stale_elapsed = time.time() - _last_codex_event_ts
             logger.warning(
                 "Codex stream produced no SSE events for %.0fs after first byte "
@@ -1745,6 +1767,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
         # Stale-call detector: kill the connection if no response
         # arrives within the configured timeout.
         if _elapsed > _stale_timeout:
+            if native_budget is not None:
+                native_budget.mark_uncertain()
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
             if callable(_hint_fn):
@@ -1816,6 +1840,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # managed execution is not live.
             _join_worker_for_relay_teardown(t, label="Non-streaming")
             raise InterruptedError("Agent interrupted during API call")
+    if native_budget is not None and not isinstance(result["error"], (InterruptedError, KeyboardInterrupt)):
+        # Watchdog abort may be cooperative/no-op and leave the worker alive.
+        # Refuse replay before the loop sees a retryable transport timeout.
+        native_budget.check()
     if result["error"] is not None:
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved
@@ -3002,6 +3030,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
+    from agent.native_admission import require_native_route
+
+    native_budget = require_native_route(agent)
     warning = f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
     if getattr(agent, "suppress_status_output", False):
         # Strict machine-readable mode (hermes chat -Q, oneshot, background
@@ -3166,7 +3197,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         if agent.api_mode == "codex_responses":
             codex_kwargs = agent._build_api_kwargs(api_messages)
             codex_kwargs.pop("tools", None)
-            summary_response = agent._run_codex_stream(codex_kwargs)
+            # Required native mode uses the existing request watchdog/abort
+            # owner so a summary cannot bypass the absolute task deadline.
+            summary_response = (
+                agent._interruptible_api_call(codex_kwargs)
+                if native_budget is not None
+                else agent._run_codex_stream(codex_kwargs)
+            )
             _ct_sum = agent._get_transport()
             _cnr_sum = _ct_sum.normalize_response(summary_response)
             final_response = (_cnr_sum.content or "").strip()
@@ -3281,7 +3318,11 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             if agent.api_mode == "codex_responses":
                 codex_kwargs = agent._build_api_kwargs(api_messages)
                 codex_kwargs.pop("tools", None)
-                retry_response = agent._run_codex_stream(codex_kwargs)
+                retry_response = (
+                    agent._interruptible_api_call(codex_kwargs)
+                    if native_budget is not None
+                    else agent._run_codex_stream(codex_kwargs)
+                )
                 _ct_retry = agent._get_transport()
                 _cnr_retry = _ct_retry.normalize_response(retry_response)
                 final_response = (_cnr_retry.content or "").strip()
@@ -3345,6 +3386,10 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
 
     except Exception as e:
+        from agent.native_admission import NativeAdmissionDenied
+
+        if isinstance(e, NativeAdmissionDenied):
+            raise
         logger.warning("Failed to get summary response: %s", e)
         final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
     finally:
@@ -3455,6 +3500,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     Falls back to _interruptible_api_call on provider errors indicating
     streaming is not supported.
     """
+    from agent.native_admission import require_native_route
+
+    require_native_route(agent)
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
 

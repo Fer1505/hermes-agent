@@ -1811,6 +1811,13 @@ class _CodexCompletionsAdapter:
         if total_timeout is not None:
             no_progress_timeout = min(no_progress_timeout, float(total_timeout))
         hard_deadline = _start_monotonic + _aux_stream_total_ceiling(total_timeout)
+        from agent.native_admission import current_budget, NativeAdmissionDenied
+
+        native_budget = current_budget()
+        if native_budget is not None:
+            remaining = native_budget.check()
+            total_timeout = min(total_timeout, remaining) if total_timeout is not None else remaining
+            hard_deadline = min(hard_deadline, native_budget.deadline)
         deadline_lock = threading.Lock()
         progress_deadline = [_start_monotonic + no_progress_timeout]
         saw_content = threading.Event()
@@ -1871,6 +1878,8 @@ class _CodexCompletionsAdapter:
             # Publish transport timeout only after the attempt-local decision is
             # fixed, so owner polling cannot observe completion in between.
             timed_out.set()
+            if native_budget is not None:
+                native_budget.mark_uncertain()
             if not timeout_won:
                 # The request owner already hard-cancelled this attempt. The
                 # OpenAI client is process-shared, so closing/evicting it here
@@ -1997,7 +2006,9 @@ class _CodexCompletionsAdapter:
                     _notify_aux_timing_response()
                 _check_cancelled()
 
-            event_stream = self._client.responses.create(**stream_kwargs)
+            from agent.native_admission import open_native_stream
+
+            event_stream = open_native_stream(self._client, stream_kwargs)
             with attempt_stream_lock:
                 attempt_stream.append(event_stream)
             # The timer can fire while responses.create() is blocked. If the
@@ -2081,6 +2092,9 @@ class _CodexCompletionsAdapter:
                         or (resp_usage.get("total_tokens", 0) if isinstance(resp_usage, dict) else 0),
                 )
         except Exception as exc:
+            if native_budget is not None and timed_out.is_set():
+                native_budget.mark_uncertain()
+                raise NativeAdmissionDenied("Native OAuth auxiliary deadline expired; automatic replay refused") from None
             if timed_out.is_set():
                 raise TimeoutError(_timeout_message()) from exc
             logger.debug("Codex auxiliary Responses API call failed: %s", exc)
@@ -3574,6 +3588,9 @@ def _relay_sync_completion(
     create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
     callback = create or (lambda request: client.chat.completions.create(**request))
+    from agent.native_admission import require_auxiliary_route
+
+    require_auxiliary_route(client)
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     # Protected compression calls isolate only the provider callback and stream
     # aggregation.  The owning thread remains free to unwind its lease/DB
@@ -3602,6 +3619,9 @@ async def _relay_async_completion(
     create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
     callback = create or (lambda request: client.chat.completions.create(**request))
+    from agent.native_admission import require_auxiliary_route
+
+    require_auxiliary_route(client)
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
         return await callback(kwargs)
@@ -3625,6 +3645,9 @@ def _relay_sync_stream(
     provider: str | None = None,
     api_mode: str | None = None,
 ) -> Any:
+    from agent.native_admission import require_auxiliary_route
+
+    require_auxiliary_route(client)
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
         return client.chat.completions.create(**kwargs)
@@ -9749,6 +9772,9 @@ def call_llm(
     latency_info: Optional[Dict[str, int]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
+    from agent.native_admission import current_budget
+
+    current_budget()
     queue_started_at = time.monotonic()
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
@@ -10169,6 +10195,10 @@ def _call_llm_impl(
             # Retries exhausted — fall through to first_err fallback handling.
             raise _last_transient
     except Exception as first_err:
+        from agent.native_admission import NativeAdmissionDenied
+
+        if isinstance(first_err, NativeAdmissionDenied):
+            raise
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)
@@ -10703,6 +10733,9 @@ async def async_call_llm(
     route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
+    from agent.native_admission import current_budget
+
+    current_budget()
     semaphore = _acquire_async_aux_semaphore(task)
     if semaphore is not None:
         await semaphore.acquire()
@@ -10918,6 +10951,10 @@ async def _async_call_llm_impl(
                 ),
                 task)
     except Exception as first_err:
+        from agent.native_admission import NativeAdmissionDenied
+
+        if isinstance(first_err, NativeAdmissionDenied):
+            raise
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)
