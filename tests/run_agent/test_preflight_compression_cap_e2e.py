@@ -62,7 +62,7 @@ def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts) -> AIAgent:
     )
 
     monkeypatch.setattr(
-        config_mod, "load_config_readonly", lambda: _config(max_attempts)
+        config_mod, "load_config_readonly", lambda **_kwargs: _config(max_attempts)
 
     )
     db = SessionDB(db_path=tmp_path / "state.db")
