@@ -369,7 +369,7 @@ class TestSSEAgentFailureFinishReason:
         assert reason == "error"
         assert finish.get("hermes", {}).get("failed") is True
 
-    def test_truncated_result_reports_length(self):
+    def test_partial_result_with_unclassified_cause_reports_incomplete(self):
         async def trunc():
             return (
                 {"final_response": "half", "partial": True, "completed": False,
@@ -378,8 +378,13 @@ class TestSSEAgentFailureFinishReason:
             )
 
         reason, finish, _ = self._run(trunc)
-        assert reason == "length"
-        assert finish["hermes"]["error_code"] == "output_truncated"
+        # Error prose does not establish a structured token-limit cause.
+        assert reason == "error"
+        assert finish["hermes"]["status"] == "incomplete"
+        assert finish["hermes"]["partial"] is True
+        assert finish["hermes"]["completed"] is False
+        assert finish["hermes"]["failed"] is False
+        assert finish["hermes"]["error_code"] == "agent_incomplete"
 
     def test_successful_completion_reports_stop(self):
         async def ok():
