@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import os
+import stat
 import time
 import uuid
 from contextlib import contextmanager
@@ -152,8 +153,26 @@ class _FileLock:
         self._fh = None
 
     def __enter__(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._fh = open(self.path, "a+b")
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            held = os.fstat(fd)
+            named = os.lstat(self.path)
+            if (
+                not stat.S_ISREG(held.st_mode)
+                or held.st_nlink != 1
+                or not stat.S_ISREG(named.st_mode)
+                or (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino)
+            ):
+                raise RuntimeError("active session lock must be a regular file with one link")
+            # Normalize this held inode; never replace a lock another process
+            # may already hold, or chmod through a pathname/symlink.
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            self._fh = os.fdopen(fd, "a+b")
+        except BaseException:
+            os.close(fd)
+            raise
         if os.name == "nt":
             try:
                 import msvcrt
@@ -282,15 +301,21 @@ def _read_entries(path: Path, *, strict: bool = False) -> list[dict[str, Any]]:
 
 
 def _write_entries(path: Path, entries: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    created = False
     try:
-        with open(tmp, "w", encoding="utf-8") as fh:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fh.fileno(), 0o600)
             json.dump({"entries": entries}, fh, sort_keys=True)
         os.replace(tmp, path)
     finally:
         try:
-            tmp.unlink(missing_ok=True)
+            if created:
+                tmp.unlink(missing_ok=True)
         except OSError:
             pass
 

@@ -1,5 +1,6 @@
 import logging
 import os
+import stat
 import subprocess
 import sys
 import threading
@@ -10,6 +11,213 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import active_sessions
+
+
+def _check_registry_writes_private_temp_and_destination_under_permissive_umask(
+    tmp_path, monkeypatch, mask, existing_mode
+):
+    state = tmp_path / 'home' / 'runtime' / 'active_sessions.json'
+    if existing_mode is not None:
+        state.parent.mkdir(parents=True, mode=0o700)
+        state.write_text('{"entries": []}', encoding='utf-8')
+        state.chmod(existing_mode)
+    real_replace = os.replace
+    replacements = []
+
+    def checked_replace(source, target):
+        assert stat.S_IMODE(Path(source).stat().st_mode) == 0o600
+        assert Path(target) == state
+        replacements.append(source)
+        return real_replace(source, target)
+
+    monkeypatch.setattr(active_sessions.os, 'replace', checked_replace)
+    original_mask = os.umask(mask)
+    try:
+        active_sessions._write_entries(state, [{'session_id': 'synthetic'}])
+        assert stat.S_IMODE(state.stat().st_mode) == 0o600
+        active_sessions._write_entries(state, [])
+        assert stat.S_IMODE(state.stat().st_mode) == 0o600
+        assert stat.S_IMODE(state.parent.stat().st_mode) == 0o700
+        assert state.read_text(encoding='utf-8') == '{"entries": []}'
+    finally:
+        os.umask(original_mask)
+    assert len(replacements) == 2
+    assert not list(state.parent.glob('*.tmp'))
+
+
+def _check_lock_normalizes_held_inode_and_lease_rewrites_remain_private(tmp_path, mask):
+    home = tmp_path / 'home'
+    lock_path = home / 'runtime' / 'active_sessions.lock'
+    original_mask = os.umask(mask)
+    try:
+        with active_sessions._FileLock(lock_path) as lock:
+            assert stat.S_IMODE(os.fstat(lock._fh.fileno()).st_mode) == 0o600
+            assert stat.S_IMODE(lock_path.parent.stat().st_mode) == 0o700
+        original_inode = lock_path.stat().st_ino
+        lock_path.chmod(0o644)
+        with active_sessions._FileLock(lock_path) as lock:
+            assert os.fstat(lock._fh.fileno()).st_ino == original_inode
+            assert lock_path.stat().st_ino == original_inode
+            assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+        lease, error = active_sessions.try_acquire_active_session(
+            session_id='synthetic-old', surface='cli', config={},
+            registry_home=home, track_liveness=True
+        )
+        assert error is None and lease is not None
+        state = home / 'runtime' / 'active_sessions.json'
+        assert stat.S_IMODE(state.stat().st_mode) == 0o600
+        assert active_sessions.transfer_active_session(lease, session_id='synthetic-new')
+        assert stat.S_IMODE(state.stat().st_mode) == 0o600
+        lease.release()
+        assert stat.S_IMODE(state.stat().st_mode) == 0o600
+        assert active_sessions.active_session_registry_snapshot(home) == []
+    finally:
+        os.umask(original_mask)
+
+
+def _check_lock_refuses_link_without_changing_target_permissions(tmp_path, link_kind):
+    target = tmp_path / 'target'
+    target.write_bytes(b'untouched')
+    target.chmod(0o644)
+    lock_path = tmp_path / 'runtime' / 'active_sessions.lock'
+    lock_path.parent.mkdir()
+    if link_kind == 'symlink':
+        lock_path.symlink_to(target)
+    else:
+        os.link(target, lock_path)
+    with pytest.raises((OSError, RuntimeError)):
+        with active_sessions._FileLock(lock_path):
+            pytest.fail('linked lock must not be acquired')
+    assert target.read_bytes() == b'untouched'
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+
+def _check_private_registry_replace_failure_preserves_existing_bytes_and_mode(
+    tmp_path, monkeypatch, existing_mode
+):
+    state = tmp_path / 'runtime' / 'active_sessions.json'
+    state.parent.mkdir()
+    original = b'{"entries": []}\n'
+    state.write_bytes(original)
+    state.chmod(existing_mode)
+
+    def failed_replace(source, target):
+        assert stat.S_IMODE(Path(source).stat().st_mode) == 0o600
+        raise OSError('synthetic replace failure')
+
+    monkeypatch.setattr(active_sessions.os, 'replace', failed_replace)
+    with pytest.raises(OSError, match='synthetic replace failure'):
+        active_sessions._write_entries(state, [{'session_id': 'synthetic-new'}])
+    assert state.read_bytes() == original
+    assert stat.S_IMODE(state.stat().st_mode) == existing_mode
+    assert not list(state.parent.glob('*.tmp'))
+
+
+def test_private_registry_temp_collision_preserves_the_existing_file(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    state = tmp_path / 'runtime' / 'active_sessions.json'
+    state.parent.mkdir()
+    state.write_bytes(b'{"entries": []}\n')
+    collision = state.with_name(f'{state.name}.{os.getpid()}.collision.tmp')
+    collision.write_bytes(b'not ours')
+    monkeypatch.setattr(active_sessions.uuid, 'uuid4', lambda: SimpleNamespace(hex='collision'))
+    with pytest.raises(FileExistsError):
+        active_sessions._write_entries(state, [])
+    assert state.read_bytes() == b'{"entries": []}\n'
+    assert collision.read_bytes() == b'not ours'
+
+
+def _check_private_state_normalization_failure_closes_descriptor(tmp_path, monkeypatch, kind):
+    state = tmp_path / 'runtime' / 'active_sessions.json'
+    state.parent.mkdir()
+    state.write_bytes(b'{"entries": []}\n')
+    state.chmod(0o600)
+    descriptors = []
+
+    def failed_fchmod(fd, mode):
+        assert mode == 0o600
+        descriptors.append(fd)
+        raise PermissionError('synthetic normalization failure')
+
+    monkeypatch.setattr(active_sessions.os, 'fchmod', failed_fchmod)
+    with pytest.raises(PermissionError, match='synthetic normalization failure'):
+        if kind == 'registry':
+            active_sessions._write_entries(state, [])
+        else:
+            with active_sessions._FileLock(state.with_suffix('.lock')):
+                pytest.fail('normalization must fail before lock acquisition')
+    assert len(descriptors) == 1
+    with pytest.raises(OSError):
+        os.fstat(descriptors[0])
+    assert state.read_bytes() == b'{"entries": []}\n'
+    assert stat.S_IMODE(state.stat().st_mode) == 0o600
+    assert not list(state.parent.glob('*.tmp'))
+
+
+# Exercise POSIX guarantees on each real native CI host; do not fake the OS.
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize('mask', [0o022, 0o000])
+@pytest.mark.parametrize('existing_mode', [None, 0o600, 0o644])
+def test_registry_writes_private_temp_and_destination_under_permissive_umask_linux(tmp_path, monkeypatch, mask, existing_mode):
+    _check_registry_writes_private_temp_and_destination_under_permissive_umask(tmp_path, monkeypatch, mask, existing_mode)
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize('mask', [0o022, 0o000])
+@pytest.mark.parametrize('existing_mode', [None, 0o600, 0o644])
+def test_registry_writes_private_temp_and_destination_under_permissive_umask_macos(tmp_path, monkeypatch, mask, existing_mode):
+    _check_registry_writes_private_temp_and_destination_under_permissive_umask(tmp_path, monkeypatch, mask, existing_mode)
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize('mask', [0o022, 0o000])
+def test_lock_normalizes_held_inode_and_lease_rewrites_remain_private_linux(tmp_path, mask):
+    _check_lock_normalizes_held_inode_and_lease_rewrites_remain_private(tmp_path, mask)
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize('mask', [0o022, 0o000])
+def test_lock_normalizes_held_inode_and_lease_rewrites_remain_private_macos(tmp_path, mask):
+    _check_lock_normalizes_held_inode_and_lease_rewrites_remain_private(tmp_path, mask)
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize('link_kind', ['symlink', 'hardlink'])
+def test_lock_refuses_link_without_changing_target_permissions_linux(tmp_path, link_kind):
+    _check_lock_refuses_link_without_changing_target_permissions(tmp_path, link_kind)
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize('link_kind', ['symlink', 'hardlink'])
+def test_lock_refuses_link_without_changing_target_permissions_macos(tmp_path, link_kind):
+    _check_lock_refuses_link_without_changing_target_permissions(tmp_path, link_kind)
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize('existing_mode', [0o600, 0o644])
+def test_private_registry_replace_failure_preserves_existing_bytes_and_mode_linux(tmp_path, monkeypatch, existing_mode):
+    _check_private_registry_replace_failure_preserves_existing_bytes_and_mode(tmp_path, monkeypatch, existing_mode)
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize('existing_mode', [0o600, 0o644])
+def test_private_registry_replace_failure_preserves_existing_bytes_and_mode_macos(tmp_path, monkeypatch, existing_mode):
+    _check_private_registry_replace_failure_preserves_existing_bytes_and_mode(tmp_path, monkeypatch, existing_mode)
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize('kind', ['registry', 'lock'])
+def test_private_state_normalization_failure_closes_descriptor_linux(tmp_path, monkeypatch, kind):
+    _check_private_state_normalization_failure_closes_descriptor(tmp_path, monkeypatch, kind)
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize('kind', ['registry', 'lock'])
+def test_private_state_normalization_failure_closes_descriptor_macos(tmp_path, monkeypatch, kind):
+    _check_private_state_normalization_failure_closes_descriptor(tmp_path, monkeypatch, kind)
 
 
 def test_resolve_max_concurrent_sessions_values(caplog):
@@ -559,4 +767,3 @@ def test_release_wins_against_transfer_waiting_on_same_lease_lock(
     assert transfer_result == [False]
     assert lease.released is True
     assert active_sessions.active_session_registry_snapshot() == []
-
