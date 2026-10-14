@@ -529,6 +529,24 @@ class TestListProfiles:
         assert "alpha" in names
         assert "beta" in names
 
+    def test_alias_resolution_can_be_disabled(self, profile_env, monkeypatch):
+        create_profile("alpha", no_alias=True)
+        wrapper = create_wrapper_script("alpha-alias", target="alpha")
+        assert wrapper is not None
+        ordinary = {info.name: info for info in list_profiles()}
+        assert ordinary["alpha"].alias_name == "alpha-alias"
+        assert ordinary["alpha"].alias_path == wrapper
+
+        def forbidden_wrappers():
+            pytest.fail("Path-only enumeration must not resolve host wrappers")
+
+        monkeypatch.setattr(profiles, "_get_wrapper_dir", forbidden_wrappers)
+        without_aliases = {info.name: info for info in list_profiles(include_aliases=False)}
+        assert without_aliases.keys() == ordinary.keys()
+        for name, info in without_aliases.items():
+            assert info.path == ordinary[name].path
+            assert info.alias_name is None and info.alias_path is None
+
 
 # ===================================================================
 # TestActiveProfile

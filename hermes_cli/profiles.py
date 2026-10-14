@@ -1074,10 +1074,10 @@ def _default_home_is_dormant_scaffolding(default_home: Path) -> bool:
         return False
 
 
-def list_profiles() -> List[ProfileInfo]:
-    """Return info for all profiles, including the default."""
+def list_profiles(*, include_aliases: bool = True) -> List[ProfileInfo]:
+    """Return profile info; state-only callers can omit host wrapper aliases."""
     profiles = []
-    wrapper_dir = _get_wrapper_dir()
+    wrapper_dir = _get_wrapper_dir() if include_aliases else None
 
     # Default profile — unless it is dormant scaffolding. On profile-mode
     # deployments the default home survives only to host profiles/, the sticky
@@ -1112,7 +1112,7 @@ def list_profiles() -> List[ProfileInfo]:
         # Build the {profile -> alias} map ONCE here instead of calling
         # find_alias_for_profile() per profile (which re-scanned the whole
         # wrapper dir each time — O(N*M), the dominant cost in this function).
-        alias_map = build_alias_map()
+        alias_map = build_alias_map() if include_aliases else {}
         for entry in sorted(profiles_root.iterdir()):
             if not entry.is_dir():
                 continue

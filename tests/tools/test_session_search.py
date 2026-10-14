@@ -486,6 +486,56 @@ class TestSessionLink:
 # =========================================================================
 
 class TestCrossProfileRead:
+    @pytest.mark.parametrize("lookup", ["own", "foreign", "missing", "explicit"])
+    def test_bare_session_lookup_keeps_wrappers_outside_owned_root(self, tmp_path, monkeypatch, lookup):
+        import os
+        from pathlib import Path
+        from hermes_cli import profiles as profiles_mod
+
+        original_home = os.environ.get("HOME")
+        worker_root = tmp_path / "worker-root"
+        other_home = worker_root / "profiles" / "other"
+        other_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(worker_root))
+        # Canonical runner HOME is itself owned, but remains outside the
+        # explicit worker root. Never read the human's real wrapper directory.
+        wrapper_dir = Path.home() / ".local" / "bin"
+        wrapper_dir.mkdir(parents=True, exist_ok=True)
+        accesses = []
+        original_iterdir = Path.iterdir
+
+        def fenced_iterdir(directory):
+            if directory == wrapper_dir:
+                accesses.append(directory)
+                raise AssertionError("Host wrapper enumeration is forbidden")
+            return original_iterdir(directory)
+
+        monkeypatch.setattr(Path, "iterdir", fenced_iterdir)
+        current = SessionDB(worker_root / "state.db")
+        other = SessionDB(other_home / "state.db")
+        try:
+            current.create_session("owned-current", source="cli")
+            current.append_message("owned-current", role="user", content="Synthetic own marker")
+            other.create_session("owned-other", source="cli")
+            other.append_message("owned-other", role="user", content="Synthetic same-owner marker")
+            current._conn.commit()
+            other._conn.commit()
+            kwargs = {"session_id": "owned-current" if lookup == "own" else "owned-missing" if lookup == "missing" else "owned-other"}
+            if lookup == "explicit":
+                kwargs["profile"] = "other"
+            result = json.loads(session_search(db=current, **kwargs))
+            assert result["success"] is (lookup != "missing")
+            if lookup in {"foreign", "explicit"}:
+                assert "@session:other/owned-other" in json.dumps(result)
+                assert "Synthetic same-owner marker" in json.dumps(result)
+            if lookup == "foreign":
+                assert result["profile"] == "other"
+            assert not accesses
+            assert os.environ.get("HOME") == original_home
+        finally:
+            current.close()
+            other.close()
+
     def _patch_profiles(self, monkeypatch, home, exists=True):
         from hermes_cli import profiles as profiles_mod
         monkeypatch.setattr(profiles_mod, "normalize_profile_name", lambda n: n)
@@ -507,7 +557,11 @@ class TestCrossProfileRead:
         from hermes_cli import profiles as profiles_mod
         Info = namedtuple("Info", "name path")
         monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: tmp_path / "default_home")
-        monkeypatch.setattr(profiles_mod, "list_profiles", lambda: [Info("asdf", other_home)])
+        def profile_paths(*, include_aliases=True):
+            assert include_aliases is False
+            return [Info("asdf", other_home)]
+
+        monkeypatch.setattr(profiles_mod, "list_profiles", profile_paths)
 
         # `db` (current profile) lacks s_far; no profile passed → scan finds it.
         result = json.loads(session_search(session_id="s_far", db=db))

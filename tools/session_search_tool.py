@@ -407,7 +407,7 @@ def _locate_session_db(session_id: str):
 
     targets = [("default", profiles_mod.get_profile_dir("default"))]
     try:
-        targets += [(info.name, info.path) for info in profiles_mod.list_profiles()]
+        targets += [(info.name, info.path) for info in profiles_mod.list_profiles(include_aliases=False)]
     except Exception:
         logging.debug("list_profiles failed during session locate", exc_info=True)
 
