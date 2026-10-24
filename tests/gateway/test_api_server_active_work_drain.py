@@ -131,13 +131,20 @@ class TestDrainWaitsForApiWork:
         task_started = asyncio.Event()
         allow_task = asyncio.Event()
 
-        def delayed_create_task(coro):
+        # The patch target resolves to the global ``asyncio.create_task``, so it
+        # also intercepts aiohttp's own tasks (since 3.14.4 its client writes the
+        # request body via ``asyncio.create_task`` on Python < 3.12).  Delaying
+        # those would deadlock the request, so hold back only the /v1/runs task.
+        def delayed_create_task(coro, **kwargs):
+            if not getattr(coro, "__qualname__", "").endswith("._run_and_close"):
+                return original_create_task(coro, **kwargs)
+
             async def delayed():
                 task_started.set()
                 await allow_task.wait()
                 return await coro
 
-            return original_create_task(delayed())
+            return original_create_task(delayed(), **kwargs)
 
         mock_agent = MagicMock()
         mock_agent.run_conversation.return_value = {"final_response": "done"}
@@ -152,7 +159,7 @@ class TestDrainWaitsForApiWork:
             async with TestClient(TestServer(app)) as client:
                 response = await client.post("/v1/runs", json={"input": "hello"})
                 assert response.status == 202
-                await task_started.wait()
+                await asyncio.wait_for(task_started.wait(), _TURN_UNBLOCK_TIMEOUT)
 
                 assert api._active_run_agents == {}
                 assert runner._active_api_run_count() == 1
