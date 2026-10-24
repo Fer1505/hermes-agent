@@ -215,17 +215,17 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "discord.py==2.7.1",
         "PyNaCl==1.6.2",  # GHSA-mrfv-m5wm-5w6w / CVE-2025-69277
         "davey==0.1.4",
-        "brotlicffi==1.2.0.1",
+        "brotlicffi==1.2.1.0",
         # discord.py pulls aiohttp transitively (>=3.7.4,<4) as its HTTP
         # backbone. Pin the patched floor here too so the lazy Discord path
         # can't keep an already-installed vulnerable aiohttp satisfying that
         # range — mirrors the messaging extra and platform.slack.
-        "aiohttp==3.14.3",  # prior CVEs + GHSA-cq5v-8q36-5273/GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
+        "aiohttp==3.14.4",  # 2026-10 advisory set + prior CVEs + GHSA-cq5v-8q36-5273/GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
     ),
     "platform.slack": (
         "slack-bolt==1.30.0",
         "slack-sdk==3.43.0",
-        "aiohttp==3.14.3",  # prior CVEs + GHSA-cq5v-8q36-5273/GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
+        "aiohttp==3.14.4",  # 2026-10 advisory set + prior CVEs + GHSA-cq5v-8q36-5273/GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
     ),
     "platform.matrix": (
         "mautrix[encryption]==0.21.1",
@@ -235,7 +235,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         # mautrix (aiohttp>=3,<4) and aiohttp-socks (aiohttp>=3.10.0) only cap
         # aiohttp transitively, so a vulnerable already-installed aiohttp still
         # satisfies both — pin the patched floor here too, like platform.discord.
-        "aiohttp==3.14.3",  # prior CVEs + GHSA-cq5v-8q36-5273/GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
+        "aiohttp==3.14.4",  # 2026-10 advisory set + prior CVEs + GHSA-cq5v-8q36-5273/GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
     ),
     "platform.dingtalk": (
         "dingtalk-stream==0.24.3",
@@ -254,7 +254,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # (microsoft-teams-api/cards/common, dependency-injector, msal). Lazy-
     # installed on demand like every other messaging platform; also exposed
     # as the `teams` extra in pyproject for packagers / explicit installs.
-    "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.3"),  # aiohttp 3.14.3: prior CVEs + GHSA-cq5v-8q36-5273/GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
+    "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.4"),  # aiohttp 3.14.4: 2026-10 advisory set (GHSA-2g87-pp6c-29x5 and 7 more) + prior CVEs + GHSA-cq5v-8q36-5273/GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
 
     # ─── Terminal backends ─────────────────────────────────────────────────
     "terminal.modal": ("modal==1.3.4",),
@@ -290,7 +290,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # for stripped/source-build installs that somehow dropped it. The vision
     # call site uses prompt=False so it can never raise a blocking input()
     # prompt mid-session (#40490).
-    "tool.vision": ("Pillow==12.3.0",),
+    "tool.vision": ("Pillow==13.0.0",),
     # Document-to-Markdown extraction for read_file (firecrawl-anydoc, Rust
     # core, imports as `anydoc`). Widens read_file's auto-extraction beyond
     # the stdlib .ipynb/.docx/.xlsx to PDF, legacy Office (.doc/.ppt/.xls),
