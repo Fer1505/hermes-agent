@@ -270,7 +270,10 @@ class TestCommandCodeFetchModelsPickerContract:
         chat = resolve_provider_full("commandcode", {}, [])
         assert chat is not None and chat.id == "commandcode"
         assert chat.transport == "openai_chat"
-        assert "COMMANDCODE_API_KEY" in chat.api_key_env_vars
+        # The env-var name comes from the live models.dev catalog (fetched over
+        # the network in the hermetic test HOME); it changed from
+        # COMMANDCODE_API_KEY to CMD_API_KEY upstream. Accept either.
+        assert {"COMMANDCODE_API_KEY", "CMD_API_KEY"} & set(chat.api_key_env_vars)
 
         anth = resolve_provider_full("commandcode-anthropic", {}, [])
         assert anth is not None and anth.id == "commandcode-anthropic"
