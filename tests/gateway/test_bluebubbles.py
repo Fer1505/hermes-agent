@@ -159,6 +159,55 @@ class TestBlueBubblesMentionGating:
         assert handled == []
 
 
+class TestBlueBubblesDuplicateDelivery:
+    @pytest.mark.asyncio
+    async def test_updated_message_for_a_dispatched_guid_is_not_answered_again(self, monkeypatch):
+        # Live 2026-10-29: each DM arrived as new-message under "any;-;+1..." and
+        # ~10 s later as updated-message under the bare handle; both were answered.
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+
+        def delivery(event_type, guid, **record):
+            return _FakeBlueBubblesRequest({
+                "type": event_type,
+                "data": {"guid": guid, "text": "Can you send all this to my email",
+                         "handle": {"address": "+15555550100"}, "isFromMe": False, **record},
+            })
+
+        first = await adapter._handle_webhook(delivery("new-message", "msg-1", chats=[{"guid": "any;-;+15555550100"}]))
+        again = await adapter._handle_webhook(delivery("updated-message", "msg-1", dateRead=1793284999000))
+        other = await adapter._handle_webhook(delivery("new-message", "msg-2", chats=[{"guid": "any;-;+15555550100"}]))
+        await asyncio.sleep(0)
+
+        assert [r.status for r in (first, again, other)] == [200, 200, 200]
+        assert [event.message_id for event in handled] == ["msg-1", "msg-2"]
+        assert handled[0].source.chat_id == "any;-;+15555550100"
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_message_can_still_be_dispatched_by_its_update(self, monkeypatch):
+        # A delivery that is not dispatched (no text yet) must not mark the guid.
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        base = {"guid": "msg-3", "handle": {"address": "+15555550100"}, "isFromMe": False,
+                "chats": [{"guid": "any;-;+15555550100"}]}
+        empty = await adapter._handle_webhook(_FakeBlueBubblesRequest({"type": "new-message", "data": {**base, "text": ""}}))
+        filled = await adapter._handle_webhook(_FakeBlueBubblesRequest({"type": "updated-message", "data": {**base, "text": "hello"}}))
+        await asyncio.sleep(0)
+
+        assert (empty.status, filled.status) == (400, 200)
+        assert [event.text for event in handled] == ["hello"]
+
+
 class TestBlueBubblesWebhookParsing:
 
     def test_webhook_can_fall_back_to_sender_when_chat_fields_missing(self, monkeypatch):

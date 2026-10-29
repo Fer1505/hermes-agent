@@ -123,6 +123,7 @@ _PHONE_RE = re.compile(r"\+?\d{7,15}")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
 
 _GUID_CACHE_SIZE = 500  # LRU cap for resolved chat-GUID lookups
+_SEEN_INBOUND_SIZE = 2048  # LRU cap for inbound message guids already dispatched
 
 
 def _redact(text: str) -> str:
@@ -204,6 +205,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
+        self._seen_inbound: OrderedDict[str, None] = OrderedDict()
 
     # ------------------------------------------------------------------
     # API helpers
@@ -981,6 +983,14 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if is_from_me:
             return web.Response(text="ok")
 
+        # BlueBubbles sends a message again as "updated-message" when its
+        # delivered/read state changes (the read receipt below triggers one),
+        # sometimes under the bare handle instead of the chat GUID, so a second
+        # session would answer it again. Each message guid is dispatched once.
+        message_guid = self._value(record.get("guid"), record.get("messageGuid"))
+        if message_guid and message_guid in self._seen_inbound:
+            return web.Response(text="ok")
+
         # Skip tapback reactions delivered as messages
         assoc_type = record.get("associatedMessageType")
         if isinstance(assoc_type, int) and assoc_type in {
@@ -1102,6 +1112,14 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
         )
+        if message_guid:
+            # Re-checked here: attachment downloads above can interleave a
+            # duplicate delivery of the same message.
+            if message_guid in self._seen_inbound:
+                return web.Response(text="ok")
+            self._seen_inbound[message_guid] = None
+            while len(self._seen_inbound) > _SEEN_INBOUND_SIZE:
+                self._seen_inbound.popitem(last=False)
         task = asyncio.create_task(self.handle_message(event))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
